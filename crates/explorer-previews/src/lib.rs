@@ -145,6 +145,30 @@ mod tests {
             _ => panic!("NUL-bearing data should be unsupported"),
         }
 
+        // Oversized images downscale below GPU texture limits (the
+        // panic class: Device::create_texture beyond 8192); metadata
+        // keeps the true dimensions.
+        let wide_path = dir.join("wide.png");
+        {
+            let file = std::fs::File::create(&wide_path).unwrap();
+            let mut enc = png::Encoder::new(file, 5000, 8);
+            enc.set_color(png::ColorType::Rgba);
+            enc.set_depth(png::BitDepth::Eight);
+            let mut writer = enc.write_header().unwrap();
+            writer.write_image_data(&vec![128u8; 5000 * 8 * 4]).unwrap();
+        }
+        match Registry::standard().load(&wide_path).unwrap() {
+            Preview::Image { image, meta } => {
+                assert!(
+                    image.width().max(image.height()) <= 4096,
+                    "{}",
+                    image.width()
+                );
+                assert_eq!(meta.width, 5000);
+            }
+            _ => panic!("wide png should preview as image"),
+        }
+
         let noext_path = dir.join("NOTES");
         std::fs::write(&noext_path, "remember the milk\n").unwrap();
         match Registry::standard().load(&noext_path).unwrap() {

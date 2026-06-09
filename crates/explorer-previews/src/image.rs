@@ -27,9 +27,21 @@ impl PreviewHandler for ImageHandler {
     fn load(&self, path: &Path) -> anyhow::Result<Preview> {
         // Straight alpha: damascene premultiplies at blend time.
         let decoded = decode::load_straight(path)?;
-        Ok(Preview::Image {
-            meta: convert::meta_of(&decoded),
-            image: convert::to_damascene(&decoded),
-        })
+        let meta = convert::meta_of(&decoded);
+        // Cap the uploaded texture: GPU texture limits are commonly
+        // 8192 (wgpu's default request), and a preview pane never
+        // needs a 12800px source. The linear-light thumbnailer keeps
+        // HDR highlights; `meta` keeps reporting the true dimensions.
+        let image = if decoded.width.max(decoded.height) > MAX_PREVIEW_EDGE {
+            convert::thumbnail(&decoded, MAX_PREVIEW_EDGE)
+        } else {
+            convert::to_damascene(&decoded)
+        };
+        Ok(Preview::Image { image, meta })
     }
 }
+
+/// Long-edge cap for preview uploads, comfortably under every desktop
+/// adapter's texture dimension limit (the floor in practice is 4096;
+/// wgpu's default request is 8192).
+const MAX_PREVIEW_EDGE: u32 = 4096;
