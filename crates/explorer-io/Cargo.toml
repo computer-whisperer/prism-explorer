@@ -1,0 +1,12 @@
+[package]
+name = "explorer-io"
+description = "Background filesystem IO for prism-explorer — priority worker pool, streaming directory listings, lazy stat"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+tracing.workspace = true

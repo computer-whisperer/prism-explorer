@@ -1,0 +1,54 @@
+[workspace]
+resolver = "2"
+members = ["crates/explorer-io", "crates/explorer-previews", "crates/explorer"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/computer-whisperer/prism-explorer"
+authors = ["Christian Balcom"]
+
+[workspace.dependencies]
+anyhow = "1"
+tracing = "0.1"
+damascene-core = "0.4.2"
+damascene-winit-wgpu = "0.4.2"
+
+# Color-managed decode stack, shared with damascene-gallery and prism-bg.
+# Path dep from a sibling checkout until it's published.
+achromat = { path = "../achromat", features = ["damascene"] }
+
+explorer-io = { path = "crates/explorer-io" }
+explorer-previews = { path = "crates/explorer-previews" }
+
+# achromat's vendored jpegxr 0.3.1 (bindgen bumped to 0.72; upstream's
+# pin on 0.69 generates opaque structs with current libclang). Patches
+# apply only at the consuming workspace root, so it's repeated here,
+# pointed at achromat's vendor copy. Drop when upstream updates.
+[patch.crates-io]
+jpegxr = { path = "../achromat/vendor/jpegxr" }
+
+# MSDF/text crates are ~500x slower unoptimized (per damascene's own
+# profile guidance); image decode is also hot in dev runs.
+[profile.dev.package.fdsm]
+opt-level = 3
+[profile.dev.package.cosmic-text]
+opt-level = 3
+[profile.dev.package.jpegxr]
+opt-level = 3
+[profile.dev.package.jxl-oxide]
+opt-level = 3
+[profile.dev.package.jxl-render]
+opt-level = 3
+[profile.dev.package.jxl-vardct]
+opt-level = 3
+[profile.dev.package.jxl-modular]
+opt-level = 3
+[profile.dev.package.image]
+opt-level = 3
+[profile.dev.package.png]
+opt-level = 3
+[profile.dev.package.moxcms]
+opt-level = 3

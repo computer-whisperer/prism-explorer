@@ -1,0 +1,286 @@
+//! The directory model: entries stream in from the listing pass, get
+//! lazily enriched by stat results, and are displayed through a sorted
+//! `order` index.
+//!
+//! `entries` is `Arc<Mutex<…>>` because damascene's `virtual_list` row
+//! builder is `Fn + Send + Sync + 'static` — display data has to be
+//! shared, not cloned per frame (a Ceph directory can hold 100k
+//! entries). The mutex is uncontended in practice: only the UI thread
+//! touches it (workers communicate by message), the lock just satisfies
+//! the bound soundly.
+
+use std::ffi::{OsStr, OsString};
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+
+use explorer_io::listing::ListingUpdate;
+use explorer_io::stat::EntryMeta;
+use explorer_io::{EntryKind, RawEntry};
+use explorer_previews::Preview;
+
+use crate::places::Place;
+
+/// Stable entry identity: index into `Listing::entries`, which only
+/// ever appends. Sorting happens in `order`, so ids survive resorts —
+/// in-flight stat/preview results stay attached to the right file.
+pub type EntryId = u32;
+
+pub struct Entry {
+    pub name: OsString,
+    /// Lossy display name, cached (rows render every frame).
+    pub display: String,
+    /// Case-folded sort key, cached.
+    sort_key: String,
+    /// Best-known kind: `d_type` from the listing, upgraded by the
+    /// stat pass (which follows symlinks).
+    pub kind: EntryKind,
+    pub is_symlink: bool,
+    pub meta: Option<EntryMeta>,
+    pub meta_error: Option<String>,
+}
+
+impl Entry {
+    fn from_raw(raw: RawEntry) -> Self {
+        let display = raw.name.to_string_lossy().into_owned();
+        Entry {
+            sort_key: display.to_lowercase(),
+            display,
+            name: raw.name,
+            kind: raw.kind,
+            is_symlink: raw.kind == EntryKind::Symlink,
+            meta: None,
+            meta_error: None,
+        }
+    }
+
+    pub fn is_hidden(&self) -> bool {
+        self.display.starts_with('.')
+    }
+
+    pub fn is_dir(&self) -> bool {
+        self.kind == EntryKind::Dir
+    }
+}
+
+pub type SharedEntries = Arc<Mutex<Vec<Entry>>>;
+
+pub struct Listing {
+    pub dir: PathBuf,
+    /// Pool generation this listing belongs to; results tagged with
+    /// any other generation are strays from a directory already left.
+    pub generation: u64,
+    pub entries: SharedEntries,
+    /// Sorted, hidden-filtered view over `entries`.
+    pub order: Arc<Vec<EntryId>>,
+    pub complete: bool,
+    pub error: Option<String>,
+}
+
+impl Listing {
+    pub fn new(dir: PathBuf, generation: u64) -> Self {
+        Listing {
+            dir,
+            generation,
+            entries: Arc::new(Mutex::new(Vec::new())),
+            order: Arc::new(Vec::new()),
+            complete: false,
+            error: None,
+        }
+    }
+
+    /// Fold one streaming update in. Returns whether `order` changed
+    /// (the caller remaps its selection position).
+    pub fn absorb(&mut self, update: ListingUpdate, show_hidden: bool) -> bool {
+        if let Some(e) = update.error {
+            self.error = Some(e);
+        }
+        self.complete |= update.done;
+        if update.batch.is_empty() {
+            return false;
+        }
+        self.entries
+            .lock()
+            .unwrap()
+            .extend(update.batch.into_iter().map(Entry::from_raw));
+        self.rebuild_order(show_hidden);
+        true
+    }
+
+    /// Apply a stat result. Returns whether `order` changed (a symlink
+    /// resolved to a directory regroups it among the dirs).
+    pub fn apply_stat(
+        &mut self,
+        id: EntryId,
+        result: Result<EntryMeta, String>,
+        show_hidden: bool,
+    ) -> bool {
+        let mut entries = self.entries.lock().unwrap();
+        let Some(entry) = entries.get_mut(id as usize) else {
+            return false;
+        };
+        let mut regrouped = false;
+        match result {
+            Ok(meta) => {
+                regrouped = entry.is_dir() != (meta.kind == EntryKind::Dir);
+                entry.kind = meta.kind;
+                entry.is_symlink = meta.is_symlink;
+                entry.meta = Some(meta);
+            }
+            Err(e) => entry.meta_error = Some(e),
+        }
+        drop(entries);
+        if regrouped {
+            self.rebuild_order(show_hidden);
+        }
+        regrouped
+    }
+
+    /// Recompute `order`: hidden filter, directories first, then
+    /// case-insensitive by name (raw name as the total-order tiebreak).
+    pub fn rebuild_order(&mut self, show_hidden: bool) {
+        let entries = self.entries.lock().unwrap();
+        let mut order: Vec<EntryId> = (0..entries.len() as EntryId)
+            .filter(|&i| show_hidden || !entries[i as usize].is_hidden())
+            .collect();
+        order.sort_by(|&a, &b| {
+            let (ea, eb) = (&entries[a as usize], &entries[b as usize]);
+            eb.is_dir()
+                .cmp(&ea.is_dir())
+                .then_with(|| ea.sort_key.cmp(&eb.sort_key))
+                .then_with(|| ea.name.cmp(&eb.name))
+        });
+        drop(entries);
+        self.order = Arc::new(order);
+    }
+
+    pub fn pos_of(&self, id: EntryId) -> Option<usize> {
+        self.order.iter().position(|&i| i == id)
+    }
+
+    pub fn id_by_name(&self, name: &OsStr) -> Option<EntryId> {
+        let entries = self.entries.lock().unwrap();
+        entries
+            .iter()
+            .position(|e| e.name == name)
+            .map(|i| i as EntryId)
+    }
+
+    pub fn path_of(&self, id: EntryId) -> PathBuf {
+        let entries = self.entries.lock().unwrap();
+        self.dir.join(&entries[id as usize].name)
+    }
+}
+
+/// Everything workers post back to the UI thread.
+pub enum Msg {
+    Listing {
+        generation: u64,
+        update: ListingUpdate,
+    },
+    Stat {
+        generation: u64,
+        id: EntryId,
+        result: Result<EntryMeta, String>,
+    },
+    Preview {
+        generation: u64,
+        id: EntryId,
+        result: Result<Preview, String>,
+    },
+    Places(Vec<Place>),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn update(names: &[(&str, EntryKind)], done: bool) -> ListingUpdate {
+        ListingUpdate {
+            batch: names
+                .iter()
+                .map(|(n, k)| RawEntry {
+                    name: n.into(),
+                    kind: *k,
+                })
+                .collect(),
+            done,
+            error: None,
+        }
+    }
+
+    fn ordered_names(l: &Listing) -> Vec<String> {
+        let entries = l.entries.lock().unwrap();
+        l.order
+            .iter()
+            .map(|&i| entries[i as usize].display.clone())
+            .collect()
+    }
+
+    #[test]
+    fn streams_sort_dirs_first_case_insensitive() {
+        let mut l = Listing::new("/test".into(), 0);
+        l.absorb(
+            update(
+                &[
+                    ("zebra.txt", EntryKind::File),
+                    ("Apps", EntryKind::Dir),
+                    (".hidden", EntryKind::File),
+                ],
+                false,
+            ),
+            false,
+        );
+        assert_eq!(ordered_names(&l), ["Apps", "zebra.txt"]);
+
+        // Second batch interleaves; ids of existing entries survive.
+        let zebra = l.id_by_name(OsStr::new("zebra.txt")).unwrap();
+        l.absorb(
+            update(
+                &[("banana", EntryKind::File), ("Zoo", EntryKind::Dir)],
+                true,
+            ),
+            false,
+        );
+        assert_eq!(ordered_names(&l), ["Apps", "Zoo", "banana", "zebra.txt"]);
+        assert!(l.complete);
+        assert_eq!(l.id_by_name(OsStr::new("zebra.txt")), Some(zebra));
+
+        // Hidden toggle re-admits dotfiles.
+        l.rebuild_order(true);
+        assert_eq!(
+            ordered_names(&l),
+            ["Apps", "Zoo", ".hidden", "banana", "zebra.txt"]
+        );
+    }
+
+    #[test]
+    fn stat_resolving_symlink_to_dir_regroups() {
+        let mut l = Listing::new("/test".into(), 0);
+        l.absorb(
+            update(
+                &[("alpha", EntryKind::Dir), ("link", EntryKind::Symlink)],
+                true,
+            ),
+            false,
+        );
+        assert_eq!(ordered_names(&l), ["alpha", "link"]);
+
+        let id = l.id_by_name(OsStr::new("link")).unwrap();
+        let regrouped = l.apply_stat(
+            id,
+            Ok(EntryMeta {
+                size: 0,
+                modified: None,
+                kind: EntryKind::Dir,
+                is_symlink: true,
+            }),
+            false,
+        );
+        assert!(regrouped);
+        // Still dirs-first, now sorted among them.
+        assert_eq!(ordered_names(&l), ["alpha", "link"]);
+        let entries = l.entries.lock().unwrap();
+        assert!(entries[id as usize].is_dir());
+        assert!(entries[id as usize].is_symlink);
+    }
+}

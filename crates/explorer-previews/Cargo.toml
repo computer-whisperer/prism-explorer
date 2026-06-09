@@ -1,0 +1,18 @@
+[package]
+name = "explorer-previews"
+description = "Preview handlers for prism-explorer — type dispatch and per-format preview loading"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+tracing.workspace = true
+achromat.workspace = true
+damascene-core.workspace = true
+
+[dev-dependencies]
+png = "0.18"
