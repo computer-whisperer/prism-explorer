@@ -15,7 +15,8 @@ prism-explorer [DIRECTORY]    # defaults to $HOME
 
 | Key | Action |
 | --- | --- |
-| arrows / `jk` | move selection |
+| arrows / `hjkl` | move selection (list: ←/`h` parent, →/`l` enter dir) |
+| `g` | toggle list / thumbnail grid |
 | Enter / double-click | open directory · open file (`xdg-open`) |
 | Backspace | parent directory |
 | Home / End | first / last entry |
@@ -40,12 +41,22 @@ hard rule: **no filesystem call ever runs on the UI thread.**
   CICP/ICC handling, HDR luminance anchoring), known text/code types,
   and a sniffing fallback that separates unknown text from binary with
   one bounded read.
+- **`crates/explorer-thumbs`** — the on-disk thumbnail cache. Unlike
+  the freedesktop spec's 8-bit sRGB PNGs, entries store linear-light
+  f16 tagged with primaries and reference luminance, so an HDR
+  thumbnail re-renders exactly like a fresh decode. Keyed by source
+  path + mtime + size; atomic writes; corruption is a miss, not an
+  error; LRU byte-budget sweep at launch. Lives on local disk
+  (`~/.cache/prism-explorer/thumbs`), never the filesystem being
+  browsed.
 - **`crates/explorer`** — the damascene app: places sidebar (XDG dirs +
   network mounts from `/proc/mounts`), breadcrumbs, virtualized list
-  view (`virtual_list`, fine at 100k entries), resizable preview pane.
-  Selection keeps stable entry ids across streaming resorts; preview
-  decodes are latest-wins (holding an arrow key through a directory
-  queues one decode, not fifty).
+  and thumbnail-grid views (`virtual_list`, fine at 100k entries),
+  resizable preview pane. Selection keeps stable entry ids across
+  streaming resorts; preview decodes are latest-wins (holding an arrow
+  key through a directory queues one decode, not fifty); grid
+  thumbnails decode only for realized cells and are RAM-capped by an
+  LRU however large the directory is.
 
 HDR output negotiates per-output (`ColorPreferences::hdr_extended`);
 image previews render with full panel headroom (`NoLimit`
@@ -54,12 +65,10 @@ shows what the host negotiated.
 
 ## Roadmap
 
-- On-disk HDR-preserving thumbnail cache (the freedesktop spec's 8-bit
-  sRGB PNGs throw away exactly what this explorer is for)
 - XDG portal `FileChooser` backend — explorer-quality open/save dialogs
   for every portal-using app — plus `org.freedesktop.FileManager1`
-- Grid view with image thumbnails; more preview handlers (PDF, video,
-  audio, archives, fonts); search; file operations
+- More preview handlers (PDF, video, audio, archives, fonts); search;
+  file operations; syntax highlighting
 
 ## License
 

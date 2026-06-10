@@ -23,6 +23,10 @@ damascene-winit-wgpu.workspace = true
 achromat.workspace = true
 explorer-io.workspace = true
 explorer-previews.workspace = true
+explorer-thumbs.workspace = true
+
+# RAM cap on decoded grid thumbnails.
+lru = "0.18"
 
 # mtime column formatting.
 chrono = { version = "0.4", default-features = false, features = ["clock"] }

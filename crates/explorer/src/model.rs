@@ -35,16 +35,22 @@ pub struct Entry {
     /// stat pass (which follows symlinks).
     pub kind: EntryKind,
     pub is_symlink: bool,
+    /// Name claims an image extension (cached: the grid asks every
+    /// frame, and the answer can't change without a new listing).
+    pub is_image: bool,
     pub meta: Option<EntryMeta>,
     pub meta_error: Option<String>,
 }
 
 impl Entry {
     fn from_raw(raw: RawEntry) -> Self {
+        use explorer_previews::{ImageHandler, PreviewHandler as _};
         let display = raw.name.to_string_lossy().into_owned();
         Entry {
             sort_key: display.to_lowercase(),
             display,
+            is_image: raw.kind != EntryKind::Dir
+                && ImageHandler.claims(std::path::Path::new(&raw.name)),
             name: raw.name,
             kind: raw.kind,
             is_symlink: raw.kind == EntryKind::Symlink,
@@ -186,6 +192,11 @@ pub enum Msg {
         generation: u64,
         id: EntryId,
         result: Result<Preview, String>,
+    },
+    Thumb {
+        generation: u64,
+        id: EntryId,
+        result: Result<damascene_core::image::Image, String>,
     },
     Places(Vec<Place>),
 }

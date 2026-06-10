@@ -8,23 +8,27 @@
 //! file's preview decodes at the front of the queue, and navigating
 //! away drops every queued job for the directory being left.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
 use std::ffi::OsString;
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 
+use damascene_core::image::Image;
 use damascene_core::prelude::*;
 use damascene_core::scroll::{ScrollAlignment, ScrollRequest};
 use damascene_core::{BuildCx, EventCx, KeyChord, UiEvent, UiEventKind, UiKey};
 use damascene_winit_wgpu::Wakeup;
+use lru::LruCache;
 
 use explorer_io::{listing, stat, EntryKind, Notifier, Pool, Tier};
 use explorer_previews::{Preview, Registry};
+use explorer_thumbs::ThumbCache;
 
 use crate::fmt;
-use crate::model::{EntryId, Listing, Msg};
+use crate::model::{Entry, EntryId, Listing, Msg};
 use crate::places::Place;
 
 /// The host's wakeup handle, shared with every worker that posts
@@ -37,9 +41,58 @@ const SIDEBAR_MAX: f32 = 420.0;
 const PREVIEW_MIN: f32 = 260.0;
 const PREVIEW_MAX: f32 = 900.0;
 
+// Grid view geometry. Cells are media (thumbnail or icon) over a name
+// caption; the virtual list row height bakes the gap in, which also
+// keeps focus rings clear of the next row.
+const TILE_W: f32 = 128.0;
+const TILE_MEDIA_H: f32 = 84.0;
+const TILE_H: f32 = 116.0;
+const TILE_GAP: f32 = tokens::SPACE_2;
+
+/// RAM cap on decoded thumbnails (LRU). At the 256px cache edge a 16:9
+/// thumb is ~300 KB of f16, so this bounds thumbnail RAM near 150 MB
+/// however large the directory is.
+const RAM_THUMBS: usize = 512;
+
 /// Display cap for text previews — the handler already bounds the read
 /// at 128 KiB; this bounds what one mono text leaf has to lay out.
 const TEXT_PREVIEW_MAX_LINES: usize = 400;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ViewMode {
+    List,
+    Grid,
+}
+
+/// Decoded thumbnails plus request bookkeeping. Shared with the grid's
+/// `'static` cell builder (same Arc<Mutex> rationale as the entries —
+/// UI thread only, the lock just satisfies the bound).
+struct ThumbState {
+    ram: LruCache<EntryId, Image>,
+    /// Jobs submitted, to dedupe across frames.
+    requested: HashSet<EntryId>,
+    /// Decodes that failed; the cell falls back to a file icon (the
+    /// preview pane is where the user sees the actual error).
+    failed: HashSet<EntryId>,
+}
+
+impl ThumbState {
+    fn new() -> Self {
+        ThumbState {
+            ram: LruCache::new(NonZeroUsize::new(RAM_THUMBS).expect("nonzero")),
+            requested: HashSet::new(),
+            failed: HashSet::new(),
+        }
+    }
+
+    /// Entry ids restart at 0 in a new directory — everything here is
+    /// meaningless after a navigation.
+    fn reset(&mut self) {
+        self.ram.clear();
+        self.requested.clear();
+        self.failed.clear();
+    }
+}
 
 enum PreviewState {
     /// Nothing selected, or a directory is.
@@ -68,6 +121,13 @@ pub struct ExplorerApp {
     listing: Listing,
     places: Vec<Place>,
     show_hidden: bool,
+    view: ViewMode,
+
+    thumbs: Arc<ThumbCache>,
+    thumb_state: Arc<Mutex<ThumbState>>,
+    /// Columns the grid laid out last frame (build-time, viewport
+    /// dependent); keyboard navigation moves by this much vertically.
+    cols: Cell<usize>,
 
     /// Selected entry: stable id plus its current position in
     /// `listing.order` (kept in sync across resorts).
@@ -96,7 +156,13 @@ pub struct ExplorerApp {
 }
 
 impl ExplorerApp {
-    pub fn new(start: PathBuf, pool: Pool, notifier: Notifier, registry: Arc<Registry>) -> Self {
+    pub fn new(
+        start: PathBuf,
+        pool: Pool,
+        notifier: Notifier,
+        registry: Arc<Registry>,
+        thumbs: Arc<ThumbCache>,
+    ) -> Self {
         let (tx, rx) = channel();
         let mut app = ExplorerApp {
             listing: Listing::new(start.clone(), pool.generation()),
@@ -108,6 +174,10 @@ impl ExplorerApp {
             registry,
             places: Vec::new(),
             show_hidden: false,
+            view: ViewMode::List,
+            thumbs,
+            thumb_state: Arc::new(Mutex::new(ThumbState::new())),
+            cols: Cell::new(1),
             selected: None,
             pending_select: None,
             preview: PreviewState::Empty,
@@ -147,8 +217,9 @@ impl ExplorerApp {
         self.preview_inflight = None;
         self.preview_wanted = None;
         self.stat_requested.lock().unwrap().clear();
+        self.thumb_state.lock().unwrap().reset();
         self.scroll_requests.borrow_mut().push(ScrollRequest::new(
-            "list",
+            self.scroll_key(),
             0,
             ScrollAlignment::Visible,
         ));
@@ -176,14 +247,30 @@ impl ExplorerApp {
         self.navigate(parent, from);
     }
 
+    /// Scroll container key + the index of the line holding `pos` in
+    /// the active view (the grid packs `cols` entries per line).
+    fn scroll_key(&self) -> &'static str {
+        match self.view {
+            ViewMode::List => "list",
+            ViewMode::Grid => "grid",
+        }
+    }
+
+    fn scroll_line_of(&self, pos: usize) -> usize {
+        match self.view {
+            ViewMode::List => pos,
+            ViewMode::Grid => pos / self.cols.get().max(1),
+        }
+    }
+
     fn select_id(&mut self, id: EntryId) {
         let Some(pos) = self.listing.pos_of(id) else {
             return;
         };
         self.selected = Some((id, pos));
         self.scroll_requests.borrow_mut().push(ScrollRequest::new(
-            "list",
-            pos,
+            self.scroll_key(),
+            self.scroll_line_of(pos),
             ScrollAlignment::Visible,
         ));
 
@@ -273,6 +360,23 @@ impl ExplorerApp {
         self.remap_selection();
     }
 
+    fn toggle_view(&mut self) {
+        self.view = match self.view {
+            ViewMode::List => ViewMode::Grid,
+            ViewMode::Grid => ViewMode::List,
+        };
+        // Keep the selection on screen in the other view. On the first
+        // ever switch to grid, `cols` is still the default — the target
+        // self-corrects on the next selection move.
+        if let Some((_, pos)) = self.selected {
+            self.scroll_requests.borrow_mut().push(ScrollRequest::new(
+                self.scroll_key(),
+                self.scroll_line_of(pos),
+                ScrollAlignment::Visible,
+            ));
+        }
+    }
+
     /// Re-derive the selection's position after `order` changed; drop
     /// the selection if its entry was filtered out.
     fn remap_selection(&mut self) {
@@ -347,24 +451,33 @@ impl ExplorerApp {
             }
         }
 
+        let (view_icon, view_tip) = match self.view {
+            ViewMode::List => ("layout-dashboard", "grid view (g)"),
+            ViewMode::Grid => ("menu", "list view (g)"),
+        };
         toolbar([
             icon_button("chevron-up")
                 .key("up")
                 .tooltip("parent directory (Backspace)"),
             breadcrumb([breadcrumb_list(items)]),
             spacer(),
+            icon_button(view_icon).key("view-toggle").tooltip(view_tip),
             color_mode_badge(cx),
         ])
     }
 
-    fn list_el(&self) -> El {
+    /// Error / still-empty states shared by both views; `None` once
+    /// there are entries to show.
+    fn listing_placeholder(&self) -> Option<El> {
         if let Some(err) = &self.listing.error {
-            return column([icon("alert-circle"), text(err.clone()).muted()])
-                .gap(tokens::SPACE_3)
-                .align(Align::Center)
-                .justify(Justify::Center)
-                .width(Size::Fill(1.0))
-                .height(Size::Fill(1.0));
+            return Some(
+                column([icon("alert-circle"), text(err.clone()).muted()])
+                    .gap(tokens::SPACE_3)
+                    .align(Align::Center)
+                    .justify(Justify::Center)
+                    .width(Size::Fill(1.0))
+                    .height(Size::Fill(1.0)),
+            );
         }
         if self.listing.order.is_empty() {
             let label: El = if self.listing.complete {
@@ -374,11 +487,20 @@ impl ExplorerApp {
                     .gap(tokens::SPACE_2)
                     .align(Align::Center)
             };
-            return column([label])
-                .align(Align::Center)
-                .justify(Justify::Center)
-                .width(Size::Fill(1.0))
-                .height(Size::Fill(1.0));
+            return Some(
+                column([label])
+                    .align(Align::Center)
+                    .justify(Justify::Center)
+                    .width(Size::Fill(1.0))
+                    .height(Size::Fill(1.0)),
+            );
+        }
+        None
+    }
+
+    fn list_el(&self) -> El {
+        if let Some(placeholder) = self.listing_placeholder() {
+            return placeholder;
         }
 
         // Snapshots/handles for the 'static row builder.
@@ -397,31 +519,18 @@ impl ExplorerApp {
             let entries = entries.lock().unwrap();
             let e = &entries[id as usize];
 
-            // Realized row without metadata: queue a stat, once.
-            if e.meta.is_none() && e.meta_error.is_none() {
-                let mut requested = stat_requested.lock().unwrap();
-                if requested.insert(id) {
-                    let path = dir.join(&e.name);
-                    let tx = tx.clone();
-                    let notify = notify.clone();
-                    pool.submit(Tier::Visible, move || {
-                        let result = stat::stat_entry(&path);
-                        let _ = tx.send(Msg::Stat {
-                            generation,
-                            id,
-                            result,
-                        });
-                        notify();
-                    });
-                }
-            }
+            maybe_request_stat(
+                e,
+                id,
+                &dir,
+                generation,
+                &pool,
+                &tx,
+                &notify,
+                &stat_requested,
+            );
 
-            let icon_name = match e.kind {
-                EntryKind::Dir => "folder",
-                EntryKind::File => "file",
-                EntryKind::Symlink => "file",
-                EntryKind::Other => "more-horizontal",
-            };
+            let icon_name = entry_icon(e.kind);
             let size = match &e.meta {
                 Some(m) if m.kind == EntryKind::File => fmt::human_bytes(m.size),
                 _ => String::new(),
@@ -467,6 +576,133 @@ impl ExplorerApp {
         // also keeps the rings inside the scroll scissor).
         .gap(tokens::RING_WIDTH)
         .key("list")
+    }
+
+    /// Grid of thumbnail tiles, virtualized by row (the gallery's
+    /// pattern). Image cells pull from the thumbnail cache — RAM LRU
+    /// first, then a worker job that hits disk or decodes; everything
+    /// else shows its kind icon.
+    fn grid_el(&self, cx: &BuildCx) -> El {
+        if let Some(placeholder) = self.listing_placeholder() {
+            return placeholder;
+        }
+
+        // Width available to tiles: viewport minus sidebar, preview
+        // pane, page padding, panel gaps, and slack for card padding,
+        // strokes, resize handles, and the scrollbar gutter. Erring
+        // low costs at most one column; erring high overflows the row.
+        let vw = cx.viewport_width().unwrap_or(1280.0);
+        let avail = vw
+            - self.sidebar_w
+            - self.preview_w
+            - 2.0 * tokens::SPACE_4
+            - 4.0 * tokens::SPACE_2
+            - 24.0;
+        let cols = (((avail + TILE_GAP) / (TILE_W + TILE_GAP)) as usize).max(1);
+        self.cols.set(cols);
+        let count = self.listing.order.len();
+        let rows = count.div_ceil(cols);
+
+        // Snapshots/handles for the 'static cell builder.
+        let entries = self.listing.entries.clone();
+        let order = self.listing.order.clone();
+        let dir = self.listing.dir.clone();
+        let generation = self.listing.generation;
+        let pool = self.pool.clone();
+        let tx = self.tx.clone();
+        let notify = self.notifier.clone();
+        let stat_requested = self.stat_requested.clone();
+        let thumb_state = self.thumb_state.clone();
+        let thumbs = self.thumbs.clone();
+        let selected_id = self.selected_id();
+
+        virtual_list(rows, TILE_H + TILE_GAP, move |r| {
+            let mut cells = Vec::with_capacity(cols);
+            for col in 0..cols {
+                let i = r * cols + col;
+                if i >= count {
+                    cells.push(spacer().width(Size::Fixed(TILE_W)));
+                    continue;
+                }
+                let id = order[i];
+                let entries = entries.lock().unwrap();
+                let e = &entries[id as usize];
+
+                maybe_request_stat(
+                    e,
+                    id,
+                    &dir,
+                    generation,
+                    &pool,
+                    &tx,
+                    &notify,
+                    &stat_requested,
+                );
+
+                let name = e.display.clone();
+                let icon_name = entry_icon(e.kind);
+                let wants_thumb = e.is_image && e.kind != EntryKind::Dir;
+                let path = wants_thumb.then(|| dir.join(&e.name));
+                drop(entries);
+
+                let media: El = if let Some(path) = path {
+                    let mut ts = thumb_state.lock().unwrap();
+                    if let Some(img) = ts.ram.get(&id) {
+                        image(img.clone())
+                            .image_fit(ImageFit::Cover)
+                            // A wall of 1000-nit tiles would be hostile;
+                            // cap grid brights at 2× reference (the
+                            // preview pane shows full headroom).
+                            .dynamic_range_limit(DynamicRangeLimit::ConstrainedHigh)
+                            .radius(tokens::RADIUS_SM)
+                            .width(Size::Fill(1.0))
+                            .height(Size::Fixed(TILE_MEDIA_H))
+                    } else if ts.failed.contains(&id) {
+                        tile_icon(icon_name)
+                    } else {
+                        // Realized cell without a thumb: queue one, once.
+                        if ts.requested.insert(id) {
+                            let tx = tx.clone();
+                            let notify = notify.clone();
+                            let thumbs = thumbs.clone();
+                            pool.submit(Tier::Visible, move || {
+                                let result = thumbs.thumbnail(&path).map_err(|e| format!("{e:#}"));
+                                let _ = tx.send(Msg::Thumb {
+                                    generation,
+                                    id,
+                                    result,
+                                });
+                                notify();
+                            });
+                        }
+                        skeleton()
+                            .radius(tokens::RADIUS_SM)
+                            .width(Size::Fill(1.0))
+                            .height(Size::Fixed(TILE_MEDIA_H))
+                    }
+                } else {
+                    tile_icon(icon_name)
+                };
+
+                let cell = column([media, text(name.clone()).caption()])
+                    .gap(tokens::SPACE_1)
+                    .align(Align::Center)
+                    .width(Size::Fixed(TILE_W))
+                    .height(Size::Fixed(TILE_H))
+                    .radius(tokens::RADIUS_SM)
+                    .clip()
+                    .key(format!("row:{id}"))
+                    .focusable()
+                    .tooltip(name);
+                cells.push(if Some(id) == selected_id {
+                    cell.current()
+                } else {
+                    cell.ghost()
+                });
+            }
+            row(cells).gap(TILE_GAP)
+        })
+        .key("grid")
     }
 
     fn preview_pane(&self) -> El {
@@ -598,6 +834,59 @@ impl ExplorerApp {
     }
 }
 
+fn entry_icon(kind: EntryKind) -> &'static str {
+    match kind {
+        EntryKind::Dir => "folder",
+        EntryKind::File | EntryKind::Symlink => "file",
+        EntryKind::Other => "more-horizontal",
+    }
+}
+
+/// Icon centered in a grid cell's media area (non-image entries, and
+/// image entries whose thumbnail failed).
+fn tile_icon(name: &'static str) -> El {
+    column([icon(name).icon_size(28.0).color(tokens::MUTED_FOREGROUND)])
+        .align(Align::Center)
+        .justify(Justify::Center)
+        .width(Size::Fill(1.0))
+        .height(Size::Fixed(TILE_MEDIA_H))
+}
+
+/// Realized row/cell without metadata: queue a stat, once per entry.
+/// Lives outside the app so both views' `'static` builders can call it
+/// on their captured handles.
+#[allow(clippy::too_many_arguments)]
+fn maybe_request_stat(
+    e: &Entry,
+    id: EntryId,
+    dir: &Path,
+    generation: u64,
+    pool: &Pool,
+    tx: &Sender<Msg>,
+    notify: &Notifier,
+    stat_requested: &Arc<Mutex<HashSet<EntryId>>>,
+) {
+    if e.meta.is_some() || e.meta_error.is_some() {
+        return;
+    }
+    let mut requested = stat_requested.lock().unwrap();
+    if !requested.insert(id) {
+        return;
+    }
+    let path = dir.join(&e.name);
+    let tx = tx.clone();
+    let notify = notify.clone();
+    pool.submit(Tier::Visible, move || {
+        let result = stat::stat_entry(&path);
+        let _ = tx.send(Msg::Stat {
+            generation,
+            id,
+            result,
+        });
+        notify();
+    });
+}
+
 fn preview_placeholder(icon_name: &str, label: &str) -> El {
     card([preview_placeholder_body(icon_name, label).padding(tokens::SPACE_4)])
         .width(Size::Fixed(420.0))
@@ -673,16 +962,40 @@ impl App for ExplorerApp {
                         }
                     }
                 }
+                Msg::Thumb {
+                    generation,
+                    id,
+                    result,
+                } => {
+                    let mut ts = self.thumb_state.lock().unwrap();
+                    ts.requested.remove(&id);
+                    if generation != self.listing.generation {
+                        continue;
+                    }
+                    match result {
+                        Ok(image) => {
+                            ts.ram.put(id, image);
+                        }
+                        Err(error) => {
+                            tracing::warn!(id, error, "thumbnail failed");
+                            ts.failed.insert(id);
+                        }
+                    }
+                }
                 Msg::Places(places) => self.places = places,
             }
         }
     }
 
     fn build(&self, cx: &BuildCx) -> El {
+        let center = match self.view {
+            ViewMode::List => self.list_el(),
+            ViewMode::Grid => self.grid_el(cx),
+        };
         let content = row([
             self.sidebar_el(),
             resize_handle(Axis::Row).key("sidebar-resize"),
-            card([self.list_el().padding(tokens::SPACE_2)])
+            card([center.padding(tokens::SPACE_2)])
                 .width(Size::Fill(1.0))
                 .height(Size::Fill(1.0)),
             resize_handle(Axis::Row).key("preview-resize"),
@@ -719,12 +1032,17 @@ impl App for ExplorerApp {
         vec![
             (KeyChord::named(UiKey::ArrowUp), "prev".into()),
             (KeyChord::named(UiKey::ArrowDown), "next".into()),
+            (KeyChord::named(UiKey::ArrowLeft), "left".into()),
+            (KeyChord::named(UiKey::ArrowRight), "right".into()),
             (KeyChord::named(UiKey::Home), "first".into()),
             (KeyChord::named(UiKey::End), "last".into()),
             (KeyChord::named(UiKey::Enter), "open".into()),
             (KeyChord::named(UiKey::Backspace), "parent".into()),
             (KeyChord::vim('k'), "prev".into()),
             (KeyChord::vim('j'), "next".into()),
+            (KeyChord::vim('h'), "left".into()),
+            (KeyChord::vim('l'), "right".into()),
+            (KeyChord::vim('g'), "view".into()),
             (KeyChord::vim('.'), "hidden".into()),
         ]
     }
@@ -796,12 +1114,44 @@ impl App for ExplorerApp {
                 self.navigate_parent();
                 return;
             }
+            if key == "view-toggle" && event.is_click_or_activate(key) {
+                self.toggle_view();
+                return;
+            }
         }
 
+        // Vertical motion is one entry in the list, one grid row in the
+        // grid; horizontal motion only exists in the grid (in the list,
+        // left/right walk the hierarchy, file-manager style).
+        let vstep = match self.view {
+            ViewMode::List => 1,
+            ViewMode::Grid => self.cols.get().max(1) as isize,
+        };
         if event.is_hotkey("next") {
-            self.move_selection(1);
+            self.move_selection(vstep);
         } else if event.is_hotkey("prev") {
-            self.move_selection(-1);
+            self.move_selection(-vstep);
+        } else if event.is_hotkey("left") {
+            match self.view {
+                ViewMode::List => self.navigate_parent(),
+                ViewMode::Grid => self.move_selection(-1),
+            }
+        } else if event.is_hotkey("right") {
+            match self.view {
+                ViewMode::List => {
+                    if let Some(id) = self.selected_id() {
+                        let entries = self.listing.entries.lock().unwrap();
+                        let is_dir = entries.get(id as usize).is_some_and(Entry::is_dir);
+                        drop(entries);
+                        if is_dir {
+                            self.activate_id(id);
+                        }
+                    }
+                }
+                ViewMode::Grid => self.move_selection(1),
+            }
+        } else if event.is_hotkey("view") {
+            self.toggle_view();
         } else if event.is_hotkey("first") {
             self.select_pos(0);
         } else if event.is_hotkey("last") {
@@ -893,11 +1243,16 @@ mod tests {
     fn test_app() -> ExplorerApp {
         let pool = Pool::spawn(1, "test");
         let notifier: Notifier = Arc::new(|| {});
+        let thumbs = ThumbCache::new(
+            std::env::temp_dir().join(format!("explorer-app-test-{}", std::process::id())),
+            256,
+        );
         let mut app = ExplorerApp::new(
             PathBuf::from("/test/somewhere"),
             pool,
             notifier,
             Arc::new(Registry::standard()),
+            Arc::new(thumbs),
         );
         app.places = vec![
             Place {
@@ -976,6 +1331,50 @@ mod tests {
             },
         };
         assert_eq!(lint_findings(&app), Vec::<String>::new());
+    }
+
+    /// Grid view with every cell flavor at once: a decoded thumbnail
+    /// (synthetic 2×2 image in the RAM LRU), a pending image (skeleton +
+    /// queued job), a failed image, plus plain dir/file icon cells.
+    #[test]
+    fn grid_tree_lints_clean() {
+        let mut app = test_app();
+        app.view = ViewMode::Grid;
+        app.listing.absorb(
+            ListingUpdate {
+                batch: vec![
+                    RawEntry {
+                        name: "pending.png".into(),
+                        kind: EntryKind::File,
+                    },
+                    RawEntry {
+                        name: "broken.avif".into(),
+                        kind: EntryKind::File,
+                    },
+                ],
+                done: true,
+                error: None,
+            },
+            false,
+        );
+        let thumbed = app
+            .listing
+            .id_by_name(std::ffi::OsStr::new("photo.jxr"))
+            .unwrap();
+        let broken = app
+            .listing
+            .id_by_name(std::ffi::OsStr::new("broken.avif"))
+            .unwrap();
+        {
+            let mut ts = app.thumb_state.lock().unwrap();
+            ts.ram.put(thumbed, Image::from_rgba8(2, 2, vec![128; 16]));
+            ts.failed.insert(broken);
+        }
+        let id = thumbed;
+        let pos = app.listing.pos_of(id).unwrap();
+        app.selected = Some((id, pos));
+        assert_eq!(lint_findings(&app), Vec::<String>::new());
+        assert!(app.cols.get() > 1, "grid should lay out multiple columns");
     }
 
     #[test]

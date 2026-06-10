@@ -22,6 +22,15 @@ use damascene_winit_wgpu::{run_with_config, HostConfig};
 use app::{ExplorerApp, SharedWakeup};
 use explorer_io::{Notifier, Pool};
 use explorer_previews::Registry;
+use explorer_thumbs::ThumbCache;
+
+/// Long edge of cached thumbnails: 2× the grid tile width, so tiles
+/// stay sharp on 2× displays.
+const THUMB_EDGE: u32 = 256;
+
+/// On-disk cache budget. ~300 KB per f16 thumbnail → room for roughly
+/// seven thousand of them.
+const THUMB_BUDGET_BYTES: u64 = 2 << 30;
 
 fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -63,8 +72,37 @@ fn main() -> Result<()> {
         })
     };
 
+    // Thumbnails cache to local disk, never the (possibly network)
+    // filesystem being browsed. tmp fallback still caches within a
+    // session if no home directory resolves.
+    let thumbs = Arc::new(ThumbCache::standard(THUMB_EDGE).unwrap_or_else(|| {
+        ThumbCache::new(
+            std::env::temp_dir().join("prism-explorer-thumbs"),
+            THUMB_EDGE,
+        )
+    }));
+
+    // Evict LRU thumbnails beyond the byte budget (and orphaned temp
+    // files) once per launch. A detached thread, not the IO pool: this
+    // touches only local disk (no Ceph contention to manage), and pool
+    // jobs are cancelled wholesale on every navigation.
+    {
+        let thumbs = thumbs.clone();
+        std::thread::Builder::new()
+            .name("thumb-sweep".into())
+            .spawn(move || {
+                thumbs.sweep(THUMB_BUDGET_BYTES);
+            })?;
+    }
+
     let pool = Pool::spawn(workers, "explorer-io");
-    let app = ExplorerApp::new(start, pool, notifier, Arc::new(Registry::standard()));
+    let app = ExplorerApp::new(
+        start,
+        pool,
+        notifier,
+        Arc::new(Registry::standard()),
+        thumbs,
+    );
 
     let config = HostConfig::default()
         .with_app_id("prism-explorer")

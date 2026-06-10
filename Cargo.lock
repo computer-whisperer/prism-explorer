@@ -2654,6 +2654,8 @@ dependencies = [
  "damascene-winit-wgpu",
  "explorer-io",
  "explorer-previews",
+ "explorer-thumbs",
+ "lru",
  "tracing",
  "tracing-subscriber",
 ]
