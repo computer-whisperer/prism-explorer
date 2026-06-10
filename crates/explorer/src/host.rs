@@ -222,9 +222,15 @@ impl Host {
                 self.gpu = Some(acquire_gpu(window.clone())?);
             }
             let gpu = self.gpu.as_ref().unwrap();
-            let mut gfx =
-                WindowGfx::new(&gpu.instance, &gpu.adapter, &gpu.device, &gpu.queue, window, &self.config)
-                    .map_err(|e| format!("could not create a rendering surface: {e}"))?;
+            let mut gfx = WindowGfx::new(
+                &gpu.instance,
+                &gpu.adapter,
+                &gpu.device,
+                &gpu.queue,
+                window,
+                &self.config,
+            )
+            .map_err(|e| format!("could not create a rendering surface: {e}"))?;
             let mut app = spec.app;
             gfx.renderer.set_theme(app.theme());
             for s in app.shaders() {
@@ -495,7 +501,11 @@ impl ApplicationHandler<HostCommand> for Host {
                 };
                 match state {
                     ElementState::Pressed => {
-                        for event in win.gfx.renderer.pointer_down(Pointer::mouse(lx, ly, button)) {
+                        for event in win
+                            .gfx
+                            .renderer
+                            .pointer_down(Pointer::mouse(lx, ly, button))
+                        {
                             dispatch_app_event(
                                 win.app.as_mut(),
                                 event,
@@ -572,7 +582,11 @@ impl ApplicationHandler<HostCommand> for Host {
                 ..
             } => {
                 if let Some(key) = map_key(&key_event.logical_key) {
-                    for event in win.gfx.renderer.key_down(key, win.modifiers, key_event.repeat) {
+                    for event in win
+                        .gfx
+                        .renderer
+                        .key_down(key, win.modifiers, key_event.repeat)
+                    {
                         // Clipboard chords resolve host-side: the app
                         // sees a paste with text attached, a cut as a
                         // delete-selection, and copies untouched.
@@ -801,7 +815,8 @@ impl WindowState {
         }
 
         let frame = match gfx.surface.get_current_texture() {
-            wgpu::CurrentSurfaceTexture::Success(t) | wgpu::CurrentSurfaceTexture::Suboptimal(t) => t,
+            wgpu::CurrentSurfaceTexture::Success(t)
+            | wgpu::CurrentSurfaceTexture::Suboptimal(t) => t,
             wgpu::CurrentSurfaceTexture::Lost | wgpu::CurrentSurfaceTexture::Outdated => {
                 // Reconfigure and re-request — without the request the
                 // compositor keeps the stale frame until some other

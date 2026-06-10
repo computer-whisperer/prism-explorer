@@ -259,7 +259,9 @@ impl Request {
         self.closed.store(true, Ordering::Relaxed);
         // Closing the window drops the picker, whose unanswered reply
         // resolves the pending method call.
-        let _ = self.proxy.send_event(HostCommand::CloseWindow { token: self.token });
+        let _ = self
+            .proxy
+            .send_event(HostCommand::CloseWindow { token: self.token });
     }
 }
 

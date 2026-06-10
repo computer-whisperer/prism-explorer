@@ -197,12 +197,20 @@ impl App for PickerApp {
         // Enter/arrow hotkeys don't fire mid-typing.
         if event.target_key() == Some("picker-name") {
             if event.kind == UiEventKind::KeyDown
-                && event.key_press.as_ref().is_some_and(|kp| kp.key == UiKey::Enter)
+                && event
+                    .key_press
+                    .as_ref()
+                    .is_some_and(|kp| kp.key == UiKey::Enter)
             {
                 self.accept();
                 return;
             }
-            text_input::apply_event(&mut self.filename, &mut self.selection, "picker-name", &event);
+            text_input::apply_event(
+                &mut self.filename,
+                &mut self.selection,
+                "picker-name",
+                &event,
+            );
             return;
         }
         if event.is_click_or_activate("picker-accept") {

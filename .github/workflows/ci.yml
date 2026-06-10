@@ -1,0 +1,118 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+
+# The workspace path-depends on two unpublished siblings (see the root
+# Cargo.toml): achromat at ../achromat and damascene's worktree at
+# ../damascene/damascene.main. Every job recreates that layout by
+# checking the repo out into a subdirectory with the siblings beside
+# it, pinned to the commits Cargo.lock was generated against. Drop the
+# sibling checkouts when achromat and damascene 0.4.3 publish.
+
+jobs:
+  fmt:
+    name: Rustfmt
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: prism-explorer
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          path: prism-explorer
+      - uses: actions/checkout@v6
+        with:
+          repository: computer-whisperer/achromat
+          ref: 4d8317a251745f26eef6492209bfea5714748ef2
+          path: achromat
+      - uses: actions/checkout@v6
+        with:
+          repository: computer-whisperer/damascene
+          ref: 8d9054ea9cdbf13cb9e66e6a44257d121c88d6a9
+          path: damascene/damascene.main
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all --check
+
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: prism-explorer
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          path: prism-explorer
+      - uses: actions/checkout@v6
+        with:
+          repository: computer-whisperer/achromat
+          ref: 4d8317a251745f26eef6492209bfea5714748ef2
+          path: achromat
+      - uses: actions/checkout@v6
+        with:
+          repository: computer-whisperer/damascene
+          ref: 8d9054ea9cdbf13cb9e66e6a44257d121c88d6a9
+          path: damascene/damascene.main
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      # wgpu/winit need vulkan + wayland/xkb + dbus on Linux (same set
+      # as damascene's CI); dav1d backs achromat's AVIF decode.
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libvulkan-dev libwayland-dev libxkbcommon-dev libdbus-1-dev libdav1d-dev
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: prism-explorer
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+  build-test:
+    name: Build + Test
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: prism-explorer
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          path: prism-explorer
+      - uses: actions/checkout@v6
+        with:
+          repository: computer-whisperer/achromat
+          ref: 4d8317a251745f26eef6492209bfea5714748ef2
+          path: achromat
+      - uses: actions/checkout@v6
+        with:
+          repository: computer-whisperer/damascene
+          ref: 8d9054ea9cdbf13cb9e66e6a44257d121c88d6a9
+          path: damascene/damascene.main
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libvulkan-dev libwayland-dev libxkbcommon-dev libdbus-1-dev libdav1d-dev
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: prism-explorer
+      - name: Build workspace
+        run: cargo build --workspace --all-targets --locked
+      - name: Run tests
+        run: cargo test --workspace --locked
+      # CPU-only render of every canned scene; fails on lint findings.
+      # The artifacts (svg + tree dumps) double as a layout snapshot.
+      - name: Bundle lint gate
+        run: cargo run -p prism-explorer --bin dump_bundles --locked
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bundle-dumps
+          path: prism-explorer/crates/explorer/out/
