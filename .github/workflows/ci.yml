@@ -112,7 +112,7 @@ jobs:
       # The artifacts (svg + tree dumps) double as a layout snapshot.
       - name: Bundle lint gate
         run: cargo run -p prism-explorer --bin dump_bundles --locked
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v5
         with:
           name: bundle-dumps
           path: prism-explorer/crates/explorer/out/
