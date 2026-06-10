@@ -30,3 +30,6 @@ lru = "0.18"
 
 # mtime column formatting.
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
+
+# org.freedesktop.FileManager1 service (blocking API on its own thread).
+zbus = "5"

@@ -1,0 +1,8 @@
+# D-Bus activation: lets "show in file manager" calls launch
+# prism-explorer when it isn't already running.
+#
+# Install to ~/.local/share/dbus-1/services/ (or the system dir) and
+# adjust Exec to the installed binary path.
+[D-BUS Service]
+Name=org.freedesktop.FileManager1
+Exec=/usr/local/bin/prism-explorer

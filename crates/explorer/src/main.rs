@@ -7,6 +7,7 @@
 //! Usage: `prism-explorer [DIRECTORY]` — defaults to `$HOME`.
 
 mod app;
+mod filemanager1;
 mod fmt;
 mod model;
 mod places;
@@ -99,10 +100,15 @@ fn main() -> Result<()> {
     let app = ExplorerApp::new(
         start,
         pool,
-        notifier,
+        notifier.clone(),
         Arc::new(Registry::standard()),
         thumbs,
     );
+
+    // "Show this in the file manager" service — browsers' Open
+    // containing folder, etc. Best-effort: if another file manager
+    // owns the name we stay a plain browser.
+    filemanager1::spawn(app.msg_sender(), notifier);
 
     let config = HostConfig::default()
         .with_app_id("prism-explorer")

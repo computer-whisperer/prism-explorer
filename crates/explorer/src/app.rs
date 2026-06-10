@@ -200,6 +200,12 @@ impl ExplorerApp {
     /// navigation) bumps the pool generation, which cancels queued
     /// jobs wholesale — a pooled probe was reliably dropped before it
     /// ran, leaving the sidebar on "probing…" forever.
+    /// Sender half of the app's message queue, for external services
+    /// (D-Bus) that post commands to the UI thread.
+    pub fn msg_sender(&self) -> Sender<Msg> {
+        self.tx.clone()
+    }
+
     fn spawn_places_probe(&self) {
         let tx = self.tx.clone();
         let notify = self.notifier.clone();
@@ -1026,6 +1032,7 @@ impl App for ExplorerApp {
                     }
                 }
                 Msg::Places(places) => self.places = places,
+                Msg::OpenLocation { dir, select } => self.navigate(dir, select),
             }
         }
     }

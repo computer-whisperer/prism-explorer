@@ -199,6 +199,13 @@ pub enum Msg {
         result: Result<damascene_core::image::Image, String>,
     },
     Places(Vec<Place>),
+    /// External command (D-Bus): navigate to `dir`, then select
+    /// `select` once it streams in. Not generation-tagged — it isn't a
+    /// stale result, it's a fresh instruction.
+    OpenLocation {
+        dir: PathBuf,
+        select: Option<OsString>,
+    },
 }
 
 #[cfg(test)]

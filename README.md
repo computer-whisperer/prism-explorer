@@ -64,10 +64,20 @@ image previews render with full panel headroom (`NoLimit`
 dynamic-range-limit, BT.2390 remastering above it). The toolbar badge
 shows what the host negotiated.
 
+## D-Bus
+
+A running explorer serves **`org.freedesktop.FileManager1`** — the
+"show this in the file manager" interface browsers and download
+managers call. `ShowItems` navigates to the item's directory and
+selects it; `ShowFolders` opens the folder. Install
+`data/org.freedesktop.FileManager1.service` to
+`~/.local/share/dbus-1/services/` to have calls launch the explorer
+when it isn't running.
+
 ## Roadmap
 
 - XDG portal `FileChooser` backend — explorer-quality open/save dialogs
-  for every portal-using app — plus `org.freedesktop.FileManager1`
+  for every portal-using app
 - More preview handlers (PDF, video, audio, archives, fonts); search;
   file operations; syntax highlighting
 
