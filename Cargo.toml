@@ -36,6 +36,13 @@ explorer-thumbs = { path = "crates/explorer-thumbs" }
 [patch.crates-io]
 jpegxr = { path = "../achromat/vendor/jpegxr" }
 
+# Unpublished damascene: the custom multi-window host needs the
+# host::{color, gfx, input} modules (damascene issues #79/#80/#81),
+# which landed after the 0.4.2 release. Drop when 0.4.3 publishes.
+damascene-core = { path = "../damascene/damascene.main/crates/damascene-core" }
+damascene-wgpu = { path = "../damascene/damascene.main/crates/damascene-wgpu" }
+damascene-winit-wgpu = { path = "../damascene/damascene.main/crates/damascene-winit-wgpu" }
+
 # MSDF/text crates are ~500x slower unoptimized (per damascene's own
 # profile guidance); image decode is also hot in dev runs.
 [profile.dev.package.fdsm]

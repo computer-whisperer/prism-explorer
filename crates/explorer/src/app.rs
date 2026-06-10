@@ -471,8 +471,7 @@ impl ExplorerApp {
                 items.push(breadcrumb_item(breadcrumb_page(label)));
             } else {
                 items.push(breadcrumb_item(
-                    breadcrumb_link(label)
-                        .key(format!("crumb:{i}"))
+                    breadcrumb_link(format!("crumb:{i}"), label)
                         .tooltip(path.display().to_string()),
                 ));
                 items.push(breadcrumb_separator());
@@ -1044,11 +1043,11 @@ impl App for ExplorerApp {
         };
         let content = row([
             self.sidebar_el(),
-            resize_handle(Axis::Row).key("sidebar-resize"),
+            resize_handle("sidebar-resize", Axis::Row),
             card([center.padding(tokens::SPACE_2)])
                 .width(Size::Fill(1.0))
                 .height(Size::Fill(1.0)),
-            resize_handle(Axis::Row).key("preview-resize"),
+            resize_handle("preview-resize", Axis::Row),
             self.preview_pane(),
         ])
         .gap(tokens::SPACE_2)

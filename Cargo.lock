@@ -746,8 +746,6 @@ checksum = "f27ae1dd37df86211c42e150270f82743308803d90a6f6e6651cd730d5e1732f"
 [[package]]
 name = "damascene-core"
 version = "0.4.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ced7be8406d726925ec045c072a4c7bfc18d1b8db6e77230d90b84e4b9162366"
 dependencies = [
  "bytemuck",
  "cosmic-text",
@@ -772,8 +770,6 @@ dependencies = [
 [[package]]
 name = "damascene-fonts"
 version = "0.4.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9d225808c6a5c9cbe89a06da30b32962e129b6dc24da46de0966c3e1bee7fbc5"
 dependencies = [
  "damascene-fonts-emoji",
  "damascene-fonts-inter",
@@ -784,32 +780,22 @@ dependencies = [
 [[package]]
 name = "damascene-fonts-emoji"
 version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ae1de66882e6a31d3e40da0494c558b80f24bf07cf0a7900ddf442a7eefa5434"
 
 [[package]]
 name = "damascene-fonts-inter"
 version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0d084c112dab32387b62226e862f0c13fda21b380da54abdb2cc7a35ec22fffe"
 
 [[package]]
 name = "damascene-fonts-jetbrains-mono"
 version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bfd4c719004dc049baa73e4e869cca40c02532f5327ac118b3bb4fcc43a57cdc"
 
 [[package]]
 name = "damascene-fonts-symbols"
 version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e0d8aa98fba560c659beac4f4a798cb002bfe908c8c26c3a8eb3195ab9ee0776"
 
 [[package]]
 name = "damascene-wgpu"
 version = "0.4.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "55b415641e6206798f8a886b55e780cfc8509267c0581b5eaae91b71446c2a0f"
 dependencies = [
  "bytemuck",
  "cosmic-text",
@@ -822,14 +808,13 @@ dependencies = [
 [[package]]
 name = "damascene-winit-wgpu"
 version = "0.4.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3c15f19b30fe396b5a53dfbaa8d7b433c0f73dc1ae6db29d354c8c9296299eae"
 dependencies = [
  "arboard",
  "damascene-core",
  "damascene-wgpu",
  "dlib",
  "jni",
+ "log",
  "open",
  "pollster",
  "raw-window-handle",
