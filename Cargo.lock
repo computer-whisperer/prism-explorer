@@ -827,6 +827,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "explorer-thumbs"
+version = "0.1.0"
+dependencies = [
+ "achromat",
+ "anyhow",
+ "damascene-core",
+ "png",
+ "tracing",
+]
+
+[[package]]
 name = "exr"
 version = "1.74.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

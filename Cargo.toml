@@ -1,6 +1,11 @@
 [workspace]
 resolver = "2"
-members = ["crates/explorer-io", "crates/explorer-previews", "crates/explorer"]
+members = [
+    "crates/explorer-io",
+    "crates/explorer-previews",
+    "crates/explorer-thumbs",
+    "crates/explorer",
+]
 
 [workspace.package]
 version = "0.1.0"
@@ -22,6 +27,7 @@ achromat = { path = "../achromat", features = ["damascene"] }
 
 explorer-io = { path = "crates/explorer-io" }
 explorer-previews = { path = "crates/explorer-previews" }
+explorer-thumbs = { path = "crates/explorer-thumbs" }
 
 # achromat's vendored jpegxr 0.3.1 (bindgen bumped to 0.72; upstream's
 # pin on 0.69 generates opaque structs with current libclang). Patches
