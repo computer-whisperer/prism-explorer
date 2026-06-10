@@ -40,5 +40,8 @@ lru = "0.18"
 # mtime column formatting.
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 
-# org.freedesktop.FileManager1 service (blocking API on its own thread).
+# org.freedesktop.FileManager1 + the portal FileChooser backend (each
+# on its own service thread).
 zbus = "5"
+# Portal handlers await picker answers without blocking zbus dispatch.
+async-channel = "2"

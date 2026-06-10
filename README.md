@@ -83,10 +83,24 @@ selects it; `ShowFolders` opens the folder. Install
 `~/.local/share/dbus-1/services/` to have calls launch the explorer
 when it isn't running.
 
+It also serves **`org.freedesktop.impl.portal.FileChooser`** — the
+portal *backend* behind every portal-using app's open/save dialog.
+Each request becomes a picker window (the full explorer page plus
+accept/cancel chrome and a filename field in save mode) in the
+already-warm process; `OpenFile`, `SaveFile`, and `SaveFiles` are
+implemented, with per-request `Request.Close` cancellation. Install
+`data/prism.portal` to `/usr/share/xdg-desktop-portal/portals/` and
+prefer it in `~/.config/xdg-desktop-portal/portals.conf` (see the file
+header). While the portal name is held the process stays resident
+after its last window closes, ready for the next dialog.
+
+Not yet honored: `filters`/`choices` (the picker lists everything),
+`multiple` (one URI comes back), modality to the caller's window.
+
 ## Roadmap
 
-- XDG portal `FileChooser` backend — explorer-quality open/save dialogs
-  for every portal-using app
+- Portal polish: filters, multi-select, overwrite confirmation in save
+  mode, a D-Bus-activatable zero-window service mode
 - More preview handlers (PDF, video, audio, archives, fonts); search;
   file operations; syntax highlighting
 

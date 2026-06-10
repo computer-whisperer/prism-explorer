@@ -7,6 +7,7 @@
 //! Usage: `prism-explorer [DIRECTORY]` — defaults to `$HOME`.
 
 mod app;
+mod filechooser;
 mod filemanager1;
 mod fmt;
 mod host;
@@ -99,19 +100,31 @@ fn main() -> Result<()> {
             })?;
     }
 
+    let registry = Arc::new(Registry::standard());
     let pool = Pool::spawn(workers, "explorer-io");
     let app = ExplorerApp::new(
         start,
         pool,
         notifier.clone(),
-        Arc::new(Registry::standard()),
-        thumbs,
+        registry.clone(),
+        thumbs.clone(),
     );
 
     // "Show this in the file manager" service — browsers' Open
     // containing folder, etc. Best-effort: if another file manager
     // owns the name we stay a plain browser.
-    filemanager1::spawn(app.msg_sender(), notifier);
+    filemanager1::spawn(app.msg_sender(), notifier.clone());
+
+    // Portal FileChooser backend: open/save dialogs for every
+    // portal-using app, served as picker windows from this process.
+    // Owning the name makes us a service, so the process then stays
+    // resident after its last window closes.
+    let resident = filechooser::spawn(filechooser::PickerDeps {
+        notifier,
+        registry,
+        thumbs,
+        proxy: event_loop.create_proxy(),
+    });
 
     let config = HostConfig::default()
         .with_app_id("prism-explorer")
@@ -128,9 +141,7 @@ fn main() -> Result<()> {
             height: 950.0,
             app: Box::new(app),
         },
-        // Not resident yet: nothing re-opens a window after the last
-        // one closes until the portal service lands.
-        false,
+        resident,
     )
     .map_err(|e| anyhow::anyhow!("host error: {e}"))
 }

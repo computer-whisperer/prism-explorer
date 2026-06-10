@@ -16,6 +16,7 @@ use damascene_core::prelude::*;
 use damascene_core::selection::Selection;
 use damascene_core::widgets::text_input::{self, TextInputOpts};
 use damascene_core::{App, BuildCx, EventCx, KeyChord, UiEvent, UiEventKind, UiKey};
+use explorer_io::Pool;
 
 use crate::app::{scaffold, ExplorerApp, FileActivation};
 
@@ -58,12 +59,18 @@ pub struct PickerApp {
     /// Asks the host to close this picker's window (posts
     /// `HostCommand::CloseWindow` with the token the service chose).
     close: Arc<dyn Fn() + Send + Sync>,
+    /// The picker's *dedicated* IO pool — generation cancellation is
+    /// pool-wide, so a picker must never share a pool with another
+    /// window (its navigations would cancel that window's jobs). Shut
+    /// down on drop; `None` only in tests.
+    pool: Option<Pool>,
 }
 
 impl PickerApp {
     pub fn new(
         request: PickerRequest,
         mut explorer: ExplorerApp,
+        pool: Option<Pool>,
         reply: PickerReply,
         close: Arc<dyn Fn() + Send + Sync>,
     ) -> Self {
@@ -76,6 +83,7 @@ impl PickerApp {
             selection: Selection::default(),
             reply: Some(reply),
             close,
+            pool,
         }
     }
 
@@ -152,10 +160,13 @@ impl PickerApp {
 
 impl Drop for PickerApp {
     /// The host dropped us without an answer (user closed the window):
-    /// that is a cancel.
+    /// that is a cancel. Either way the dialog's IO pool dies with it.
     fn drop(&mut self) {
         if let Some(reply) = self.reply.take() {
             reply(None);
+        }
+        if let Some(pool) = &self.pool {
+            pool.shutdown();
         }
     }
 }
@@ -249,6 +260,7 @@ mod tests {
                 current_name: "untitled.txt".into(),
             },
             explorer,
+            None,
             Box::new(|_| {}),
             Arc::new(|| {}),
         );
@@ -282,6 +294,7 @@ mod tests {
                 current_name: "out.png".into(),
             },
             explorer,
+            None,
             Box::new(move |r| *picked2.lock().unwrap() = Some(r)),
             Arc::new(|| {}),
         );

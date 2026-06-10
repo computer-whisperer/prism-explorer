@@ -2894,6 +2894,7 @@ dependencies = [
  "achromat",
  "anyhow",
  "arboard",
+ "async-channel",
  "chrono",
  "damascene-core",
  "damascene-wgpu",

@@ -1,0 +1,16 @@
+# Portal backend declaration: tells xdg-desktop-portal that the
+# FileChooser implementation lives on our bus name.
+#
+# Install to /usr/share/xdg-desktop-portal/portals/prism.portal, then
+# select it in ~/.config/xdg-desktop-portal/portals.conf:
+#
+#   [preferred]
+#   org.freedesktop.impl.portal.FileChooser=prism;gtk
+#
+# (the ";gtk" fallback serves dialogs while prism-explorer isn't
+# running — the name is only on the bus while the explorer is).
+# Restart the portal after changes:
+#   systemctl --user restart xdg-desktop-portal
+[portal]
+DBusName=org.freedesktop.impl.portal.desktop.prism
+Interfaces=org.freedesktop.impl.portal.FileChooser
