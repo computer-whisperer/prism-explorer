@@ -195,13 +195,25 @@ impl ExplorerApp {
         app
     }
 
+    /// One-shot at startup, on a detached thread rather than the pool:
+    /// the constructor's initial `navigate` (and any quick follow-up
+    /// navigation) bumps the pool generation, which cancels queued
+    /// jobs wholesale — a pooled probe was reliably dropped before it
+    /// ran, leaving the sidebar on "probing…" forever.
     fn spawn_places_probe(&self) {
         let tx = self.tx.clone();
         let notify = self.notifier.clone();
-        self.pool.submit(Tier::Visible, move || {
-            let _ = tx.send(Msg::Places(crate::places::probe()));
-            notify();
-        });
+        let spawned = std::thread::Builder::new()
+            .name("places-probe".into())
+            .spawn(move || {
+                let places = crate::places::probe();
+                tracing::debug!(count = places.len(), "places probed");
+                let _ = tx.send(Msg::Places(places));
+                notify();
+            });
+        if let Err(e) = spawned {
+            tracing::warn!(error = %e, "places probe thread failed to spawn");
+        }
     }
 
     /// Leave for `dir`: invalidate all queued work, reset per-directory
