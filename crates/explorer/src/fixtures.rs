@@ -42,6 +42,7 @@ pub fn scenes() -> Vec<Scene> {
     vec![
         scene("browse", BROWSER, app::fixtures::browse()),
         scene("text_preview", BROWSER, app::fixtures::text_preview()),
+        scene("multiselect", BROWSER, multiselect()),
         scene("grid", BROWSER, app::fixtures::grid()),
         scene("listing_error", BROWSER, app::fixtures::listing_error()),
         scene("picker_open", PICKER, picker_open()),
@@ -49,6 +50,16 @@ pub fn scenes() -> Vec<Scene> {
         scene("picker_save", PICKER, picker_save()),
         scene("picker_overwrite", PICKER, picker_overwrite()),
     ]
+}
+
+/// List view with two files marked and the cursor on a third —
+/// exercises the check accent + multi-highlight.
+fn multiselect() -> crate::app::ExplorerApp {
+    let mut app = app::fixtures::browse();
+    app::fixtures::mark(&mut app, "notes.txt");
+    app::fixtures::mark(&mut app, "photo.jxr");
+    app::fixtures::select(&mut app, "docs");
+    app
 }
 
 /// The filters `picker_open` carries: photo.jxr passes "Images",
@@ -75,7 +86,10 @@ fn picker_open() -> PickerApp {
     let mut explorer = app::fixtures::browse();
     app::fixtures::select(&mut explorer, "photo.jxr");
     picker(
-        PickerKind::Open { directory: false },
+        PickerKind::Open {
+            directory: false,
+            multiple: false,
+        },
         "Open",
         String::new(),
         explorer,

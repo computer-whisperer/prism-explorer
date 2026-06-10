@@ -143,9 +143,17 @@ pub struct ExplorerApp {
     /// dependent); keyboard navigation moves by this much vertically.
     cols: Cell<usize>,
 
-    /// Selected entry: stable id plus its current position in
-    /// `listing.order` (kept in sync across resorts).
+    /// The cursor: stable id plus its current position in
+    /// `listing.order` (kept in sync across resorts). Drives the
+    /// preview pane and keyboard navigation.
     selected: Option<(EntryId, usize)>,
+    /// Multi-selection beyond the cursor (Ctrl/Shift/Space). Empty is
+    /// plain single-select — the cursor is the whole selection. A
+    /// `multiple` picker returns this set.
+    marked: HashSet<EntryId>,
+    /// Range-select anchor for Shift+click; set by plain click,
+    /// Ctrl+click, and Space.
+    anchor: Option<EntryId>,
     /// Select this name once it appears in the stream — set when
     /// navigating to a parent so the directory we came from is focused.
     pending_select: Option<OsString>,
@@ -196,6 +204,8 @@ impl ExplorerApp {
             thumb_state: Arc::new(Mutex::new(ThumbState::new())),
             cols: Cell::new(1),
             selected: None,
+            marked: HashSet::new(),
+            anchor: None,
             pending_select: None,
             preview: PreviewState::Empty,
             preview_inflight: None,
@@ -247,6 +257,8 @@ impl ExplorerApp {
         self.cwd = dir.clone();
         self.listing = Listing::new(dir.clone(), generation);
         self.selected = None;
+        self.marked.clear();
+        self.anchor = None;
         self.pending_select = select;
         self.preview = PreviewState::Empty;
         self.preview_inflight = None;
@@ -330,9 +342,44 @@ impl ExplorerApp {
         }
     }
 
+    /// Keyboard navigation (arrows, Home/End) is single-select: move
+    /// the cursor and drop any marks. Multi-select is mouse/Space only.
     fn select_pos(&mut self, pos: usize) {
         if let Some(&id) = self.listing.order.get(pos) {
-            self.select_id(id);
+            self.select_only(id);
+        }
+    }
+
+    /// Plain selection: cursor to `id`, clear marks, reset the anchor.
+    fn select_only(&mut self, id: EntryId) {
+        self.marked.clear();
+        self.anchor = Some(id);
+        self.select_id(id);
+    }
+
+    /// Ctrl+click / Space: toggle `id`'s mark; the cursor and anchor
+    /// follow it.
+    fn toggle_mark(&mut self, id: EntryId) {
+        if !self.marked.insert(id) {
+            self.marked.remove(&id);
+        }
+        self.anchor = Some(id);
+        self.select_id(id);
+    }
+
+    /// Shift+click: mark the inclusive range from the anchor to `id`
+    /// (replacing the set). No anchor yet falls back to single-select.
+    fn range_mark(&mut self, id: EntryId) {
+        match (
+            self.anchor.and_then(|a| self.listing.pos_of(a)),
+            self.listing.pos_of(id),
+        ) {
+            (Some(a), Some(b)) => {
+                let (lo, hi) = (a.min(b), a.max(b));
+                self.marked = self.listing.order[lo..=hi].iter().copied().collect();
+                self.select_id(id);
+            }
+            _ => self.select_only(id),
         }
     }
 
@@ -486,7 +533,7 @@ impl ExplorerApp {
     }
 
     /// Re-derive the selection's position after `order` changed; drop
-    /// the selection if its entry was filtered out.
+    /// the cursor and any marks whose entries were filtered out.
     fn remap_selection(&mut self) {
         if let Some((id, _)) = self.selected {
             self.selected = self.listing.pos_of(id).map(|pos| (id, pos));
@@ -495,10 +542,28 @@ impl ExplorerApp {
                 self.preview_wanted = None;
             }
         }
+        if !self.marked.is_empty() {
+            self.marked.retain(|&id| self.listing.pos_of(id).is_some());
+        }
     }
 
     fn selected_id(&self) -> Option<EntryId> {
         self.selected.map(|(id, _)| id)
+    }
+
+    /// Absolute paths of the marked files (non-dirs), in listing order.
+    /// What a `multiple` picker returns; empty when nothing is marked.
+    pub(crate) fn marked_file_paths(&self) -> Vec<PathBuf> {
+        let entries = self.listing.entries.lock().unwrap();
+        self.listing
+            .order
+            .iter()
+            .filter(|id| self.marked.contains(id))
+            .filter_map(|&id| {
+                let e = entries.get(id as usize)?;
+                (!e.is_dir()).then(|| self.cwd.join(&e.name))
+            })
+            .collect()
     }
 
     /// Breadcrumb segments for the current directory: (label, path)
@@ -620,6 +685,7 @@ impl ExplorerApp {
         let notify = self.notifier.clone();
         let stat_requested = self.stat_requested.clone();
         let selected_id = self.selected_id();
+        let marked = self.marked.clone();
 
         virtual_list(order.len(), ROW_H, move |i| {
             let id = order[i];
@@ -637,7 +703,18 @@ impl ExplorerApp {
                 &stat_requested,
             );
 
-            let icon_name = entry_icon(e.kind);
+            // Marked rows swap their kind icon for a check accent (no
+            // layout shift), and highlight like the cursor.
+            let is_marked = marked.contains(&id);
+            let lead_icon = if is_marked {
+                icon("check")
+                    .icon_size(tokens::ICON_SM)
+                    .color(tokens::PRIMARY)
+            } else {
+                icon(entry_icon(e.kind))
+                    .icon_size(tokens::ICON_SM)
+                    .color(tokens::MUTED_FOREGROUND)
+            };
             let size = match &e.meta {
                 Some(m) if m.kind == EntryKind::File => fmt::human_bytes(m.size),
                 _ => String::new(),
@@ -657,9 +734,7 @@ impl ExplorerApp {
             }
 
             let r = row([
-                icon(icon_name)
-                    .icon_size(tokens::ICON_SM)
-                    .color(tokens::MUTED_FOREGROUND),
+                lead_icon,
                 name,
                 text(size).caption().muted().width(Size::Fixed(76.0)),
                 text(date).caption().muted().width(Size::Fixed(118.0)),
@@ -672,7 +747,7 @@ impl ExplorerApp {
             .clip()
             .key(format!("row:{id}"))
             .focusable();
-            if Some(id) == selected_id {
+            if Some(id) == selected_id || is_marked {
                 r.current()
             } else {
                 r.ghost()
@@ -722,6 +797,7 @@ impl ExplorerApp {
         let thumb_state = self.thumb_state.clone();
         let thumbs = self.thumbs.clone();
         let selected_id = self.selected_id();
+        let marked = self.marked.clone();
 
         virtual_list(rows, TILE_H + TILE_GAP, move |r| {
             let mut cells = Vec::with_capacity(cols);
@@ -791,7 +867,22 @@ impl ExplorerApp {
                     tile_icon(icon_name)
                 };
 
-                let cell = column([media, text(name.clone()).caption()])
+                // Marked tiles get a check accent on the caption and
+                // highlight like the cursor.
+                let is_marked = marked.contains(&id);
+                let caption: El = if is_marked {
+                    row([
+                        icon("check")
+                            .icon_size(tokens::ICON_SM)
+                            .color(tokens::PRIMARY),
+                        text(name.clone()).caption(),
+                    ])
+                    .gap(tokens::SPACE_1)
+                    .align(Align::Center)
+                } else {
+                    text(name.clone()).caption()
+                };
+                let cell = column([media, caption])
                     .gap(tokens::SPACE_1)
                     .align(Align::Center)
                     .width(Size::Fixed(TILE_W))
@@ -801,7 +892,7 @@ impl ExplorerApp {
                     .key(format!("row:{id}"))
                     .focusable()
                     .tooltip(name);
-                cells.push(if Some(id) == selected_id {
+                cells.push(if Some(id) == selected_id || is_marked {
                     cell.current()
                 } else {
                     cell.ghost()
@@ -1192,6 +1283,7 @@ impl App for ExplorerApp {
             (KeyChord::vim('r'), "refresh".into()),
             (KeyChord::named(UiKey::Other("F5".into())), "refresh".into()),
             (KeyChord::vim('.'), "hidden".into()),
+            (KeyChord::named(UiKey::Space), "mark".into()),
         ]
     }
 
@@ -1226,13 +1318,24 @@ impl App for ExplorerApp {
 
         if let Some(key) = event.target_key() {
             if let Some(id) = key.strip_prefix("row:").and_then(|s| s.parse().ok()) {
-                if event.kind == UiEventKind::Click && event.click_count >= 2 {
-                    self.select_id(id);
-                    self.activate_id(id);
-                    return;
-                }
-                if event.is_click_or_activate(key) {
-                    self.select_id(id);
+                // Rows select on *mouse* click only — keyboard selection
+                // is the arrow hotkeys, and keyboard activation (Enter,
+                // Space) is handled by the "open"/"mark" hotkeys below,
+                // so we don't treat a focused row's Activate as a click.
+                if event.kind == UiEventKind::Click {
+                    if event.click_count >= 2 {
+                        self.select_only(id);
+                        self.activate_id(id);
+                        return;
+                    }
+                    let m = event.modifiers;
+                    if m.ctrl {
+                        self.toggle_mark(id);
+                    } else if m.shift {
+                        self.range_mark(id);
+                    } else {
+                        self.select_only(id);
+                    }
                     return;
                 }
             }
@@ -1314,6 +1417,10 @@ impl App for ExplorerApp {
             self.navigate_parent();
         } else if event.is_hotkey("hidden") {
             self.toggle_hidden();
+        } else if event.is_hotkey("mark") {
+            if let Some(id) = self.selected_id() {
+                self.toggle_mark(id);
+            }
         }
     }
 
@@ -1518,6 +1625,15 @@ pub(crate) mod fixtures {
         app.selected = Some((id, pos));
         id
     }
+
+    /// Add `name` to the marked (multi-selection) set.
+    pub(crate) fn mark(app: &mut ExplorerApp, name: &str) {
+        let id = app
+            .listing
+            .id_by_name(std::ffi::OsStr::new(name))
+            .expect("fixture entry exists");
+        app.marked.insert(id);
+    }
 }
 
 #[cfg(test)]
@@ -1535,6 +1651,72 @@ mod tests {
         let app = grid();
         crate::fixtures::render(&app, (1500.0, 950.0));
         assert!(app.cols.get() > 1, "grid should lay out multiple columns");
+    }
+
+    fn id_of(app: &ExplorerApp, name: &str) -> EntryId {
+        app.listing.id_by_name(std::ffi::OsStr::new(name)).unwrap()
+    }
+
+    /// Ctrl toggles marks; Shift ranges from the anchor; plain
+    /// selection clears the set; marked_file_paths returns non-dir
+    /// marks in listing order.
+    #[test]
+    fn multi_select_chords() {
+        let mut app = browse(); // order: docs(dir), notes.txt, photo.jxr
+        let notes = id_of(&app, "notes.txt");
+        let photo = id_of(&app, "photo.jxr");
+
+        // Ctrl-style toggle marks both files.
+        app.toggle_mark(notes);
+        app.toggle_mark(photo);
+        assert_eq!(app.marked, HashSet::from([notes, photo]));
+        // Cursor follows the last toggle.
+        assert_eq!(app.selected_id(), Some(photo));
+
+        // Toggling photo again removes it.
+        app.toggle_mark(photo);
+        assert_eq!(app.marked, HashSet::from([notes]));
+
+        // Paths: non-dir marks, in listing order, absolute.
+        assert_eq!(
+            app.marked_file_paths(),
+            vec![PathBuf::from("/test/somewhere/notes.txt")]
+        );
+
+        // A plain selection clears the marks.
+        app.select_only(notes);
+        assert!(app.marked.is_empty());
+
+        // Shift-range from anchor(notes) to photo marks the whole span
+        // (notes, photo — docs is a dir but ranges include it; it's
+        // dropped only from marked_file_paths).
+        app.range_mark(photo);
+        assert!(app.marked.contains(&notes) && app.marked.contains(&photo));
+        assert_eq!(
+            app.marked_file_paths(),
+            vec![
+                PathBuf::from("/test/somewhere/notes.txt"),
+                PathBuf::from("/test/somewhere/photo.jxr"),
+            ]
+        );
+    }
+
+    /// Keyboard nav and navigation both drop the multi-selection.
+    #[test]
+    fn marks_clear_on_keyboard_nav_and_navigate() {
+        let mut app = browse();
+        app.toggle_mark(id_of(&app, "notes.txt"));
+        app.toggle_mark(id_of(&app, "photo.jxr"));
+        assert_eq!(app.marked.len(), 2);
+
+        // A plain arrow move is single-select.
+        app.move_selection(1);
+        assert!(app.marked.is_empty());
+
+        // And a navigation resets everything.
+        app.toggle_mark(id_of(&app, "notes.txt"));
+        app.navigate(PathBuf::from("/elsewhere"), None);
+        assert!(app.marked.is_empty() && app.anchor.is_none());
     }
 
     /// Selection follows ids across a mid-stream resort: select an

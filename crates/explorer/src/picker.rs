@@ -29,8 +29,9 @@ use crate::model::FileFilter;
 /// What the dialog is choosing. Mirrors the portal's OpenFile /
 /// SaveFile split (`directory` is OpenFile's folder-choosing option).
 pub enum PickerKind {
-    /// Pick an existing file (or folder, with `directory`).
-    Open { directory: bool },
+    /// Pick an existing file (or folder, with `directory`). With
+    /// `multiple`, accept returns every marked file.
+    Open { directory: bool, multiple: bool },
     /// Pick a destination: a directory plus a (typed) file name.
     Save,
 }
@@ -124,13 +125,26 @@ impl PickerApp {
     /// the accept button.
     fn acceptable(&self) -> Option<Vec<PathBuf>> {
         match self.kind {
-            PickerKind::Open { directory: false } => {
+            PickerKind::Open {
+                directory: false,
+                multiple,
+            } => {
+                // Multi-select returns every marked file; with nothing
+                // marked it falls back to the cursor's file.
+                if multiple {
+                    let marked = self.explorer.marked_file_paths();
+                    if !marked.is_empty() {
+                        return Some(marked);
+                    }
+                }
                 let (path, is_dir) = self.explorer.selected_entry_path()?;
                 (!is_dir).then(|| vec![path])
             }
             // Folder mode: the selected directory if there is one,
             // otherwise the directory being browsed.
-            PickerKind::Open { directory: true } => match self.explorer.selected_entry_path() {
+            PickerKind::Open {
+                directory: true, ..
+            } => match self.explorer.selected_entry_path() {
                 Some((path, true)) => Some(vec![path]),
                 _ => Some(vec![self.explorer.cwd_path().to_path_buf()]),
             },
@@ -359,12 +373,19 @@ impl App for PickerApp {
         // adopt the name in save mode (GTK convention).
         for path in self.explorer.take_activated() {
             match self.kind {
-                PickerKind::Open { directory: false } => {
+                // Double-click / Enter commits the activated file alone,
+                // even in multi-select — the accept button is what
+                // returns the marked set.
+                PickerKind::Open {
+                    directory: false, ..
+                } => {
                     if self.reply.is_some() {
                         self.finish(Some(vec![path]));
                     }
                 }
-                PickerKind::Open { directory: true } => {}
+                PickerKind::Open {
+                    directory: true, ..
+                } => {}
                 PickerKind::Save => {
                     if let Some(name) = path.file_name() {
                         self.filename = name.to_string_lossy().into_owned();
@@ -402,7 +423,10 @@ mod tests {
         let explorer = crate::app::fixtures::browse();
         let mut picker = PickerApp::new(
             PickerRequest {
-                kind: PickerKind::Open { directory: false },
+                kind: PickerKind::Open {
+                    directory: false,
+                    multiple: false,
+                },
                 accept_label: "Open".into(),
                 start_dir: PathBuf::from("/test/somewhere"),
                 current_name: String::new(),
@@ -461,6 +485,39 @@ mod tests {
             Arc::new(|| {}),
         );
         (picker, picked)
+    }
+
+    /// A `multiple` Open picker returns every marked file; with nothing
+    /// marked it falls back to the cursor's file.
+    #[test]
+    fn multiple_open_returns_marked_files() {
+        let mut explorer = crate::app::fixtures::browse();
+        crate::app::fixtures::mark(&mut explorer, "notes.txt");
+        crate::app::fixtures::mark(&mut explorer, "photo.jxr");
+        let picker = PickerApp::new(
+            PickerRequest {
+                kind: PickerKind::Open {
+                    directory: false,
+                    multiple: true,
+                },
+                accept_label: "Open".into(),
+                start_dir: PathBuf::from("/test/somewhere"),
+                current_name: String::new(),
+                filters: Vec::new(),
+                current_filter: 0,
+            },
+            explorer,
+            None,
+            Box::new(|_| {}),
+            Arc::new(|| {}),
+        );
+        assert_eq!(
+            picker.acceptable(),
+            Some(vec![
+                PathBuf::from("/test/somewhere/notes.txt"),
+                PathBuf::from("/test/somewhere/photo.jxr"),
+            ])
+        );
     }
 
     #[test]

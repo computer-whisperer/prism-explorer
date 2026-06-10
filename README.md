@@ -15,13 +15,20 @@ prism-explorer [DIRECTORY]    # defaults to $HOME
 
 | Key | Action |
 | --- | --- |
-| arrows / `hjkl` | move selection (list: ←/`h` parent, →/`l` enter dir) |
+| arrows / `hjkl` | move the cursor (list: ←/`h` parent, →/`l` enter dir) |
+| Ctrl+click | toggle a file in the multi-selection |
+| Shift+click | select a range from the cursor |
+| Space | toggle the cursor's row in the multi-selection |
 | `g` | toggle list / thumbnail grid |
 | Enter / double-click | open directory · open file (`xdg-open`) |
 | Backspace | parent directory |
 | Home / End | first / last entry |
 | `r` / F5 | refresh listing |
 | `.` | toggle hidden files |
+
+Plain click or any arrow key collapses back to a single selection;
+marked rows show a check accent. A multi-selection is what a portal
+`multiple` open dialog returns.
 
 ## Architecture
 
@@ -109,13 +116,13 @@ prefer it in `~/.config/xdg-desktop-portal/portals.conf` (see the file
 header). While the portal name is held the process stays resident
 after its last window closes, ready for the next dialog.
 
-Not yet honored: `choices` (ignored), `multiple` (one URI comes
-back), modality to the caller's window.
+A `multiple` open dialog returns the whole multi-selection (Ctrl /
+Shift / Space; see Controls). Not yet honored: `choices` (ignored) and
+modality to the caller's window.
 
 ## Roadmap
 
-- Portal polish: multi-select, a D-Bus-activatable zero-window service
-  mode
+- Portal polish: a D-Bus-activatable zero-window service mode
 - More preview handlers (PDF, video, audio, archives, fonts); search;
   file operations; syntax highlighting
 

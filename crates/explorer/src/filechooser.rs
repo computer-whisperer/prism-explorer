@@ -167,19 +167,20 @@ impl FileChooser {
         options: HashMap<String, OwnedValue>,
     ) -> (u32, HashMap<String, OwnedValue>) {
         let directory = bool_option(&options, "directory");
-        if bool_option(&options, "multiple") {
-            tracing::debug!("OpenFile: multiple requested; returning a single choice");
-        }
+        let multiple = bool_option(&options, "multiple");
         let (filters, current_filter) = filter_options(&options);
         let request = PickerRequest {
-            kind: PickerKind::Open { directory },
+            kind: PickerKind::Open {
+                directory,
+                multiple,
+            },
             accept_label: accept_label(&options, "Open"),
             start_dir: start_dir(&options),
             current_name: String::new(),
             filters,
             current_filter,
         };
-        tracing::info!(%title, directory, "portal OpenFile");
+        tracing::info!(%title, directory, multiple, "portal OpenFile");
         let (response, answer) = self.run_picker(connection, handle, &title, request).await;
         (response, uris_result(answer))
     }
@@ -240,7 +241,10 @@ impl FileChooser {
         // No filters: this picker chooses the *directory* the supplied
         // names land in (SaveFiles has no filter options in the spec).
         let request = PickerRequest {
-            kind: PickerKind::Open { directory: true },
+            kind: PickerKind::Open {
+                directory: true,
+                multiple: false,
+            },
             accept_label: accept_label(&options, "Save"),
             start_dir: start_dir(&options),
             current_name: String::new(),
