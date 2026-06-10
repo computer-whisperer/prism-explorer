@@ -47,6 +47,7 @@ pub fn scenes() -> Vec<Scene> {
         scene("picker_open", PICKER, picker_open()),
         scene("picker_filter_menu", PICKER, picker_filter_menu()),
         scene("picker_save", PICKER, picker_save()),
+        scene("picker_overwrite", PICKER, picker_overwrite()),
     ]
 }
 
@@ -100,6 +101,21 @@ fn picker_save() -> PickerApp {
         app::fixtures::browse(),
         Vec::new(),
     )
+}
+
+/// Save picker whose name collides with an existing file — accept
+/// (driven through the real event path) parks it behind the modal
+/// overwrite-confirmation dialog instead of answering.
+fn picker_overwrite() -> PickerApp {
+    let mut p = picker(
+        PickerKind::Save,
+        "Save",
+        "notes.txt".into(),
+        app::fixtures::browse(),
+        Vec::new(),
+    );
+    p.on_event(UiEvent::synthetic_click("picker-accept"), &EventCx::new());
+    p
 }
 
 fn picker(

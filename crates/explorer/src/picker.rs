@@ -9,15 +9,19 @@
 //! the user closes the window (the reply channel disconnecting reads
 //! as cancel on the service side).
 
+use std::ffi::OsStr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use damascene_core::prelude::*;
 use damascene_core::selection::Selection;
+use damascene_core::widgets::dialog::{
+    dialog, dialog_description, dialog_footer, dialog_header, dialog_title,
+};
 use damascene_core::widgets::select::{self, select_menu, select_trigger};
 use damascene_core::widgets::text_input::{self, TextInputOpts};
 use damascene_core::{App, BuildCx, EventCx, KeyChord, UiEvent, UiEventKind, UiKey};
-use explorer_io::Pool;
+use explorer_io::{EntryKind, Pool};
 
 use crate::app::{scaffold, ExplorerApp, FileActivation};
 use crate::model::FileFilter;
@@ -69,6 +73,11 @@ pub struct PickerApp {
     filter_idx: usize,
     /// The filter select's popover-open flag.
     filter_open: bool,
+    /// Save mode: when accepting would overwrite an existing file, the
+    /// would-be result is parked here and a modal confirm dialog shown
+    /// instead of answering. `Replace` finishes with it; `Cancel`
+    /// clears it.
+    pending_overwrite: Option<Vec<PathBuf>>,
     reply: Option<PickerReply>,
     /// Asks the host to close this picker's window (posts
     /// `HostCommand::CloseWindow` with the token the service chose).
@@ -104,6 +113,7 @@ impl PickerApp {
             filters: request.filters,
             filter_idx,
             filter_open: false,
+            pending_overwrite: None,
             reply: Some(reply),
             close,
             pool,
@@ -142,9 +152,45 @@ impl PickerApp {
     }
 
     fn accept(&mut self) {
-        if let Some(paths) = self.acceptable() {
-            self.finish(Some(paths));
+        let Some(paths) = self.acceptable() else {
+            return;
+        };
+        // Save mode: warn before clobbering an existing file. The check
+        // reads the in-memory listing (no extra stat) and so is
+        // best-effort — a not-yet-streamed name in a huge directory
+        // won't trip it. Directories aren't overwrite targets; let the
+        // app surface that error itself.
+        if matches!(self.kind, PickerKind::Save) {
+            let name = self.filename.trim();
+            if matches!(self.explorer.existing_kind(OsStr::new(name)), Some(k) if k != EntryKind::Dir)
+            {
+                self.pending_overwrite = Some(paths);
+                return;
+            }
         }
+        self.finish(Some(paths));
+    }
+
+    /// Modal "this file exists" confirmation, stacked over the picker
+    /// while `pending_overwrite` is set.
+    fn overwrite_dialog(&self) -> El {
+        let name = self.filename.trim();
+        dialog(
+            "overwrite",
+            [
+                dialog_header([
+                    dialog_title("Replace file?"),
+                    dialog_description(format!(
+                        "\u{201c}{name}\u{201d} already exists in this folder. \
+                         Replacing it overwrites its contents."
+                    )),
+                ]),
+                dialog_footer([
+                    button("Cancel").ghost().key("overwrite:cancel"),
+                    button("Replace").primary().key("overwrite:replace"),
+                ]),
+            ],
+        )
     }
 
     fn chrome_el(&self) -> El {
@@ -205,23 +251,28 @@ impl App for PickerApp {
     }
 
     fn build(&self, cx: &BuildCx) -> El {
-        let page = column([self.explorer.page_el(cx), self.chrome_el()])
+        let mut layers: Vec<El> = vec![column([self.explorer.page_el(cx), self.chrome_el()])
             .gap(tokens::SPACE_3)
             .width(Size::Fill(1.0))
-            .height(Size::Fill(1.0));
-        // The filter menu stacks over the page (popover paradigm),
-        // anchored to its trigger by the shared key.
-        let page = if self.filter_open {
+            .height(Size::Fill(1.0))];
+        // Overlays stack over the page in z-order: the filter menu
+        // (popover, anchored to its trigger by the shared key), then
+        // the overwrite confirmation (modal, on top of everything).
+        if self.filter_open {
             let options = self
                 .filters
                 .iter()
                 .enumerate()
                 .map(|(i, f)| (i.to_string(), f.name.clone()));
-            stack([page, select_menu("picker-filter", options)])
-                .width(Size::Fill(1.0))
-                .height(Size::Fill(1.0))
+            layers.push(select_menu("picker-filter", options));
+        }
+        if self.pending_overwrite.is_some() {
+            layers.push(self.overwrite_dialog());
+        }
+        let page = if layers.len() == 1 {
+            layers.pop().unwrap()
         } else {
-            page
+            stack(layers).width(Size::Fill(1.0)).height(Size::Fill(1.0))
         };
         scaffold(page)
     }
@@ -233,6 +284,22 @@ impl App for PickerApp {
     }
 
     fn on_event(&mut self, event: UiEvent, cx: &EventCx) {
+        // The overwrite confirmation is modal: while it's up, only its
+        // own controls do anything — every other event is swallowed so
+        // nothing reaches the name field or the explorer beneath it.
+        if self.pending_overwrite.is_some() {
+            if event.is_click_or_activate("overwrite:replace") {
+                if let Some(paths) = self.pending_overwrite.take() {
+                    self.finish(Some(paths));
+                }
+            } else if event.is_click_or_activate("overwrite:cancel")
+                || event.is_click_or_activate("overwrite:dismiss")
+                || event.is_hotkey("picker-cancel")
+            {
+                self.pending_overwrite = None;
+            }
+            return;
+        }
         // The filename field: fold edits, accept on Enter. Key events
         // route here whenever the field is focused, so the explorer's
         // Enter/arrow hotkeys don't fire mid-typing.
@@ -324,6 +391,10 @@ mod tests {
     // (`all_scenes_lint_clean` renders the picker_open / picker_save
     // scenes alongside the browser ones).
 
+    /// Captures the picker's single reply: outer `Option` = answered?,
+    /// inner = the chosen paths (`None` = cancelled).
+    type ReplySink = Arc<std::sync::Mutex<Option<Option<Vec<PathBuf>>>>>;
+
     /// Trigger click opens the menu; picking an option closes it and
     /// refilters the wrapped explorer's listing (dirs always stay).
     #[test]
@@ -366,6 +437,70 @@ mod tests {
         assert_eq!(
             picker.explorer.visible_names(),
             ["docs", "notes.txt", "photo.jxr"]
+        );
+    }
+
+    /// Helper: a Save picker over the synthetic browse() listing
+    /// (which has `notes.txt` (file) and `docs` (dir)), capturing its
+    /// one reply.
+    fn save_picker(name: &str) -> (PickerApp, ReplySink) {
+        let picked: ReplySink = Default::default();
+        let sink = picked.clone();
+        let picker = PickerApp::new(
+            PickerRequest {
+                kind: PickerKind::Save,
+                accept_label: "Save".into(),
+                start_dir: PathBuf::from("/test/somewhere"),
+                current_name: name.into(),
+                filters: Vec::new(),
+                current_filter: 0,
+            },
+            crate::app::fixtures::browse(),
+            None,
+            Box::new(move |r| *sink.lock().unwrap() = Some(r)),
+            Arc::new(|| {}),
+        );
+        (picker, picked)
+    }
+
+    #[test]
+    fn save_over_existing_file_confirms_then_replaces() {
+        let (mut picker, picked) = save_picker("notes.txt");
+        let cx = EventCx::new();
+        // Accept parks the result behind the modal — no answer yet.
+        picker.on_event(UiEvent::synthetic_click("picker-accept"), &cx);
+        assert!(picker.pending_overwrite.is_some());
+        assert!(picked.lock().unwrap().is_none());
+        // Replace confirms with the parked path.
+        picker.on_event(UiEvent::synthetic_click("overwrite:replace"), &cx);
+        assert_eq!(
+            picked.lock().unwrap().clone(),
+            Some(Some(vec![PathBuf::from("/test/somewhere/notes.txt")]))
+        );
+    }
+
+    #[test]
+    fn save_overwrite_cancel_keeps_picker_open() {
+        let (mut picker, picked) = save_picker("notes.txt");
+        let cx = EventCx::new();
+        picker.on_event(UiEvent::synthetic_click("picker-accept"), &cx);
+        assert!(picker.pending_overwrite.is_some());
+        // Cancel dismisses the dialog without answering; the picker
+        // stays open (reply not consumed).
+        picker.on_event(UiEvent::synthetic_click("overwrite:cancel"), &cx);
+        assert!(picker.pending_overwrite.is_none());
+        assert!(picked.lock().unwrap().is_none());
+        assert!(picker.reply.is_some());
+    }
+
+    #[test]
+    fn save_new_name_answers_without_confirm() {
+        let (mut picker, picked) = save_picker("brand-new.txt");
+        picker.on_event(UiEvent::synthetic_click("picker-accept"), &EventCx::new());
+        assert!(picker.pending_overwrite.is_none());
+        assert_eq!(
+            picked.lock().unwrap().clone(),
+            Some(Some(vec![PathBuf::from("/test/somewhere/brand-new.txt")]))
         );
     }
 

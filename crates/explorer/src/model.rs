@@ -175,6 +175,14 @@ impl Listing {
         self.order.iter().position(|&i| i == id)
     }
 
+    /// Best-effort kind of an entry with this exact name, if one has
+    /// streamed in. The save picker uses it to confirm before
+    /// overwriting an existing file — `None` includes "not yet listed".
+    pub fn kind_of_name(&self, name: &OsStr) -> Option<EntryKind> {
+        let entries = self.entries.lock().unwrap();
+        entries.iter().find(|e| e.name == name).map(|e| e.kind)
+    }
+
     pub fn id_by_name(&self, name: &OsStr) -> Option<EntryId> {
         let entries = self.entries.lock().unwrap();
         entries

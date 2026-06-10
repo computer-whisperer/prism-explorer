@@ -759,6 +759,7 @@ dependencies = [
  "log",
  "lru",
  "lyon_tessellation",
+ "naga",
  "nalgebra",
  "roxmltree 0.21.1",
  "rustc-hash 2.1.2",

@@ -401,6 +401,13 @@ impl ExplorerApp {
         &self.cwd
     }
 
+    /// Best-effort kind of an entry named `name` in the current
+    /// directory — the save picker uses it to confirm before
+    /// overwriting an existing file (no extra stat; reads the listing).
+    pub(crate) fn existing_kind(&self, name: &std::ffi::OsStr) -> Option<EntryKind> {
+        self.listing.kind_of_name(name)
+    }
+
     /// The selected entry's absolute path and whether it is a
     /// directory (through the symlink, once stat'ed).
     pub(crate) fn selected_entry_path(&self) -> Option<(PathBuf, bool)> {

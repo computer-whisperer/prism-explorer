@@ -101,7 +101,9 @@ already-warm process; `OpenFile`, `SaveFile`, and `SaveFiles` are
 implemented, with per-request `Request.Close` cancellation. The
 caller's file-type `filters` are honored — glob and mimetype patterns
 both, switchable from a dropdown in the chrome (directories always
-list; they're how you navigate). Install
+list; they're how you navigate). Saving over an existing name raises a
+modal overwrite confirmation (best-effort from the listing — no extra
+stat). Install
 `data/prism.portal` to `/usr/share/xdg-desktop-portal/portals/` and
 prefer it in `~/.config/xdg-desktop-portal/portals.conf` (see the file
 header). While the portal name is held the process stays resident
@@ -112,8 +114,8 @@ back), modality to the caller's window.
 
 ## Roadmap
 
-- Portal polish: multi-select, overwrite confirmation in save mode, a
-  D-Bus-activatable zero-window service mode
+- Portal polish: multi-select, a D-Bus-activatable zero-window service
+  mode
 - More preview handlers (PDF, video, audio, archives, fonts); search;
   file operations; syntax highlighting
 
