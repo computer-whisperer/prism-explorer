@@ -58,8 +58,17 @@ hard rule: **no filesystem call ever runs on the UI thread.**
   key through a directory queues one decode, not fifty); grid
   thumbnails decode only for realized cells and are RAM-capped by an
   LRU however large the directory is.
+- **`crates/explorer/src/host.rs`** — the explorer's own winit host
+  loop: a resident multi-window process on one shared wgpu device,
+  built from damascene-winit-wgpu's exposed host layers (`WindowGfx`
+  per-window bring-up, the `SurfaceColor` HDR negotiation driver, the
+  pure input mappers). Each window pairs a damascene `Runner` with its
+  own `App`; HDR/SDR negotiates per window and re-negotiates live on
+  output moves. This is what lets one warm process (thumbnail cache,
+  glyph atlases, compiled shaders, D-Bus services) spin off browser
+  windows and — next — portal FileChooser dialogs.
 
-HDR output negotiates per-output (`ColorPreferences::hdr_extended`);
+HDR output negotiates per-window (`ColorPreferences::hdr_extended`);
 image previews render with full panel headroom (`NoLimit`
 dynamic-range-limit, BT.2390 remastering above it). The toolbar badge
 shows what the host negotiated.

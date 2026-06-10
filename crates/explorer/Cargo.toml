@@ -18,7 +18,16 @@ tracing.workspace = true
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 damascene-core.workspace = true
+damascene-wgpu.workspace = true
 damascene-winit-wgpu.workspace = true
+
+# The custom multi-window host loop (src/host.rs). Versions track
+# damascene's own pins — the input mappers take winit types and the
+# Runner takes wgpu handles, so majors must match.
+winit = "0.30"
+wgpu = "29"
+arboard = { version = "3", features = ["wayland-data-control"] }
+pollster = "0.4"
 
 achromat.workspace = true
 explorer-io.workspace = true

@@ -19,6 +19,7 @@ authors = ["Christian Balcom"]
 anyhow = "1"
 tracing = "0.1"
 damascene-core = "0.4.2"
+damascene-wgpu = "0.4.2"
 damascene-winit-wgpu = "0.4.2"
 
 # Color-managed decode stack, shared with damascene-gallery and prism-bg.

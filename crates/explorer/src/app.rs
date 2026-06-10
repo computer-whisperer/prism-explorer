@@ -20,7 +20,6 @@ use damascene_core::image::Image;
 use damascene_core::prelude::*;
 use damascene_core::scroll::{ScrollAlignment, ScrollRequest};
 use damascene_core::{BuildCx, EventCx, KeyChord, UiEvent, UiEventKind, UiKey};
-use damascene_winit_wgpu::Wakeup;
 use lru::LruCache;
 
 use explorer_io::{listing, stat, EntryKind, Notifier, Pool, Tier};
@@ -30,10 +29,6 @@ use explorer_thumbs::ThumbCache;
 use crate::fmt;
 use crate::model::{Entry, EntryId, Listing, Msg};
 use crate::places::Place;
-
-/// The host's wakeup handle, shared with every worker that posts
-/// results. Delivered once the event loop exists; `None` before that.
-pub type SharedWakeup = Arc<Mutex<Option<Wakeup>>>;
 
 const ROW_H: f32 = 34.0;
 const SIDEBAR_MIN: f32 = 160.0;

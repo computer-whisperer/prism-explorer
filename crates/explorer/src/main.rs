@@ -9,6 +9,7 @@
 mod app;
 mod filemanager1;
 mod fmt;
+mod host;
 mod model;
 mod places;
 
@@ -17,13 +18,13 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use damascene_core::color::ColorPreferences;
-use damascene_core::Rect;
-use damascene_winit_wgpu::{run_with_config, HostConfig};
+use damascene_winit_wgpu::HostConfig;
 
-use app::{ExplorerApp, SharedWakeup};
+use app::ExplorerApp;
 use explorer_io::{Notifier, Pool};
 use explorer_previews::Registry;
 use explorer_thumbs::ThumbCache;
+use host::{HostCommand, WindowSpec};
 
 /// Long edge of cached thumbnails: 2× the grid tile width, so tiles
 /// stay sharp on 2× displays.
@@ -63,13 +64,14 @@ fn main() -> Result<()> {
         .map(|n| n.get().clamp(4, 8))
         .unwrap_or(4);
 
-    let wakeup = SharedWakeup::default();
+    // The event loop exists before any app so workers get their
+    // notifier from frame zero; wakes that land before the first
+    // window are covered by its initial redraw.
+    let event_loop = host::event_loop().map_err(|e| anyhow::anyhow!("host error: {e}"))?;
     let notifier: Notifier = {
-        let wakeup = wakeup.clone();
+        let proxy = event_loop.create_proxy();
         Arc::new(move || {
-            if let Some(w) = wakeup.lock().unwrap().as_ref() {
-                w.wake();
-            }
+            let _ = proxy.send_event(HostCommand::Wake);
         })
     };
 
@@ -114,10 +116,17 @@ fn main() -> Result<()> {
         .with_app_id("prism-explorer")
         // Extended-range linear swapchain on HDR outputs; degrades to
         // P3/sRGB per compositor capability.
-        .with_color_preferences(ColorPreferences::hdr_extended())
-        .with_external_wakeup(move |w| *wakeup.lock().unwrap() = Some(w));
+        .with_color_preferences(ColorPreferences::hdr_extended());
 
-    let viewport = Rect::new(0.0, 0.0, 1500.0, 950.0);
-    run_with_config("Prism Explorer", viewport, app, config)
-        .map_err(|e| anyhow::anyhow!("host error: {e}"))
+    host::run(
+        event_loop,
+        config,
+        WindowSpec {
+            title: "Prism Explorer".into(),
+            width: 1500.0,
+            height: 950.0,
+            app: Box::new(app),
+        },
+    )
+    .map_err(|e| anyhow::anyhow!("host error: {e}"))
 }

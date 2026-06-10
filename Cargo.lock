@@ -2893,15 +2893,20 @@ version = "0.1.0"
 dependencies = [
  "achromat",
  "anyhow",
+ "arboard",
  "chrono",
  "damascene-core",
+ "damascene-wgpu",
  "damascene-winit-wgpu",
  "explorer-io",
  "explorer-previews",
  "explorer-thumbs",
  "lru",
+ "pollster",
  "tracing",
  "tracing-subscriber",
+ "wgpu",
+ "winit",
  "zbus",
 ]
 
