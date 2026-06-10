@@ -247,43 +247,14 @@ impl App for PickerApp {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use damascene_core::{render_bundle_themed, Rect, Theme};
 
-    #[test]
-    fn picker_tree_lints_clean() {
-        let explorer = crate::app::tests::test_app();
-        let picker = PickerApp::new(
-            PickerRequest {
-                kind: PickerKind::Save,
-                accept_label: "Save".into(),
-                start_dir: PathBuf::from("/test/somewhere"),
-                current_name: "untitled.txt".into(),
-            },
-            explorer,
-            None,
-            Box::new(|_| {}),
-            Arc::new(|| {}),
-        );
-        let theme = Theme::default();
-        let (w, h) = (1500.0, 950.0);
-        let diag = damascene_core::HostDiagnostics::default();
-        let cx = BuildCx::new(&theme)
-            .with_viewport(w, h)
-            .with_diagnostics(&diag);
-        let mut tree = picker.build(&cx);
-        let bundle = render_bundle_themed(&mut tree, Rect::new(0.0, 0.0, w, h), &theme);
-        let findings: Vec<String> = bundle
-            .lint
-            .findings
-            .iter()
-            .map(|f| format!("{f:?}"))
-            .collect();
-        assert!(findings.is_empty(), "lint findings: {findings:#?}");
-    }
+    // The picker's tree-lint coverage lives in `crate::fixtures`
+    // (`all_scenes_lint_clean` renders the picker_open / picker_save
+    // scenes alongside the browser ones).
 
     #[test]
     fn save_accept_paths() {
-        let explorer = crate::app::tests::test_app();
+        let explorer = crate::app::fixtures::browse();
         let picked: Arc<std::sync::Mutex<Option<Option<Vec<PathBuf>>>>> = Default::default();
         let picked2 = picked.clone();
         let mut picker = PickerApp::new(

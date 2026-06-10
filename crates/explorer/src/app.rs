@@ -1339,17 +1339,19 @@ fn color_mode_badge(cx: &BuildCx) -> El {
     b.key("color-mode")
 }
 
-#[cfg(test)]
-pub(crate) mod tests {
+/// Canned-scene constructors — a synthetic listing, no real IO (pool
+/// jobs queue but the scenes never drain results). Shared by the
+/// in-crate lint tests and the `dump_bundles` artifact bin, which is
+/// why this isn't under `cfg(test)`. Composed into named, viewport-
+/// sized scenes by [`crate::fixtures`].
+pub(crate) mod fixtures {
     use super::*;
-    use damascene_core::{render_bundle_themed, Rect, Theme};
     use explorer_io::listing::ListingUpdate;
     use explorer_io::RawEntry;
 
-    /// An app with a synthetic listing — no real IO, pool jobs are
-    /// dropped before any worker would run them. Shared with the
-    /// picker's tests.
-    pub(crate) fn test_app() -> ExplorerApp {
+    /// Browsing `/test/somewhere`: a directory, a text file, an image
+    /// file, two synthetic places. The base every scene grows from.
+    pub(crate) fn browse() -> ExplorerApp {
         let pool = Pool::spawn(1, "test");
         let notifier: Notifier = Arc::new(|| {});
         let thumbs = ThumbCache::new(
@@ -1400,38 +1402,10 @@ pub(crate) mod tests {
         app
     }
 
-    fn lint_findings(app: &ExplorerApp) -> Vec<String> {
-        let theme = Theme::default();
-        let (w, h) = (1500.0, 950.0);
-        let diag = damascene_core::HostDiagnostics::default();
-        let cx = BuildCx::new(&theme)
-            .with_viewport(w, h)
-            .with_diagnostics(&diag);
-        let mut tree = app.build(&cx);
-        let bundle = render_bundle_themed(&mut tree, Rect::new(0.0, 0.0, w, h), &theme);
-        bundle
-            .lint
-            .findings
-            .iter()
-            .map(|f| format!("{f:?}"))
-            .collect()
-    }
-
-    #[test]
-    fn browse_tree_lints_clean() {
-        let app = test_app();
-        assert_eq!(lint_findings(&app), Vec::<String>::new());
-    }
-
-    #[test]
-    fn text_preview_tree_lints_clean() {
-        let mut app = test_app();
-        let id = app
-            .listing
-            .id_by_name(std::ffi::OsStr::new("notes.txt"))
-            .unwrap();
-        let pos = app.listing.pos_of(id).unwrap();
-        app.selected = Some((id, pos));
+    /// `notes.txt` selected with a (truncated) text preview ready.
+    pub(crate) fn text_preview() -> ExplorerApp {
+        let mut app = browse();
+        let id = select(&mut app, "notes.txt");
         app.preview = PreviewState::Ready {
             id,
             preview: Preview::Text {
@@ -1439,15 +1413,15 @@ pub(crate) mod tests {
                 truncated: true,
             },
         };
-        assert_eq!(lint_findings(&app), Vec::<String>::new());
+        app
     }
 
     /// Grid view with every cell flavor at once: a decoded thumbnail
-    /// (synthetic 2×2 image in the RAM LRU), a pending image (skeleton +
-    /// queued job), a failed image, plus plain dir/file icon cells.
-    #[test]
-    fn grid_tree_lints_clean() {
-        let mut app = test_app();
+    /// (synthetic 2×2 image in the RAM LRU, selected), a pending image
+    /// (skeleton + queued job), a failed image, plus plain dir/file
+    /// icon cells.
+    pub(crate) fn grid() -> ExplorerApp {
+        let mut app = browse();
         app.view = ViewMode::Grid;
         app.listing.absorb(
             ListingUpdate {
@@ -1479,18 +1453,44 @@ pub(crate) mod tests {
             ts.ram.put(thumbed, Image::from_rgba8(2, 2, vec![128; 16]));
             ts.failed.insert(broken);
         }
-        let id = thumbed;
-        let pos = app.listing.pos_of(id).unwrap();
-        app.selected = Some((id, pos));
-        assert_eq!(lint_findings(&app), Vec::<String>::new());
-        assert!(app.cols.get() > 1, "grid should lay out multiple columns");
+        select(&mut app, "photo.jxr");
+        app
     }
 
-    #[test]
-    fn listing_error_tree_lints_clean() {
-        let mut app = test_app();
+    /// The listing failed outright.
+    pub(crate) fn listing_error() -> ExplorerApp {
+        let mut app = browse();
         app.listing.error = Some("opening /test/somewhere: permission denied".into());
-        assert_eq!(lint_findings(&app), Vec::<String>::new());
+        app
+    }
+
+    /// Select the entry named `name`, returning its id.
+    pub(crate) fn select(app: &mut ExplorerApp, name: &str) -> EntryId {
+        let id = app
+            .listing
+            .id_by_name(std::ffi::OsStr::new(name))
+            .expect("fixture entry exists");
+        let pos = app.listing.pos_of(id).unwrap();
+        app.selected = Some((id, pos));
+        id
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fixtures::{browse, grid};
+    use super::*;
+    use explorer_io::listing::ListingUpdate;
+    use explorer_io::RawEntry;
+
+    /// `cols` is a build-time output (viewport-dependent); rendering
+    /// the grid scene at the browser viewport must produce a real
+    /// multi-column layout for keyboard navigation to move by.
+    #[test]
+    fn grid_lays_out_multiple_columns() {
+        let app = grid();
+        crate::fixtures::render(&app, (1500.0, 950.0));
+        assert!(app.cols.get() > 1, "grid should lay out multiple columns");
     }
 
     /// Selection follows ids across a mid-stream resort: select an
@@ -1498,7 +1498,7 @@ pub(crate) mod tests {
     /// id must be unchanged with an updated position.
     #[test]
     fn selection_survives_streaming_resort() {
-        let mut app = test_app();
+        let mut app = browse();
         let id = app
             .listing
             .id_by_name(std::ffi::OsStr::new("notes.txt"))

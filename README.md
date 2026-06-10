@@ -68,6 +68,13 @@ hard rule: **no filesystem call ever runs on the UI thread.**
   glyph atlases, compiled shaders, D-Bus services) spin off browser
   windows and — next — portal FileChooser dialogs.
 
+For layout work without a window, `cargo run --bin dump_bundles`
+renders canned scenes (browse, previews, grid, the portal pickers)
+through damascene's bundle pipeline into `crates/explorer/out/` — an
+approximate SVG, a source-mapped tree dump, draw ops, and a lint
+report per scene — and exits nonzero on lint findings. The same scenes
+gate `cargo test` (`fixtures::all_scenes_lint_clean`).
+
 HDR output negotiates per-window (`ColorPreferences::hdr_extended`);
 image previews render with full panel headroom (`NoLimit`
 dynamic-range-limit, BT.2390 remastering above it). The toolbar badge

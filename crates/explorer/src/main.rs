@@ -6,15 +6,6 @@
 //!
 //! Usage: `prism-explorer [DIRECTORY]` — defaults to `$HOME`.
 
-mod app;
-mod filechooser;
-mod filemanager1;
-mod fmt;
-mod host;
-mod model;
-mod picker;
-mod places;
-
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -22,11 +13,12 @@ use anyhow::Result;
 use damascene_core::color::ColorPreferences;
 use damascene_winit_wgpu::HostConfig;
 
-use app::ExplorerApp;
 use explorer_io::{Notifier, Pool};
 use explorer_previews::Registry;
 use explorer_thumbs::ThumbCache;
-use host::{HostCommand, WindowSpec};
+use prism_explorer::app::ExplorerApp;
+use prism_explorer::host::{self, HostCommand, WindowSpec};
+use prism_explorer::{filechooser, filemanager1};
 
 /// Long edge of cached thumbnails: 2× the grid tile width, so tiles
 /// stay sharp on 2× displays.

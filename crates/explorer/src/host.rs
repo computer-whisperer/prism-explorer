@@ -848,6 +848,9 @@ impl WindowState {
         } else {
             self.frame_index = self.frame_index.wrapping_add(1);
             let t = &self.last_timings;
+            // The spread is currently a no-op (every field is listed)
+            // but keeps this compiling when upstream adds fields.
+            #[allow(clippy::needless_update)]
             let diagnostics = HostDiagnostics {
                 backend,
                 surface_size: (gfx.config.width, gfx.config.height),

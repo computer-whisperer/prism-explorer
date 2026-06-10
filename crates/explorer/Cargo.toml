@@ -12,6 +12,12 @@ authors.workspace = true
 name = "prism-explorer"
 path = "src/main.rs"
 
+# Renders every canned scene (src/fixtures.rs) through the damascene
+# bundle pipeline: svg + tree dump + draw ops + lint into out/.
+[[bin]]
+name = "dump_bundles"
+path = "src/bin/dump_bundles.rs"
+
 [dependencies]
 anyhow.workspace = true
 tracing.workspace = true
