@@ -11,6 +11,7 @@ mod filemanager1;
 mod fmt;
 mod host;
 mod model;
+mod picker;
 mod places;
 
 use std::path::PathBuf;

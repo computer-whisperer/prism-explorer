@@ -89,6 +89,17 @@ impl ThumbState {
     }
 }
 
+/// What activating a *file* (Enter / double-click) does. Directories
+/// always navigate.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum FileActivation {
+    /// Hand to the system opener — the browser-window behavior.
+    SystemOpen,
+    /// Record into an outbox the wrapper drains — picker dialogs treat
+    /// activation as "choose this file".
+    Collect,
+}
+
 enum PreviewState {
     /// Nothing selected, or a directory is.
     Empty,
@@ -117,6 +128,10 @@ pub struct ExplorerApp {
     places: Vec<Place>,
     show_hidden: bool,
     view: ViewMode,
+    file_activation: FileActivation,
+    /// Files activated under [`FileActivation::Collect`], drained by
+    /// the wrapping picker.
+    activated: Vec<PathBuf>,
 
     thumbs: Arc<ThumbCache>,
     thumb_state: Arc<Mutex<ThumbState>>,
@@ -170,6 +185,8 @@ impl ExplorerApp {
             places: Vec::new(),
             show_hidden: false,
             view: ViewMode::List,
+            file_activation: FileActivation::SystemOpen,
+            activated: Vec::new(),
             thumbs,
             thumb_state: Arc::new(Mutex::new(ThumbState::new())),
             cols: Cell::new(1),
@@ -346,12 +363,46 @@ impl ExplorerApp {
         if is_dir {
             self.navigate(path, None);
         } else {
-            // Detached; xdg-open does its own (possibly slow) IO in its
-            // own process.
-            if let Err(e) = std::process::Command::new("xdg-open").arg(&path).spawn() {
-                tracing::warn!(path = %path.display(), error = %e, "xdg-open failed");
+            match self.file_activation {
+                // Detached; xdg-open does its own (possibly slow) IO
+                // in its own process.
+                FileActivation::SystemOpen => {
+                    if let Err(e) = std::process::Command::new("xdg-open").arg(&path).spawn() {
+                        tracing::warn!(path = %path.display(), error = %e, "xdg-open failed");
+                    }
+                }
+                FileActivation::Collect => self.activated.push(path),
             }
         }
+    }
+
+    // ---- picker-wrapper surface ------------------------------------------
+    //
+    // The portal picker composes this app for everything browsing —
+    // these are the hooks its chrome needs.
+
+    /// Route file activation into the outbox instead of `xdg-open`.
+    pub(crate) fn set_file_activation(&mut self, mode: FileActivation) {
+        self.file_activation = mode;
+    }
+
+    /// Files activated since the last drain (under
+    /// [`FileActivation::Collect`]).
+    pub(crate) fn take_activated(&mut self) -> Vec<PathBuf> {
+        std::mem::take(&mut self.activated)
+    }
+
+    pub(crate) fn cwd_path(&self) -> &Path {
+        &self.cwd
+    }
+
+    /// The selected entry's absolute path and whether it is a
+    /// directory (through the symlink, once stat'ed).
+    pub(crate) fn selected_entry_path(&self) -> Option<(PathBuf, bool)> {
+        let id = self.selected_id()?;
+        let entries = self.listing.entries.lock().unwrap();
+        let e = entries.get(id as usize)?;
+        Some((self.cwd.join(&e.name), e.is_dir()))
     }
 
     fn request_preview(&mut self, id: EntryId) {
@@ -853,6 +904,33 @@ impl ExplorerApp {
         }
     }
 
+    /// Toolbar + sidebar/listing/preview + status bar, the whole
+    /// browsing page minus the window scaffold — the picker stacks its
+    /// chrome under this.
+    pub(crate) fn page_el(&self, cx: &BuildCx) -> El {
+        let center = match self.view {
+            ViewMode::List => self.list_el(),
+            ViewMode::Grid => self.grid_el(cx),
+        };
+        let content = row([
+            self.sidebar_el(),
+            resize_handle("sidebar-resize", Axis::Row),
+            card([center.padding(tokens::SPACE_2)])
+                .width(Size::Fill(1.0))
+                .height(Size::Fill(1.0)),
+            resize_handle("preview-resize", Axis::Row),
+            self.preview_pane(),
+        ])
+        .gap(tokens::SPACE_2)
+        .width(Size::Fill(1.0))
+        .height(Size::Fill(1.0));
+
+        column([self.toolbar_el(cx), content, self.status_el()])
+            .gap(tokens::SPACE_3)
+            .width(Size::Fill(1.0))
+            .height(Size::Fill(1.0))
+    }
+
     fn status_el(&self) -> El {
         let mut left = format!("{} items", self.listing.order.len());
         if !self.listing.complete && self.listing.error.is_none() {
@@ -875,6 +953,25 @@ impl ExplorerApp {
         ])
         .width(Size::Fill(1.0))
     }
+}
+
+/// Page scaffold (the hero-fixture idiom, as in the gallery): themed
+/// background under padded content; overlay root on top.
+pub(crate) fn scaffold(page: El) -> El {
+    overlays(
+        stack([
+            column(Vec::<El>::new())
+                .fill(tokens::BACKGROUND)
+                .width(Size::Fill(1.0))
+                .height(Size::Fill(1.0)),
+            page.padding(tokens::SPACE_4)
+                .width(Size::Fill(1.0))
+                .height(Size::Fill(1.0)),
+        ])
+        .width(Size::Fill(1.0))
+        .height(Size::Fill(1.0)),
+        [],
+    )
 }
 
 fn entry_icon(kind: EntryKind) -> &'static str {
@@ -1032,44 +1129,7 @@ impl App for ExplorerApp {
     }
 
     fn build(&self, cx: &BuildCx) -> El {
-        let center = match self.view {
-            ViewMode::List => self.list_el(),
-            ViewMode::Grid => self.grid_el(cx),
-        };
-        let content = row([
-            self.sidebar_el(),
-            resize_handle("sidebar-resize", Axis::Row),
-            card([center.padding(tokens::SPACE_2)])
-                .width(Size::Fill(1.0))
-                .height(Size::Fill(1.0)),
-            resize_handle("preview-resize", Axis::Row),
-            self.preview_pane(),
-        ])
-        .gap(tokens::SPACE_2)
-        .width(Size::Fill(1.0))
-        .height(Size::Fill(1.0));
-
-        let page = column([self.toolbar_el(cx), content, self.status_el()])
-            .gap(tokens::SPACE_3)
-            .width(Size::Fill(1.0))
-            .height(Size::Fill(1.0));
-
-        // Page scaffold (the hero-fixture idiom, as in the gallery):
-        // themed background under padded content; overlay root on top.
-        overlays(
-            stack([
-                column(Vec::<El>::new())
-                    .fill(tokens::BACKGROUND)
-                    .width(Size::Fill(1.0))
-                    .height(Size::Fill(1.0)),
-                page.padding(tokens::SPACE_4)
-                    .width(Size::Fill(1.0))
-                    .height(Size::Fill(1.0)),
-            ])
-            .width(Size::Fill(1.0))
-            .height(Size::Fill(1.0)),
-            [],
-        )
+        scaffold(self.page_el(cx))
     }
 
     fn hotkeys(&self) -> Vec<(KeyChord, String)> {
@@ -1280,15 +1340,16 @@ fn color_mode_badge(cx: &BuildCx) -> El {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use damascene_core::{render_bundle_themed, Rect, Theme};
     use explorer_io::listing::ListingUpdate;
     use explorer_io::RawEntry;
 
     /// An app with a synthetic listing — no real IO, pool jobs are
-    /// dropped before any worker would run them.
-    fn test_app() -> ExplorerApp {
+    /// dropped before any worker would run them. Shared with the
+    /// picker's tests.
+    pub(crate) fn test_app() -> ExplorerApp {
         let pool = Pool::spawn(1, "test");
         let notifier: Notifier = Arc::new(|| {});
         let thumbs = ThumbCache::new(
