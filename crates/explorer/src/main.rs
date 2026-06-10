@@ -127,6 +127,9 @@ fn main() -> Result<()> {
             height: 950.0,
             app: Box::new(app),
         },
+        // Not resident yet: nothing re-opens a window after the last
+        // one closes until the portal service lands.
+        false,
     )
     .map_err(|e| anyhow::anyhow!("host error: {e}"))
 }

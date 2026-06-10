@@ -46,28 +46,41 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::window::{Window, WindowId};
 
 /// Commands posted into the loop from other threads via
-/// [`EventLoopProxy`]. The IO pool's notifier and the D-Bus services
-/// send [`Wake`](HostCommand::Wake); window-opening commands (portal
-/// picker requests, `ShowFolders` on a closed explorer) join this enum
-/// as those features land.
-#[derive(Debug)]
+/// `EventLoopProxy`. The IO pool's notifier and the D-Bus services
+/// send [`Wake`](HostCommand::Wake); the portal FileChooser service
+/// opens its picker dialogs with [`OpenWindow`](HostCommand::OpenWindow)
+/// and tears them down with [`CloseWindow`](HostCommand::CloseWindow).
 pub enum HostCommand {
     /// Data outside the UI trees changed (listing batch, decoded
     /// preview, D-Bus navigation message): rebuild every window.
     Wake,
+    /// Open a window for `spec`. `token` is the sender's name for it —
+    /// the host keeps a token → `WindowId` map so the sender can close
+    /// it later without ever seeing winit types.
+    OpenWindow { token: u64, spec: WindowSpec },
+    /// Close the window opened under `token` (drops its app). A stale
+    /// or unknown token is a no-op — the user may have closed the
+    /// window first.
+    CloseWindow { token: u64 },
 }
 
 /// A window to open: title, logical size, and the [`App`] that owns it.
+///
+/// `Send` because specs travel inside [`HostCommand`]s, which D-Bus
+/// threads post through the loop proxy. The app only ever *runs* on
+/// the loop thread.
 pub struct WindowSpec {
     pub title: String,
     pub width: f32,
     pub height: f32,
-    pub app: Box<dyn App>,
+    pub app: Box<dyn App + Send>,
 }
 
 /// Run the host loop with one initial window. Returns when the last
-/// window closes, or with `Err` if GPU bring-up for the first window
-/// fails.
+/// window closes (`resident: false`) or only on a fatal error
+/// (`resident: true` — a process serving D-Bus requests stays warm
+/// with zero windows, ready to spin one up for the next request).
+/// `Err` means GPU bring-up for the first window failed.
 ///
 /// `config` supplies the color-preference ladder, MSAA sample count,
 /// present-mode choice, and Wayland `app_id`; its run-loop knobs
@@ -78,13 +91,16 @@ pub fn run(
     event_loop: EventLoop<HostCommand>,
     config: HostConfig,
     initial: WindowSpec,
+    resident: bool,
 ) -> Result<(), String> {
     event_loop.set_control_flow(ControlFlow::Wait);
     let mut host = Host {
         config,
         gpu: None,
         windows: HashMap::new(),
+        tokens: HashMap::new(),
         initial: Some(initial),
+        resident,
         clipboard: arboard::Clipboard::new().ok(),
         last_primary: String::new(),
         setup_error: None,
@@ -122,8 +138,15 @@ struct Host {
     config: HostConfig,
     gpu: Option<Gpu>,
     windows: HashMap<WindowId, WindowState>,
+    /// Sender-chosen names for command-opened windows, so
+    /// [`HostCommand::CloseWindow`] can find them. Entries for windows
+    /// the user already closed are pruned on that close.
+    tokens: HashMap<u64, WindowId>,
     /// The first window's spec, consumed by `resumed()`.
     initial: Option<WindowSpec>,
+    /// Stay alive with zero windows (the process is a D-Bus service);
+    /// otherwise the last window closing exits the loop.
+    resident: bool,
     /// Best-effort native clipboard, shared across windows.
     /// Initialization can fail headless; copy shortcuts no-op then.
     clipboard: Option<arboard::Clipboard>,
@@ -170,7 +193,11 @@ struct WindowState {
 }
 
 impl Host {
-    fn create_window(&mut self, event_loop: &ActiveEventLoop, spec: WindowSpec) {
+    fn create_window(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        spec: WindowSpec,
+    ) -> Option<WindowId> {
         let first = self.gpu.is_none();
         let attrs = Window::default_attributes()
             .with_title(&spec.title)
@@ -232,17 +259,31 @@ impl Host {
         match result {
             Ok(state) => {
                 state.gfx.window.request_redraw();
-                self.windows.insert(state.gfx.window.id(), state);
+                let id = state.gfx.window.id();
+                self.windows.insert(id, state);
+                Some(id)
             }
             Err(message) if first => {
                 // No GPU, no app: surface the failure as run()'s Err.
                 tracing::error!("{message}");
                 self.setup_error = Some(message);
                 event_loop.exit();
+                None
             }
             Err(message) => {
                 tracing::error!(error = %message, "dropping window request");
+                None
             }
+        }
+    }
+
+    /// Drop one window's state (its app with it) and exit the loop if
+    /// that was the last window of a non-resident host.
+    fn close_window(&mut self, event_loop: &ActiveEventLoop, id: WindowId) {
+        self.windows.remove(&id);
+        self.tokens.retain(|_, mapped| *mapped != id);
+        if self.windows.is_empty() && !self.resident {
+            event_loop.exit();
         }
     }
 }
@@ -303,7 +344,7 @@ impl ApplicationHandler<HostCommand> for Host {
         }
     }
 
-    fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: HostCommand) {
+    fn user_event(&mut self, event_loop: &ActiveEventLoop, event: HostCommand) {
         match event {
             HostCommand::Wake => {
                 // External data changed; any window's app may be
@@ -315,19 +356,25 @@ impl ApplicationHandler<HostCommand> for Host {
                     win.gfx.window.request_redraw();
                 }
             }
+            HostCommand::OpenWindow { token, spec } => {
+                if let Some(id) = self.create_window(event_loop, spec) {
+                    self.tokens.insert(token, id);
+                }
+            }
+            HostCommand::CloseWindow { token } => {
+                if let Some(id) = self.tokens.remove(&token) {
+                    self.close_window(event_loop, id);
+                }
+            }
         }
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
         if let WindowEvent::CloseRequested = event {
-            self.windows.remove(&id);
-            // Resident-with-zero-windows is the end state, but nothing
-            // re-opens a window yet (the portal service and
-            // single-instance activation will). Until then a closed
-            // last window means exit, not a zombie.
-            if self.windows.is_empty() {
-                event_loop.exit();
-            }
+            // Dropping the state drops the window's app; a portal
+            // picker's pending D-Bus reply observes that as its result
+            // channel disconnecting and answers "cancelled".
+            self.close_window(event_loop, id);
             return;
         }
         let Some(win) = self.windows.get_mut(&id) else {
