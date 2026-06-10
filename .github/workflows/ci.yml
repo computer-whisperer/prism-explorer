@@ -35,7 +35,7 @@ jobs:
       - uses: actions/checkout@v6
         with:
           repository: computer-whisperer/damascene
-          ref: 0176e86a26fcdeebc420e51c46d8cbd678c3e4f1
+          ref: a2450cf76127e2fbbd06c12b63f5dd0ba8dd81ac
           path: damascene/damascene.main
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -60,7 +60,7 @@ jobs:
       - uses: actions/checkout@v6
         with:
           repository: computer-whisperer/damascene
-          ref: 0176e86a26fcdeebc420e51c46d8cbd678c3e4f1
+          ref: a2450cf76127e2fbbd06c12b63f5dd0ba8dd81ac
           path: damascene/damascene.main
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -94,7 +94,7 @@ jobs:
       - uses: actions/checkout@v6
         with:
           repository: computer-whisperer/damascene
-          ref: 0176e86a26fcdeebc420e51c46d8cbd678c3e4f1
+          ref: a2450cf76127e2fbbd06c12b63f5dd0ba8dd81ac
           path: damascene/damascene.main
       - uses: dtolnay/rust-toolchain@stable
       - name: Install system dependencies

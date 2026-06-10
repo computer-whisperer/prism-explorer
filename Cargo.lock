@@ -801,6 +801,7 @@ dependencies = [
  "bytemuck",
  "cosmic-text",
  "damascene-core",
+ "log",
  "ttf-parser",
  "web-time",
  "wgpu",

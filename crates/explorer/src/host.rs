@@ -22,12 +22,18 @@
 //! channel that background threads (IO pool, D-Bus services) poke.
 //!
 //! Each window hosts its own [`App`] — interaction state, hotkeys,
-//! focus, and frame pacing are all per-window. Glyph/MSDF atlases
-//! duplicate per window for now (a `Runner` owns its atlases); shared
-//! atlases are a later damascene-side improvement.
+//! focus, and frame pacing are all per-window. A `Runner` owns its
+//! pipelines and glyph atlas, so rather than share them across windows
+//! the daemon keeps a small pool of pre-warmed `Runner`s ([`RunnerPool`])
+//! and hands one to each new window — a portal picker opens from a
+//! ready pipeline instead of paying ~300ms of construction on the open
+//! path (damascene #105's `WindowGfx::with_surface_and_renderer`).
 
 use std::collections::HashMap;
+use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
+
+use damascene_wgpu::{Runner, RunnerCaps};
 
 use damascene_core::widgets::text_input::{self, ClipboardKind};
 use damascene_core::{
@@ -97,6 +103,7 @@ pub fn run(
     let mut host = Host {
         config,
         gpu: None,
+        runner_pool: None,
         windows: HashMap::new(),
         tokens: HashMap::new(),
         initial: Some(initial),
@@ -134,9 +141,83 @@ struct Gpu {
     backend: &'static str,
 }
 
+/// How many warm spare `Runner`s to keep ready. One covers the common
+/// single-picker case; two absorbs a burst (two apps popping a dialog
+/// at once) and the ~300ms it takes a background rebuild to refill.
+/// Each idle spare holds a full pipeline set + glyph atlas, so this is
+/// a memory/latency trade — kept small deliberately.
+const WARM_RUNNERS: usize = 2;
+
+/// Pre-warmed [`Runner`]s the host hands to new windows so they skip
+/// the ~300ms of pipeline + glyph-atlas construction on the open path
+/// — the whole point of a resident daemon. A background thread builds
+/// spares for the primary window's `(format, sample_count)` and parks
+/// them; each window open pops one and requests a rebuild to refill.
+///
+/// Both degenerate cases stay correct: a pool miss (none ready yet)
+/// falls back to a cold `WindowGfx::with_surface`, and a window that
+/// negotiates a *different* format (e.g. landing on a different-HDR
+/// output) is repaired in place by `with_surface_and_renderer`'s
+/// `set_target_format` — the slower path the pool exists to avoid, not
+/// a bug.
+struct RunnerPool {
+    /// Warm spares, all built for the primary window's
+    /// `(format, sample_count)`. LIFO; depth tops out at
+    /// [`WARM_RUNNERS`].
+    spares: Arc<Mutex<Vec<Runner>>>,
+    /// Each `()` asks the warmer thread to build one more spare.
+    refill: mpsc::Sender<()>,
+}
+
+impl RunnerPool {
+    /// Spawn the warmer thread and request `target` spares up front.
+    /// `device`/`queue` are `Send + Sync` and wgpu permits resource
+    /// creation on another thread concurrently with rendering on the
+    /// loop, so the build cost lands entirely off the open path.
+    fn spawn(gpu: &Gpu, format: wgpu::TextureFormat, sample_count: u32, target: usize) -> Self {
+        let spares: Arc<Mutex<Vec<Runner>>> = Arc::new(Mutex::new(Vec::new()));
+        let caps = RunnerCaps::from_adapter(&gpu.adapter);
+        let device = gpu.device.clone();
+        let queue = gpu.queue.clone();
+        let sink = spares.clone();
+        let (refill, requests) = mpsc::channel::<()>();
+        let spawned = std::thread::Builder::new()
+            .name("runner-warmer".into())
+            .spawn(move || {
+                // Ends when the last `refill` sender drops (host exit).
+                for () in requests {
+                    let mut runner = Runner::with_caps(&device, &queue, format, sample_count, caps);
+                    runner.warm_default_glyphs();
+                    sink.lock().unwrap().push(runner);
+                }
+            });
+        if spawned.is_ok() {
+            for _ in 0..target {
+                let _ = refill.send(());
+            }
+        } else {
+            tracing::warn!("runner warmer thread failed to spawn; windows open cold");
+        }
+        RunnerPool { spares, refill }
+    }
+
+    /// Pop a warm spare, requesting a 1-for-1 replacement to keep the
+    /// depth steady. `None` when none is ready (caller builds cold).
+    fn take(&self) -> Option<Runner> {
+        let runner = self.spares.lock().unwrap().pop();
+        if runner.is_some() {
+            let _ = self.refill.send(());
+        }
+        runner
+    }
+}
+
 struct Host {
     config: HostConfig,
     gpu: Option<Gpu>,
+    /// Warm-Runner pool, spawned once the first window reveals the
+    /// negotiated `(format, sample_count)`. `None` until then.
+    runner_pool: Option<RunnerPool>,
     windows: HashMap<WindowId, WindowState>,
     /// Sender-chosen names for command-opened windows, so
     /// [`HostCommand::CloseWindow`] can find them. Entries for windows
@@ -222,15 +303,34 @@ impl Host {
                 self.gpu = Some(acquire_gpu(window.clone())?);
             }
             let gpu = self.gpu.as_ref().unwrap();
-            let mut gfx = WindowGfx::new(
-                &gpu.instance,
-                &gpu.adapter,
-                &gpu.device,
-                &gpu.queue,
-                window,
-                &self.config,
-            )
-            .map_err(|e| format!("could not create a rendering surface: {e}"))?;
+            // Create the window's real surface here (not inside
+            // WindowGfx::new) so a pooled Runner can be injected
+            // alongside it. A warm spare skips ~300ms of pipeline +
+            // glyph-atlas construction; a miss falls back to the cold
+            // constructor, which builds and warms its own Runner.
+            let surface = gpu
+                .instance
+                .create_surface(window.clone())
+                .map_err(|e| format!("could not create a rendering surface: {e}"))?;
+            let mut gfx = match self.runner_pool.as_ref().and_then(|p| p.take()) {
+                Some(runner) => WindowGfx::with_surface_and_renderer(
+                    &gpu.adapter,
+                    &gpu.device,
+                    &gpu.queue,
+                    window,
+                    surface,
+                    &self.config,
+                    runner,
+                ),
+                None => WindowGfx::with_surface(
+                    &gpu.adapter,
+                    &gpu.device,
+                    &gpu.queue,
+                    window,
+                    surface,
+                    &self.config,
+                ),
+            };
             let mut app = spec.app;
             gfx.renderer.set_theme(app.theme());
             for s in app.shaders() {
@@ -266,6 +366,17 @@ impl Host {
             Ok(state) => {
                 state.gfx.window.request_redraw();
                 let id = state.gfx.window.id();
+                // First window done: start warming spare Runners against
+                // the format it negotiated, so later windows (portal
+                // pickers) open from a ready pipeline.
+                if self.runner_pool.is_none() {
+                    let format = state.gfx.config.format;
+                    let sample_count = self.config.sample_count.max(1);
+                    self.runner_pool = self
+                        .gpu
+                        .as_ref()
+                        .map(|gpu| RunnerPool::spawn(gpu, format, sample_count, WARM_RUNNERS));
+                }
                 self.windows.insert(id, state);
                 Some(id)
             }

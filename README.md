@@ -64,9 +64,12 @@ hard rule: **no filesystem call ever runs on the UI thread.**
   per-window bring-up, the `SurfaceColor` HDR negotiation driver, the
   pure input mappers). Each window pairs a damascene `Runner` with its
   own `App`; HDR/SDR negotiates per window and re-negotiates live on
-  output moves. This is what lets one warm process (thumbnail cache,
-  glyph atlases, compiled shaders, D-Bus services) spin off browser
-  windows and — next — portal FileChooser dialogs.
+  output moves. A background thread keeps a small pool of pre-warmed
+  `Runner`s (pipelines + glyph atlas already built) so a portal picker
+  opens from a ready pipeline in single-digit milliseconds instead of
+  paying ~300ms of GPU construction on the open path. This is what lets
+  one warm process (thumbnail cache, warm render pipelines, D-Bus
+  services) spin off browser and FileChooser windows on demand.
 
 For layout work without a window, `cargo run --bin dump_bundles`
 renders canned scenes (browse, previews, grid, the portal pickers)
