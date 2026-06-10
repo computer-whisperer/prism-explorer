@@ -7,6 +7,7 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
+default-run = "prism-explorer"
 
 [[bin]]
 name = "prism-explorer"
@@ -45,6 +46,10 @@ lru = "0.18"
 
 # mtime column formatting.
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
+
+# Portal filters carry mimetype patterns ("image/*"); matched against
+# the extension-guessed type.
+mime_guess = "2"
 
 # org.freedesktop.FileManager1 + the portal FileChooser backend (each
 # on its own service thread).

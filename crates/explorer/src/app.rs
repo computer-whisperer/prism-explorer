@@ -27,7 +27,7 @@ use explorer_previews::{Preview, Registry};
 use explorer_thumbs::ThumbCache;
 
 use crate::fmt;
-use crate::model::{Entry, EntryId, Listing, Msg};
+use crate::model::{Entry, EntryId, FileFilter, Listing, Msg};
 use crate::places::Place;
 
 const ROW_H: f32 = 34.0;
@@ -127,6 +127,10 @@ pub struct ExplorerApp {
     listing: Listing,
     places: Vec<Place>,
     show_hidden: bool,
+    /// Picker-imposed type filter (portal `filters`); the browser
+    /// window never sets one. Applies to files only, in
+    /// `Listing::rebuild_order`.
+    file_filter: Option<FileFilter>,
     view: ViewMode,
     file_activation: FileActivation,
     /// Files activated under [`FileActivation::Collect`], drained by
@@ -184,6 +188,7 @@ impl ExplorerApp {
             registry,
             places: Vec::new(),
             show_hidden: false,
+            file_filter: None,
             view: ViewMode::List,
             file_activation: FileActivation::SystemOpen,
             activated: Vec::new(),
@@ -430,7 +435,29 @@ impl ExplorerApp {
 
     fn toggle_hidden(&mut self) {
         self.show_hidden = !self.show_hidden;
-        self.listing.rebuild_order(self.show_hidden);
+        self.listing
+            .rebuild_order(self.show_hidden, self.file_filter.as_ref());
+        self.remap_selection();
+    }
+
+    /// Visible (ordered) entry names — what a row-by-row reading of
+    /// the list view would show.
+    #[cfg(test)]
+    pub(crate) fn visible_names(&self) -> Vec<String> {
+        let entries = self.listing.entries.lock().unwrap();
+        self.listing
+            .order
+            .iter()
+            .map(|&id| entries[id as usize].display.clone())
+            .collect()
+    }
+
+    /// Install (or clear) the picker's file-type filter and refilter
+    /// the current listing in place.
+    pub(crate) fn set_file_filter(&mut self, filter: Option<FileFilter>) {
+        self.file_filter = filter;
+        self.listing
+            .rebuild_order(self.show_hidden, self.file_filter.as_ref());
         self.remap_selection();
     }
 
@@ -1055,7 +1082,10 @@ impl App for ExplorerApp {
                     if generation != self.listing.generation {
                         continue;
                     }
-                    if self.listing.absorb(update, self.show_hidden) {
+                    if self
+                        .listing
+                        .absorb(update, self.show_hidden, self.file_filter.as_ref())
+                    {
                         self.remap_selection();
                     }
                     if let Some(name) = self.pending_select.clone() {
@@ -1075,7 +1105,12 @@ impl App for ExplorerApp {
                     if generation != self.listing.generation {
                         continue;
                     }
-                    if self.listing.apply_stat(id, result, self.show_hidden) {
+                    if self.listing.apply_stat(
+                        id,
+                        result,
+                        self.show_hidden,
+                        self.file_filter.as_ref(),
+                    ) {
                         self.remap_selection();
                     }
                 }
@@ -1398,6 +1433,7 @@ pub(crate) mod fixtures {
                 error: None,
             },
             false,
+            None,
         );
         app
     }
@@ -1439,6 +1475,7 @@ pub(crate) mod fixtures {
                 error: None,
             },
             false,
+            None,
         );
         let thumbed = app
             .listing
@@ -1522,6 +1559,7 @@ mod tests {
                 error: None,
             },
             false,
+            None,
         );
         app.remap_selection();
 

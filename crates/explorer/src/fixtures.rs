@@ -11,9 +11,12 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use damascene_core::{render_bundle_themed, App, BuildCx, Bundle, HostDiagnostics, Rect};
+use damascene_core::{
+    render_bundle_themed, App, BuildCx, Bundle, EventCx, HostDiagnostics, Rect, UiEvent,
+};
 
 use crate::app;
+use crate::model::FileFilter;
 use crate::picker::{PickerApp, PickerKind, PickerRequest};
 
 /// Browser windows open at 1500×950 (`main.rs`), pickers at 1100×760
@@ -42,12 +45,31 @@ pub fn scenes() -> Vec<Scene> {
         scene("grid", BROWSER, app::fixtures::grid()),
         scene("listing_error", BROWSER, app::fixtures::listing_error()),
         scene("picker_open", PICKER, picker_open()),
+        scene("picker_filter_menu", PICKER, picker_filter_menu()),
         scene("picker_save", PICKER, picker_save()),
     ]
 }
 
-/// Open-file portal picker with an image selected, so the accept
-/// button renders enabled.
+/// The filters `picker_open` carries: photo.jxr passes "Images",
+/// notes.txt only "All files" — switching visibly refilters.
+fn image_filters() -> Vec<FileFilter> {
+    vec![
+        FileFilter {
+            name: "Images".into(),
+            globs: vec!["*.jxr".into()],
+            mimes: vec!["image/*".into()],
+        },
+        FileFilter {
+            name: "All files".into(),
+            globs: vec!["*".into()],
+            mimes: vec![],
+        },
+    ]
+}
+
+/// Open-file portal picker with an image selected (accept renders
+/// enabled) and the "Images" filter active — notes.txt is filtered
+/// out of the listing.
 fn picker_open() -> PickerApp {
     let mut explorer = app::fixtures::browse();
     app::fixtures::select(&mut explorer, "photo.jxr");
@@ -56,16 +78,27 @@ fn picker_open() -> PickerApp {
         "Open",
         String::new(),
         explorer,
+        image_filters(),
     )
 }
 
-/// Save portal picker with a pre-filled file name.
+/// `picker_open` with the filter select's menu popped open — driven
+/// through the real event path (trigger click), not a fixture setter.
+fn picker_filter_menu() -> PickerApp {
+    let mut picker = picker_open();
+    picker.on_event(UiEvent::synthetic_click("picker-filter"), &EventCx::new());
+    picker
+}
+
+/// Save portal picker with a pre-filled file name and no filters (the
+/// selector hides).
 fn picker_save() -> PickerApp {
     picker(
         PickerKind::Save,
         "Save",
         "untitled.txt".into(),
         app::fixtures::browse(),
+        Vec::new(),
     )
 }
 
@@ -74,6 +107,7 @@ fn picker(
     accept_label: &str,
     current_name: String,
     explorer: crate::app::ExplorerApp,
+    filters: Vec<FileFilter>,
 ) -> PickerApp {
     PickerApp::new(
         PickerRequest {
@@ -81,6 +115,8 @@ fn picker(
             accept_label: accept_label.into(),
             start_dir: PathBuf::from("/test/somewhere"),
             current_name,
+            filters,
+            current_filter: 0,
         },
         explorer,
         None,

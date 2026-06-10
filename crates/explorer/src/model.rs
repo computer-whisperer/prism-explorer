@@ -96,7 +96,12 @@ impl Listing {
 
     /// Fold one streaming update in. Returns whether `order` changed
     /// (the caller remaps its selection position).
-    pub fn absorb(&mut self, update: ListingUpdate, show_hidden: bool) -> bool {
+    pub fn absorb(
+        &mut self,
+        update: ListingUpdate,
+        show_hidden: bool,
+        filter: Option<&FileFilter>,
+    ) -> bool {
         if let Some(e) = update.error {
             self.error = Some(e);
         }
@@ -108,7 +113,7 @@ impl Listing {
             .lock()
             .unwrap()
             .extend(update.batch.into_iter().map(Entry::from_raw));
-        self.rebuild_order(show_hidden);
+        self.rebuild_order(show_hidden, filter);
         true
     }
 
@@ -119,6 +124,7 @@ impl Listing {
         id: EntryId,
         result: Result<EntryMeta, String>,
         show_hidden: bool,
+        filter: Option<&FileFilter>,
     ) -> bool {
         let mut entries = self.entries.lock().unwrap();
         let Some(entry) = entries.get_mut(id as usize) else {
@@ -136,17 +142,23 @@ impl Listing {
         }
         drop(entries);
         if regrouped {
-            self.rebuild_order(show_hidden);
+            self.rebuild_order(show_hidden, filter);
         }
         regrouped
     }
 
-    /// Recompute `order`: hidden filter, directories first, then
-    /// case-insensitive by name (raw name as the total-order tiebreak).
-    pub fn rebuild_order(&mut self, show_hidden: bool) {
+    /// Recompute `order`: hidden + type filters, directories first,
+    /// then case-insensitive by name (raw name as the total-order
+    /// tiebreak). The type filter never hides directories — they're
+    /// how the user navigates.
+    pub fn rebuild_order(&mut self, show_hidden: bool, filter: Option<&FileFilter>) {
         let entries = self.entries.lock().unwrap();
         let mut order: Vec<EntryId> = (0..entries.len() as EntryId)
-            .filter(|&i| show_hidden || !entries[i as usize].is_hidden())
+            .filter(|&i| {
+                let e = &entries[i as usize];
+                (show_hidden || !e.is_hidden())
+                    && (e.is_dir() || filter.is_none_or(|f| f.matches(&e.display)))
+            })
             .collect();
         order.sort_by(|&a, &b| {
             let (ea, eb) = (&entries[a as usize], &entries[b as usize]);
@@ -208,6 +220,67 @@ pub enum Msg {
     },
 }
 
+/// One file-type filter from a portal request: a display name plus
+/// glob and mimetype alternatives — a file passes if *any* alternative
+/// matches. Directories are never filtered (see
+/// [`Listing::rebuild_order`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FileFilter {
+    pub name: String,
+    /// Glob patterns (`*.png`; `*` and `?` wildcards), pre-lowercased
+    /// by the parser — matching is case-insensitive.
+    pub globs: Vec<String>,
+    /// Mimetype patterns, possibly wildcarded (`image/*`), matched
+    /// against the extension-guessed type of the file name.
+    pub mimes: Vec<String>,
+}
+
+impl FileFilter {
+    pub fn matches(&self, file_name: &str) -> bool {
+        let lower = file_name.to_lowercase();
+        self.globs.iter().any(|g| glob_match(g, &lower))
+            || self.mimes.iter().any(|m| mime_matches(m, file_name))
+    }
+}
+
+/// Iterative `*`/`?` glob (the portal's pattern language; no character
+/// classes). The caller lowercases both sides for case-insensitivity.
+fn glob_match(pattern: &str, name: &str) -> bool {
+    let p: Vec<char> = pattern.chars().collect();
+    let n: Vec<char> = name.chars().collect();
+    let (mut pi, mut ni) = (0, 0);
+    // Most recent `*` and the name position its current expansion
+    // started at — on mismatch, grow that expansion by one.
+    let mut star: Option<(usize, usize)> = None;
+    while ni < n.len() {
+        if pi < p.len() && (p[pi] == '?' || p[pi] == n[ni]) {
+            pi += 1;
+            ni += 1;
+        } else if pi < p.len() && p[pi] == '*' {
+            star = Some((pi, ni));
+            pi += 1;
+        } else if let Some((sp, sn)) = star {
+            star = Some((sp, sn + 1));
+            pi = sp + 1;
+            ni = sn + 1;
+        } else {
+            return false;
+        }
+    }
+    p[pi..].iter().all(|&c| c == '*')
+}
+
+/// Does the extension-guessed mimetype of `name` satisfy `pattern`
+/// (`image/png`, `image/*`, `*/*`)?
+fn mime_matches(pattern: &str, name: &str) -> bool {
+    let Some((pt, ps)) = pattern.split_once('/') else {
+        return false;
+    };
+    mime_guess::from_path(name)
+        .iter()
+        .any(|m| (pt == "*" || m.type_() == pt) && (ps == "*" || m.subtype() == ps))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -247,6 +320,7 @@ mod tests {
                 false,
             ),
             false,
+            None,
         );
         assert_eq!(ordered_names(&l), ["Apps", "zebra.txt"]);
 
@@ -258,17 +332,82 @@ mod tests {
                 true,
             ),
             false,
+            None,
         );
         assert_eq!(ordered_names(&l), ["Apps", "Zoo", "banana", "zebra.txt"]);
         assert!(l.complete);
         assert_eq!(l.id_by_name(OsStr::new("zebra.txt")), Some(zebra));
 
         // Hidden toggle re-admits dotfiles.
-        l.rebuild_order(true);
+        l.rebuild_order(true, None);
         assert_eq!(
             ordered_names(&l),
             ["Apps", "Zoo", ".hidden", "banana", "zebra.txt"]
         );
+    }
+
+    #[test]
+    fn glob_matching() {
+        assert!(glob_match("*.png", "shot.png"));
+        assert!(!glob_match("*.png", "shot.png.bak"));
+        assert!(glob_match("*", "anything at all"));
+        assert!(glob_match("img_????.jpg", "img_0042.jpg"));
+        assert!(!glob_match("img_????.jpg", "img_42.jpg"));
+        assert!(glob_match("a*b*c", "axxbxxc"));
+        assert!(!glob_match("a*b*c", "axxcxxb"));
+        assert!(glob_match("*.tar.*", "x.tar.gz"));
+        assert!(!glob_match("?", ""));
+        assert!(glob_match("*", ""));
+    }
+
+    #[test]
+    fn filter_matching() {
+        let images = FileFilter {
+            name: "Images".into(),
+            globs: vec!["*.jxr".into()],
+            mimes: vec!["image/*".into()],
+        };
+        // Glob alternative; case-insensitive via pre-lowered pattern.
+        assert!(images.matches("photo.JXR"));
+        // Mimetype wildcard via extension guess.
+        assert!(images.matches("shot.png"));
+        assert!(images.matches("pic.jpeg"));
+        assert!(!images.matches("notes.txt"));
+
+        let exact = FileFilter {
+            name: "PNG".into(),
+            globs: vec![],
+            mimes: vec!["image/png".into()],
+        };
+        assert!(exact.matches("a.png"));
+        assert!(!exact.matches("a.jpg"));
+    }
+
+    #[test]
+    fn rebuild_order_filter_spares_dirs() {
+        let mut l = Listing::new("/test".into(), 0);
+        l.absorb(
+            update(
+                &[
+                    ("docs", EntryKind::Dir),
+                    ("notes.txt", EntryKind::File),
+                    ("shot.png", EntryKind::File),
+                ],
+                true,
+            ),
+            false,
+            None,
+        );
+        let images = FileFilter {
+            name: "Images".into(),
+            globs: vec!["*.png".into()],
+            mimes: vec![],
+        };
+        l.rebuild_order(false, Some(&images));
+        assert_eq!(ordered_names(&l), ["docs", "shot.png"]);
+        // Dropping the filter restores everything.
+        l.rebuild_order(false, None);
+        assert_eq!(ordered_names(&l), ["docs", "notes.txt", "shot.png"]);
     }
 
     #[test]
@@ -280,6 +419,7 @@ mod tests {
                 true,
             ),
             false,
+            None,
         );
         assert_eq!(ordered_names(&l), ["alpha", "link"]);
 
@@ -293,6 +433,7 @@ mod tests {
                 is_symlink: true,
             }),
             false,
+            None,
         );
         assert!(regrouped);
         // Still dirs-first, now sorted among them.

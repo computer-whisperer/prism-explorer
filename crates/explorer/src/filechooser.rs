@@ -13,10 +13,11 @@
 //! closure; accept/cancel/window-close all funnel into that closure
 //! exactly once (dropping the app unanswered counts as cancel).
 //!
-//! Deliberately unimplemented for now: `filters`/`choices` (parsed
-//! away; the picker lists everything), `multiple` (one URI comes
-//! back), modal-to-parent (`parent_window` is ignored — the dialog is
-//! a plain toplevel).
+//! Deliberately unimplemented for now: `choices` (ignored),
+//! `multiple` (one URI comes back), modal-to-parent (`parent_window`
+//! is ignored — the dialog is a plain toplevel), and the
+//! `current_filter` result key (the filter active at accept time is
+//! not reported back).
 
 use std::collections::HashMap;
 use std::ffi::OsString;
@@ -33,6 +34,7 @@ use explorer_thumbs::ThumbCache;
 
 use crate::app::ExplorerApp;
 use crate::host::{HostCommand, WindowSpec};
+use crate::model::FileFilter;
 use crate::picker::{PickerApp, PickerKind, PickerRequest};
 
 /// Portal response codes (`org.freedesktop.portal.Request`).
@@ -168,11 +170,14 @@ impl FileChooser {
         if bool_option(&options, "multiple") {
             tracing::debug!("OpenFile: multiple requested; returning a single choice");
         }
+        let (filters, current_filter) = filter_options(&options);
         let request = PickerRequest {
             kind: PickerKind::Open { directory },
             accept_label: accept_label(&options, "Open"),
             start_dir: start_dir(&options),
             current_name: String::new(),
+            filters,
+            current_filter,
         };
         tracing::info!(%title, directory, "portal OpenFile");
         let (response, answer) = self.run_picker(connection, handle, &title, request).await;
@@ -202,11 +207,14 @@ impl FileChooser {
                 string_option(&options, "current_name").unwrap_or_default(),
             ),
         };
+        let (filters, current_filter) = filter_options(&options);
         let request = PickerRequest {
             kind: PickerKind::Save,
             accept_label: accept_label(&options, "Save"),
             start_dir,
             current_name,
+            filters,
+            current_filter,
         };
         tracing::info!(%title, "portal SaveFile");
         let (response, answer) = self.run_picker(connection, handle, &title, request).await;
@@ -229,11 +237,15 @@ impl FileChooser {
             .and_then(|v| <Vec<Vec<u8>>>::try_from(v.try_clone().ok()?).ok())
             .map(|files| files.into_iter().map(bytes_to_os).collect())
             .unwrap_or_default();
+        // No filters: this picker chooses the *directory* the supplied
+        // names land in (SaveFiles has no filter options in the spec).
         let request = PickerRequest {
             kind: PickerKind::Open { directory: true },
             accept_label: accept_label(&options, "Save"),
             start_dir: start_dir(&options),
             current_name: String::new(),
+            filters: Vec::new(),
+            current_filter: 0,
         };
         tracing::info!(%title, files = names.len(), "portal SaveFiles");
         let (response, answer) = self.run_picker(connection, handle, &title, request).await;
@@ -364,6 +376,55 @@ fn accept_label(options: &HashMap<String, OwnedValue>, default: &str) -> String 
     }
 }
 
+/// Wire shape of one portal filter: `(sa(us))` — display name plus
+/// (kind, pattern) alternatives, kind 0 = glob, 1 = mimetype.
+type RawFilter = (String, Vec<(u32, String)>);
+
+fn parse_filter((name, patterns): RawFilter) -> FileFilter {
+    let mut filter = FileFilter {
+        name,
+        globs: Vec::new(),
+        mimes: Vec::new(),
+    };
+    for (kind, pattern) in patterns {
+        match kind {
+            // Globs are matched case-insensitively against lowercased
+            // names — lower the pattern once here.
+            0 => filter.globs.push(pattern.to_lowercase()),
+            1 => filter.mimes.push(pattern),
+            unknown => tracing::debug!(unknown, %pattern, "skipping unknown filter kind"),
+        }
+    }
+    filter
+}
+
+/// Parse `filters` + `current_filter` into the list the picker shows
+/// and the index to start on. A `current_filter` that isn't in the
+/// list (compared by name) is appended — per the spec it should match,
+/// but GTK callers occasionally send a detached one.
+fn filter_options(options: &HashMap<String, OwnedValue>) -> (Vec<FileFilter>, usize) {
+    let mut filters: Vec<FileFilter> = options
+        .get("filters")
+        .and_then(|v| <Vec<RawFilter>>::try_from(v.try_clone().ok()?).ok())
+        .map(|raw| raw.into_iter().map(parse_filter).collect())
+        .unwrap_or_default();
+    let current = options
+        .get("current_filter")
+        .and_then(|v| RawFilter::try_from(v.try_clone().ok()?).ok())
+        .map(parse_filter);
+    let idx = match current {
+        Some(cur) => match filters.iter().position(|f| f.name == cur.name) {
+            Some(i) => i,
+            None => {
+                filters.push(cur);
+                filters.len() - 1
+            }
+        },
+        None => 0,
+    };
+    (filters, idx)
+}
+
 fn home_dir() -> PathBuf {
     std::env::var_os("HOME")
         .map(PathBuf::from)
@@ -426,6 +487,51 @@ mod tests {
             path_to_file_uri(std::path::Path::new(raw)),
             "file:///tmp/%FF"
         );
+    }
+
+    #[test]
+    fn filter_option_parsing() {
+        // No options at all → no filters, index 0.
+        assert_eq!(filter_options(&HashMap::new()), (Vec::new(), 0));
+
+        let raw: Vec<RawFilter> = vec![
+            (
+                "Images".into(),
+                vec![(0, "*.PNG".into()), (1, "image/jpeg".into())],
+            ),
+            ("All files".into(), vec![(0, "*".into())]),
+            ("Weird".into(), vec![(7, "???".into())]),
+        ];
+        let mut options = HashMap::new();
+        options.insert(
+            "filters".to_string(),
+            OwnedValue::try_from(Value::from(raw.clone())).unwrap(),
+        );
+        let (filters, idx) = filter_options(&options);
+        assert_eq!(idx, 0);
+        assert_eq!(filters.len(), 3);
+        // Globs lowered; mimetypes kept; unknown kinds dropped.
+        assert_eq!(filters[0].globs, ["*.png"]);
+        assert_eq!(filters[0].mimes, ["image/jpeg"]);
+        assert!(filters[2].globs.is_empty() && filters[2].mimes.is_empty());
+
+        // current_filter selects by name…
+        let all: RawFilter = ("All files".into(), vec![(0, "*".into())]);
+        options.insert(
+            "current_filter".to_string(),
+            OwnedValue::try_from(Value::from(all)).unwrap(),
+        );
+        assert_eq!(filter_options(&options).1, 1);
+
+        // …and a detached one is appended and selected.
+        let detached: RawFilter = ("Detached".into(), vec![(0, "*.x".into())]);
+        options.insert(
+            "current_filter".to_string(),
+            OwnedValue::try_from(Value::from(detached)).unwrap(),
+        );
+        let (filters, idx) = filter_options(&options);
+        assert_eq!((filters.len(), idx), (4, 3));
+        assert_eq!(filters[3].name, "Detached");
     }
 
     #[test]

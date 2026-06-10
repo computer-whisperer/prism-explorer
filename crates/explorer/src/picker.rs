@@ -14,11 +14,13 @@ use std::sync::Arc;
 
 use damascene_core::prelude::*;
 use damascene_core::selection::Selection;
+use damascene_core::widgets::select::{self, select_menu, select_trigger};
 use damascene_core::widgets::text_input::{self, TextInputOpts};
 use damascene_core::{App, BuildCx, EventCx, KeyChord, UiEvent, UiEventKind, UiKey};
 use explorer_io::Pool;
 
 use crate::app::{scaffold, ExplorerApp, FileActivation};
+use crate::model::FileFilter;
 
 /// What the dialog is choosing. Mirrors the portal's OpenFile /
 /// SaveFile split (`directory` is OpenFile's folder-choosing option).
@@ -40,6 +42,12 @@ pub struct PickerRequest {
     pub start_dir: PathBuf,
     /// Save mode: pre-filled file name (portal `current_name`).
     pub current_name: String,
+    /// File-type filters (portal `filters`), already split into glob /
+    /// mimetype alternatives. Empty means list everything.
+    pub filters: Vec<FileFilter>,
+    /// Index into `filters` to start on (portal `current_filter`,
+    /// already resolved by the service; ignored when out of range).
+    pub current_filter: usize,
 }
 
 /// Called exactly once with the chosen paths; `None` is cancel.
@@ -55,6 +63,12 @@ pub struct PickerApp {
     /// Global selection state — carets/selection for the filename
     /// field live here, surfaced through `App::selection`.
     selection: Selection,
+    /// File-type filters the caller supplied; the active one is
+    /// installed on the wrapped explorer. Empty hides the selector.
+    filters: Vec<FileFilter>,
+    filter_idx: usize,
+    /// The filter select's popover-open flag.
+    filter_open: bool,
     reply: Option<PickerReply>,
     /// Asks the host to close this picker's window (posts
     /// `HostCommand::CloseWindow` with the token the service chose).
@@ -75,12 +89,21 @@ impl PickerApp {
         close: Arc<dyn Fn() + Send + Sync>,
     ) -> Self {
         explorer.set_file_activation(FileActivation::Collect);
+        let filter_idx = request
+            .current_filter
+            .min(request.filters.len().saturating_sub(1));
+        if let Some(filter) = request.filters.get(filter_idx) {
+            explorer.set_file_filter(Some(filter.clone()));
+        }
         PickerApp {
             explorer,
             kind: request.kind,
             accept_label: request.accept_label,
             filename: request.current_name,
             selection: Selection::default(),
+            filters: request.filters,
+            filter_idx,
+            filter_open: false,
             reply: Some(reply),
             close,
             pool,
@@ -142,6 +165,11 @@ impl PickerApp {
             );
         }
         items.push(spacer());
+        if let Some(active) = self.filters.get(self.filter_idx) {
+            // Fixed width: the trigger otherwise Fills, fighting the
+            // spacer for the whole row (names ellipsize).
+            items.push(select_trigger("picker-filter", &active.name).width(Size::Fixed(200.0)));
+        }
         items.push(button("Cancel").ghost().key("picker-cancel"));
         let accept = button(self.accept_label.clone())
             .primary()
@@ -177,12 +205,25 @@ impl App for PickerApp {
     }
 
     fn build(&self, cx: &BuildCx) -> El {
-        scaffold(
-            column([self.explorer.page_el(cx), self.chrome_el()])
-                .gap(tokens::SPACE_3)
+        let page = column([self.explorer.page_el(cx), self.chrome_el()])
+            .gap(tokens::SPACE_3)
+            .width(Size::Fill(1.0))
+            .height(Size::Fill(1.0));
+        // The filter menu stacks over the page (popover paradigm),
+        // anchored to its trigger by the shared key.
+        let page = if self.filter_open {
+            let options = self
+                .filters
+                .iter()
+                .enumerate()
+                .map(|(i, f)| (i.to_string(), f.name.clone()));
+            stack([page, select_menu("picker-filter", options)])
                 .width(Size::Fill(1.0))
-                .height(Size::Fill(1.0)),
-        )
+                .height(Size::Fill(1.0))
+        } else {
+            page
+        };
+        scaffold(page)
     }
 
     fn hotkeys(&self) -> Vec<(KeyChord, String)> {
@@ -213,11 +254,34 @@ impl App for PickerApp {
             );
             return;
         }
+        // The filter select: toggle / dismiss / pick, folded into
+        // (filter_idx, filter_open). A pick re-filters the listing.
+        let prev = self.filter_idx;
+        let filters = self.filters.len();
+        if select::apply_event(
+            &mut self.filter_idx,
+            &mut self.filter_open,
+            &event,
+            "picker-filter",
+            |s| s.parse().ok().filter(|&i: &usize| i < filters),
+        ) {
+            if self.filter_idx != prev {
+                self.explorer
+                    .set_file_filter(self.filters.get(self.filter_idx).cloned());
+            }
+            return;
+        }
         if event.is_click_or_activate("picker-accept") {
             self.accept();
             return;
         }
         if event.is_click_or_activate("picker-cancel") || event.is_hotkey("picker-cancel") {
+            // Escape with the filter menu open closes the menu, not
+            // the dialog.
+            if self.filter_open {
+                self.filter_open = false;
+                return;
+            }
             self.finish(None);
             return;
         }
@@ -260,6 +324,51 @@ mod tests {
     // (`all_scenes_lint_clean` renders the picker_open / picker_save
     // scenes alongside the browser ones).
 
+    /// Trigger click opens the menu; picking an option closes it and
+    /// refilters the wrapped explorer's listing (dirs always stay).
+    #[test]
+    fn filter_switch_refilters_listing() {
+        let explorer = crate::app::fixtures::browse();
+        let mut picker = PickerApp::new(
+            PickerRequest {
+                kind: PickerKind::Open { directory: false },
+                accept_label: "Open".into(),
+                start_dir: PathBuf::from("/test/somewhere"),
+                current_name: String::new(),
+                filters: vec![
+                    FileFilter {
+                        name: "Images".into(),
+                        globs: vec!["*.jxr".into()],
+                        mimes: vec![],
+                    },
+                    FileFilter {
+                        name: "All files".into(),
+                        globs: vec!["*".into()],
+                        mimes: vec![],
+                    },
+                ],
+                current_filter: 0,
+            },
+            explorer,
+            None,
+            Box::new(|_| {}),
+            Arc::new(|| {}),
+        );
+        let cx = EventCx::new();
+        assert_eq!(picker.explorer.visible_names(), ["docs", "photo.jxr"]);
+
+        picker.on_event(UiEvent::synthetic_click("picker-filter"), &cx);
+        assert!(picker.filter_open);
+
+        picker.on_event(UiEvent::synthetic_click("picker-filter:option:1"), &cx);
+        assert!(!picker.filter_open);
+        assert_eq!(picker.filter_idx, 1);
+        assert_eq!(
+            picker.explorer.visible_names(),
+            ["docs", "notes.txt", "photo.jxr"]
+        );
+    }
+
     #[test]
     fn save_accept_paths() {
         let explorer = crate::app::fixtures::browse();
@@ -271,6 +380,8 @@ mod tests {
                 accept_label: "Save".into(),
                 start_dir: PathBuf::from("/test/somewhere"),
                 current_name: "out.png".into(),
+                filters: Vec::new(),
+                current_filter: 0,
             },
             explorer,
             None,
