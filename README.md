@@ -20,6 +20,7 @@ prism-explorer [DIRECTORY]    # defaults to $HOME
 | Enter / double-click | open directory · open file (`xdg-open`) |
 | Backspace | parent directory |
 | Home / End | first / last entry |
+| `r` / F5 | refresh listing |
 | `.` | toggle hidden files |
 
 ## Architecture

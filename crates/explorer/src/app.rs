@@ -247,6 +247,16 @@ impl ExplorerApp {
         self.navigate(parent, from);
     }
 
+    /// Re-list the current directory, keeping the selection by name
+    /// (its id will differ in the fresh listing).
+    fn refresh(&mut self) {
+        let keep = self.selected_id().and_then(|id| {
+            let entries = self.listing.entries.lock().unwrap();
+            entries.get(id as usize).map(|e| e.name.clone())
+        });
+        self.navigate(self.cwd.clone(), keep);
+    }
+
     /// Scroll container key + the index of the line holding `pos` in
     /// the active view (the grid packs `cols` entries per line).
     fn scroll_key(&self) -> &'static str {
@@ -750,19 +760,11 @@ impl ExplorerApp {
         let body: El = if is_dir {
             preview_placeholder_body("folder", "directory")
         } else if stale {
-            column([spinner()])
-                .align(Align::Center)
-                .justify(Justify::Center)
-                .width(Size::Fill(1.0))
-                .height(Size::Fill(1.0))
+            self.preview_loading_body(id)
         } else {
             match &self.preview {
                 PreviewState::Empty => preview_placeholder_body("file", ""),
-                PreviewState::Loading { .. } => column([spinner()])
-                    .align(Align::Center)
-                    .justify(Justify::Center)
-                    .width(Size::Fill(1.0))
-                    .height(Size::Fill(1.0)),
+                PreviewState::Loading { .. } => self.preview_loading_body(id),
                 PreviewState::Failed { error, .. } => {
                     preview_placeholder_body("alert-circle", error)
                 }
@@ -808,6 +810,35 @@ impl ExplorerApp {
             .height(Size::Fill(1.0))])
         .width(Size::Fixed(self.preview_w))
         .height(Size::Fill(1.0))
+    }
+
+    /// Preview body while the full decode is in flight: the grid's
+    /// cached thumbnail when RAM has one (instant feedback — on a slow
+    /// mount the real decode can take seconds), a bare spinner
+    /// otherwise. NoLimit matches the full image so brightness doesn't
+    /// pop when it swaps in.
+    fn preview_loading_body(&self, id: EntryId) -> El {
+        let thumb = self.thumb_state.lock().unwrap().ram.get(&id).cloned();
+        match thumb {
+            Some(img) => column([
+                image(img)
+                    .image_fit(ImageFit::Contain)
+                    .dynamic_range_limit(DynamicRangeLimit::NoLimit)
+                    .width(Size::Fill(1.0))
+                    .height(Size::Fill(1.0)),
+                row([spinner(), text("decoding…").caption().muted()])
+                    .gap(tokens::SPACE_2)
+                    .align(Align::Center),
+            ])
+            .gap(tokens::SPACE_2)
+            .width(Size::Fill(1.0))
+            .height(Size::Fill(1.0)),
+            None => column([spinner()])
+                .align(Align::Center)
+                .justify(Justify::Center)
+                .width(Size::Fill(1.0))
+                .height(Size::Fill(1.0)),
+        }
     }
 
     fn status_el(&self) -> El {
@@ -1043,6 +1074,8 @@ impl App for ExplorerApp {
             (KeyChord::vim('h'), "left".into()),
             (KeyChord::vim('l'), "right".into()),
             (KeyChord::vim('g'), "view".into()),
+            (KeyChord::vim('r'), "refresh".into()),
+            (KeyChord::named(UiKey::Other("F5".into())), "refresh".into()),
             (KeyChord::vim('.'), "hidden".into()),
         ]
     }
@@ -1152,6 +1185,8 @@ impl App for ExplorerApp {
             }
         } else if event.is_hotkey("view") {
             self.toggle_view();
+        } else if event.is_hotkey("refresh") {
+            self.refresh();
         } else if event.is_hotkey("first") {
             self.select_pos(0);
         } else if event.is_hotkey("last") {
