@@ -19,9 +19,12 @@ use crate::app;
 use crate::model::FileFilter;
 use crate::picker::{PickerApp, PickerKind, PickerRequest};
 
-/// Browser windows open at 1500×950 (`main.rs`), pickers at 1100×760
-/// (`filechooser.rs`) — scenes dump at the size they really open at.
+/// Browser windows open at 1500×950 (`main.rs`), but tiling WMs often
+/// immediately place them at half-screen width. Dump both shapes so the
+/// narrow browser experience is reviewed as a first-class layout.
 const BROWSER: (f32, f32) = (1500.0, 950.0);
+const BROWSER_HALF: (f32, f32) = (750.0, 950.0);
+/// Pickers open at 1100×760 (`filechooser.rs`).
 const PICKER: (f32, f32) = (1100.0, 760.0);
 
 pub struct Scene {
@@ -41,12 +44,35 @@ pub fn scenes() -> Vec<Scene> {
     }
     vec![
         scene("browse", BROWSER, app::fixtures::browse()),
+        scene("browse_half", BROWSER_HALF, app::fixtures::browse()),
         scene("text_preview", BROWSER, app::fixtures::text_preview()),
+        scene(
+            "text_preview_half",
+            BROWSER_HALF,
+            app::fixtures::text_preview(),
+        ),
         scene("details_preview", BROWSER, app::fixtures::details_preview()),
+        scene(
+            "details_preview_half",
+            BROWSER_HALF,
+            app::fixtures::details_preview(),
+        ),
         scene("binary_preview", BROWSER, app::fixtures::binary_preview()),
+        scene(
+            "binary_preview_half",
+            BROWSER_HALF,
+            app::fixtures::binary_preview(),
+        ),
         scene("multiselect", BROWSER, multiselect()),
+        scene("multiselect_half", BROWSER_HALF, multiselect()),
         scene("grid", BROWSER, app::fixtures::grid()),
+        scene("grid_half", BROWSER_HALF, app::fixtures::grid()),
         scene("listing_error", BROWSER, app::fixtures::listing_error()),
+        scene(
+            "listing_error_half",
+            BROWSER_HALF,
+            app::fixtures::listing_error(),
+        ),
         scene("picker_open", PICKER, picker_open()),
         scene("picker_filter_menu", PICKER, picker_filter_menu()),
         scene("picker_save", PICKER, picker_save()),

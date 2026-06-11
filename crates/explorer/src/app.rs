@@ -21,6 +21,7 @@ use damascene_core::prelude::*;
 use damascene_core::scroll::{ScrollAlignment, ScrollRequest};
 use damascene_core::selection::{Selection, SelectionPoint, SelectionRange};
 use damascene_core::surface::SurfaceAlpha;
+use damascene_core::widgets::resize_handle::HANDLE_THICKNESS;
 use damascene_core::widgets::tabs::{self, tabs_list};
 use damascene_core::widgets::text_input::{self, TextInputOpts};
 use damascene_core::{BuildCx, EventCx, KeyChord, Rect, UiEvent, UiEventKind, UiKey};
@@ -41,6 +42,14 @@ const SIDEBAR_MIN: f32 = 160.0;
 const SIDEBAR_MAX: f32 = 420.0;
 const PREVIEW_MIN: f32 = 260.0;
 const PREVIEW_MAX: f32 = 900.0;
+const PREVIEW_COMPACT_MIN: f32 = 180.0;
+const PREVIEW_ABSOLUTE_MIN: f32 = 160.0;
+const LISTING_MIN: f32 = 280.0;
+
+// Horizontal chrome outside the three content panes: scaffold padding,
+// the four row gaps, and the two resize handles.
+const CONTENT_CHROME_X: f32 =
+    2.0 * tokens::SPACE_4 + 4.0 * tokens::SPACE_2 + 2.0 * HANDLE_THICKNESS;
 
 // Grid view geometry. Cells are media (thumbnail or icon) over a name
 // caption; the virtual list row height bakes the gap in, which also
@@ -63,6 +72,12 @@ const TEXT_PREVIEW_MAX_LINES: usize = 400;
 enum ViewMode {
     List,
     Grid,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct BrowserChrome {
+    sidebar_w: f32,
+    preview_w: f32,
 }
 
 /// Decoded thumbnails plus request bookkeeping. Shared with the grid's
@@ -153,7 +168,7 @@ fn preview_modes(
     preview: Option<&Preview>,
     raw: Option<&RawPreview>,
 ) -> Vec<(PreviewMode, &'static str)> {
-    let mut modes = vec![(PreviewMode::Normal, "Normal")];
+    let mut modes = vec![(PreviewMode::Normal, "Auto")];
     if raw.and_then(|raw| raw.text.as_ref()).is_some()
         || matches!(preview, Some(Preview::Text { .. }))
     {
@@ -177,6 +192,44 @@ fn effective_preview_mode(
         wanted
     } else {
         PreviewMode::Normal
+    }
+}
+
+fn browser_chrome_widths(
+    viewport_w: f32,
+    requested_sidebar_w: f32,
+    requested_preview_w: f32,
+    preview_min_w: f32,
+) -> BrowserChrome {
+    let usable_w = (viewport_w - CONTENT_CHROME_X).max(0.0);
+    let mut sidebar_w = requested_sidebar_w.clamp(SIDEBAR_MIN, SIDEBAR_MAX);
+    let mut preview_w = requested_preview_w.clamp(preview_min_w, PREVIEW_MAX);
+
+    let mut over = sidebar_w + preview_w + LISTING_MIN - usable_w;
+    if over <= 0.0 {
+        return BrowserChrome {
+            sidebar_w,
+            preview_w,
+        };
+    }
+
+    let preview_floor = preview_min_w.max(PREVIEW_ABSOLUTE_MIN);
+    let shrink = (preview_w - preview_floor).min(over).max(0.0);
+    preview_w -= shrink;
+    over -= shrink;
+
+    let shrink = (sidebar_w - SIDEBAR_MIN).min(over).max(0.0);
+    sidebar_w -= shrink;
+    over -= shrink;
+
+    // On very narrow windows, keep the listing usable even if that
+    // means dipping below the normal preview floor.
+    let shrink = (preview_w - PREVIEW_ABSOLUTE_MIN).min(over).max(0.0);
+    preview_w -= shrink;
+
+    BrowserChrome {
+        sidebar_w,
+        preview_w,
     }
 }
 
@@ -299,6 +352,26 @@ impl ExplorerApp {
         app.spawn_places_probe();
         app.navigate(start, None);
         app
+    }
+
+    fn browser_chrome(&self, viewport_w: f32) -> BrowserChrome {
+        let preview_min = if self.preview_is_placeholder() {
+            PREVIEW_COMPACT_MIN
+        } else {
+            PREVIEW_MIN
+        };
+        browser_chrome_widths(viewport_w, self.sidebar_w, self.preview_w, preview_min)
+    }
+
+    fn preview_is_placeholder(&self) -> bool {
+        let Some((id, _)) = self.selected else {
+            return true;
+        };
+        let entries = self.listing.entries.lock().unwrap();
+        if entries.get(id as usize).is_none_or(Entry::is_dir) {
+            return true;
+        }
+        matches!(self.preview, PreviewState::Empty)
     }
 
     /// One-shot at startup, on a detached thread rather than the pool:
@@ -705,7 +778,7 @@ impl ExplorerApp {
 
     // ---- build helpers -------------------------------------------------
 
-    fn sidebar_el(&self) -> El {
+    fn sidebar_el(&self, sidebar_w: f32) -> El {
         let buttons: Vec<El> = self
             .places
             .iter()
@@ -724,7 +797,7 @@ impl ExplorerApp {
             sidebar_menu(buttons)
         };
         sidebar([sidebar_group([sidebar_group_label("Places"), menu])])
-            .width(Size::Fixed(self.sidebar_w))
+            .width(Size::Fixed(sidebar_w))
             .height(Size::Fill(1.0))
     }
 
@@ -796,12 +869,15 @@ impl ExplorerApp {
     fn listing_placeholder(&self) -> Option<El> {
         if let Some(err) = &self.listing.error {
             return Some(
-                column([icon("alert-circle"), text(err.clone()).muted()])
-                    .gap(tokens::SPACE_3)
-                    .align(Align::Center)
-                    .justify(Justify::Center)
-                    .width(Size::Fill(1.0))
-                    .height(Size::Fill(1.0)),
+                column([
+                    icon("alert-circle"),
+                    text(err.clone()).muted().wrap_text().width(Size::Fill(1.0)),
+                ])
+                .gap(tokens::SPACE_3)
+                .align(Align::Center)
+                .justify(Justify::Center)
+                .width(Size::Fill(1.0))
+                .height(Size::Fill(1.0)),
             );
         }
         if self.listing.order.is_empty() {
@@ -887,7 +963,7 @@ impl ExplorerApp {
                 .and_then(|m| m.modified)
                 .map(fmt::mtime)
                 .unwrap_or_default();
-            let mut name = text(e.display.clone()).width(Size::Fill(1.0));
+            let mut name = text(e.display.clone()).ellipsis().width(Size::Fill(1.0));
             if e.is_symlink {
                 name = name.italic();
             }
@@ -927,7 +1003,7 @@ impl ExplorerApp {
     /// pattern). Image cells pull from the thumbnail cache — RAM LRU
     /// first, then a worker job that hits disk or decodes; everything
     /// else shows its kind icon.
-    fn grid_el(&self, cx: &BuildCx) -> El {
+    fn grid_el(&self, cx: &BuildCx, chrome: BrowserChrome) -> El {
         if let Some(placeholder) = self.listing_placeholder() {
             return placeholder;
         }
@@ -938,8 +1014,8 @@ impl ExplorerApp {
         // low costs at most one column; erring high overflows the row.
         let vw = cx.viewport_width().unwrap_or(1280.0);
         let avail = vw
-            - self.sidebar_w
-            - self.preview_w
+            - chrome.sidebar_w
+            - chrome.preview_w
             - 2.0 * tokens::SPACE_4
             - 4.0 * tokens::SPACE_2
             - 24.0;
@@ -1087,7 +1163,7 @@ impl ExplorerApp {
         .key("grid")
     }
 
-    fn preview_pane(&self) -> El {
+    fn preview_pane(&self, preview_w: f32) -> El {
         let Some((id, _)) = self.selected else {
             return preview_placeholder("file", "select a file to preview");
         };
@@ -1146,7 +1222,7 @@ impl ExplorerApp {
                         preview.as_ref().ok(),
                         raw.as_ref(),
                     );
-                    self.preview_body(preview, raw.as_ref(), mode)
+                    self.preview_body(preview, raw.as_ref(), mode, preview_w)
                 }
             }
         };
@@ -1173,7 +1249,7 @@ impl ExplorerApp {
             .padding(tokens::SPACE_4)
             .width(Size::Fill(1.0))
             .height(Size::Fill(1.0))])
-        .width(Size::Fixed(self.preview_w))
+        .width(Size::Fixed(preview_w))
         .height(Size::Fill(1.0))
     }
 
@@ -1182,6 +1258,7 @@ impl ExplorerApp {
         preview: &Result<Preview, String>,
         raw: Option<&RawPreview>,
         mode: PreviewMode,
+        preview_w: f32,
     ) -> El {
         match mode {
             PreviewMode::Normal => match preview {
@@ -1190,7 +1267,7 @@ impl ExplorerApp {
                         .binary_surface
                         .as_ref()
                         .map(|s| (s.app_texture(), s.metrics()));
-                    normal_preview_body(preview, self.preview_w, surface)
+                    normal_preview_body(preview, preview_w, surface)
                 }
                 Err(error) => preview_placeholder_body("alert-circle", error),
             },
@@ -1216,7 +1293,7 @@ impl ExplorerApp {
                             .binary_surface
                             .as_ref()
                             .map(|s| (s.app_texture(), s.metrics()));
-                        binary_preview_body(binary, self.preview_w, surface)
+                        binary_preview_body(binary, preview_w, surface)
                     }
                     None => preview_placeholder_body("file", "binary view unavailable"),
                 }
@@ -1257,18 +1334,20 @@ impl ExplorerApp {
     /// browsing page minus the window scaffold — the picker stacks its
     /// chrome under this.
     pub(crate) fn page_el(&self, cx: &BuildCx) -> El {
+        let viewport_w = cx.viewport_width().unwrap_or(1280.0);
+        let chrome = self.browser_chrome(viewport_w);
         let center = match self.view {
             ViewMode::List => self.list_el(),
-            ViewMode::Grid => self.grid_el(cx),
+            ViewMode::Grid => self.grid_el(cx, chrome),
         };
         let content = row([
-            self.sidebar_el(),
+            self.sidebar_el(chrome.sidebar_w),
             resize_handle("sidebar-resize", Axis::Row),
             card([center.padding(tokens::SPACE_2)])
                 .width(Size::Fill(1.0))
                 .height(Size::Fill(1.0)),
             resize_handle("preview-resize", Axis::Row),
-            self.preview_pane(),
+            self.preview_pane(chrome.preview_w),
         ])
         .gap(tokens::SPACE_2)
         .width(Size::Fill(1.0))
@@ -1933,10 +2012,11 @@ impl crate::host::HostApp for ExplorerApp {
         let Some(binary) = binary else {
             return;
         };
+        let preview_w = self.browser_chrome(viewport.w).preview_w;
         let Some(surface) = &mut self.binary_surface else {
             return;
         };
-        let (logical_w, logical_h) = binary_surface_size(self.preview_w, viewport.h);
+        let (logical_w, logical_h) = binary_surface_size(preview_w, viewport.h);
         surface.write(device, queue, binary, logical_w, logical_h, scale_factor);
     }
 }
@@ -2303,6 +2383,31 @@ mod tests {
         let app = grid();
         crate::fixtures::render(&app, (1500.0, 950.0));
         assert!(app.cols.get() > 1, "grid should lay out multiple columns");
+    }
+
+    #[test]
+    fn half_width_browser_reserves_listing_space() {
+        let chrome = browser_chrome_widths(750.0, 220.0, 420.0, PREVIEW_COMPACT_MIN);
+        let listing_w = 750.0 - CONTENT_CHROME_X - chrome.sidebar_w - chrome.preview_w;
+        assert!(
+            listing_w >= LISTING_MIN,
+            "listing should stay first-class at half width, got {listing_w}"
+        );
+        assert!(
+            chrome.preview_w < 0.3 * 750.0,
+            "empty preview should be compact at half width"
+        );
+    }
+
+    #[test]
+    fn full_width_browser_keeps_requested_chrome() {
+        assert_eq!(
+            browser_chrome_widths(1500.0, 220.0, 420.0, PREVIEW_COMPACT_MIN),
+            BrowserChrome {
+                sidebar_w: 220.0,
+                preview_w: 420.0,
+            }
+        );
     }
 
     #[test]
