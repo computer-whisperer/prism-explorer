@@ -18,9 +18,9 @@ authors = ["Christian Balcom"]
 [workspace.dependencies]
 anyhow = "1"
 tracing = "0.1"
-damascene-core = "0.4.2"
-damascene-wgpu = "0.4.2"
-damascene-winit-wgpu = "0.4.2"
+damascene-core = "0.4.3"
+damascene-wgpu = "0.4.3"
+damascene-winit-wgpu = "0.4.3"
 
 # Color-managed decode stack, shared with damascene-gallery and prism-bg.
 # Path dep from a sibling checkout until it's published.
@@ -36,13 +36,6 @@ explorer-thumbs = { path = "crates/explorer-thumbs" }
 # pointed at achromat's vendor copy. Drop when upstream updates.
 [patch.crates-io]
 jpegxr = { path = "../achromat/vendor/jpegxr" }
-
-# Unpublished damascene: the custom multi-window host needs the
-# host::{color, gfx, input} modules (damascene issues #79/#80/#81),
-# which landed after the 0.4.2 release. Drop when 0.4.3 publishes.
-damascene-core = { path = "../damascene/damascene.main/crates/damascene-core" }
-damascene-wgpu = { path = "../damascene/damascene.main/crates/damascene-wgpu" }
-damascene-winit-wgpu = { path = "../damascene/damascene.main/crates/damascene-winit-wgpu" }
 
 # MSDF/text crates are ~500x slower unoptimized (per damascene's own
 # profile guidance); image decode is also hot in dev runs.
