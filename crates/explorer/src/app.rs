@@ -19,6 +19,8 @@ use std::sync::{Arc, Mutex};
 use damascene_core::image::Image;
 use damascene_core::prelude::*;
 use damascene_core::scroll::{ScrollAlignment, ScrollRequest};
+use damascene_core::selection::Selection;
+use damascene_core::widgets::text_input::{self, TextInputOpts};
 use damascene_core::{BuildCx, EventCx, KeyChord, UiEvent, UiEventKind, UiKey};
 use lru::LruCache;
 
@@ -131,6 +133,12 @@ pub struct ExplorerApp {
     /// window never sets one. Applies to files only, in
     /// `Listing::rebuild_order`.
     file_filter: Option<FileFilter>,
+    /// Browser name filter for the current directory listing. This is
+    /// deliberately local to the streamed entries we already have, not
+    /// a recursive filesystem search.
+    search: String,
+    selection: Selection,
+    show_search: bool,
     view: ViewMode,
     file_activation: FileActivation,
     /// Files activated under [`FileActivation::Collect`], drained by
@@ -197,6 +205,9 @@ impl ExplorerApp {
             places: Vec::new(),
             show_hidden: false,
             file_filter: None,
+            search: String::new(),
+            selection: Selection::default(),
+            show_search: true,
             view: ViewMode::List,
             file_activation: FileActivation::SystemOpen,
             activated: Vec::new(),
@@ -302,6 +313,21 @@ impl ExplorerApp {
             entries.get(id as usize).map(|e| e.name.clone())
         });
         self.navigate(self.cwd.clone(), keep);
+    }
+
+    fn search_term(&self) -> Option<String> {
+        let term = self.search.trim();
+        (!term.is_empty()).then(|| term.to_string())
+    }
+
+    fn rebuild_visible_order(&mut self) {
+        let search = self.search_term();
+        self.listing.rebuild_order(
+            self.show_hidden,
+            self.file_filter.as_ref(),
+            search.as_deref(),
+        );
+        self.remap_selection();
     }
 
     /// Scroll container key + the index of the line holding `pos` in
@@ -489,9 +515,7 @@ impl ExplorerApp {
 
     fn toggle_hidden(&mut self) {
         self.show_hidden = !self.show_hidden;
-        self.listing
-            .rebuild_order(self.show_hidden, self.file_filter.as_ref());
-        self.remap_selection();
+        self.rebuild_visible_order();
     }
 
     /// Visible (ordered) entry names — what a row-by-row reading of
@@ -510,9 +534,24 @@ impl ExplorerApp {
     /// the current listing in place.
     pub(crate) fn set_file_filter(&mut self, filter: Option<FileFilter>) {
         self.file_filter = filter;
-        self.listing
-            .rebuild_order(self.show_hidden, self.file_filter.as_ref());
-        self.remap_selection();
+        self.rebuild_visible_order();
+    }
+
+    pub(crate) fn set_search_visible(&mut self, visible: bool) {
+        self.show_search = visible;
+        if !visible && !self.search.is_empty() {
+            self.search.clear();
+            self.selection = Selection::default();
+            self.rebuild_visible_order();
+        }
+    }
+
+    fn set_search(&mut self, search: String) {
+        if self.search == search {
+            return;
+        }
+        self.search = search;
+        self.rebuild_visible_order();
     }
 
     fn toggle_view(&mut self) {
@@ -627,15 +666,47 @@ impl ExplorerApp {
             ViewMode::List => ("layout-dashboard", "grid view (g)"),
             ViewMode::Grid => ("menu", "list view (g)"),
         };
-        toolbar([
+        let mut tools = vec![
             icon_button("chevron-up")
                 .key("up")
                 .tooltip("parent directory (Backspace)"),
             breadcrumb([breadcrumb_list(items)]),
             spacer(),
+        ];
+        if self.show_search {
+            tools.push(self.search_el());
+        }
+        tools.extend([
             icon_button(view_icon).key("view-toggle").tooltip(view_tip),
             color_mode_badge(cx),
-        ])
+        ]);
+        toolbar(tools)
+    }
+
+    fn search_el(&self) -> El {
+        let input = text_input::text_input_with(
+            "browser-search",
+            &self.search,
+            &self.selection,
+            TextInputOpts {
+                placeholder: Some("Search names"),
+                ..TextInputOpts::default()
+            },
+        )
+        .width(Size::Fixed(220.0));
+        let mut children = vec![
+            icon("search")
+                .icon_size(tokens::ICON_SM)
+                .color(tokens::MUTED_FOREGROUND),
+            input,
+        ];
+        if !self.search.is_empty() {
+            children.push(icon_button("x").key("search-clear").tooltip("clear search"));
+        }
+        row(children)
+            .gap(tokens::SPACE_2)
+            .align(Align::Center)
+            .width(Size::Fixed(284.0))
     }
 
     /// Error / still-empty states shared by both views; `None` once
@@ -652,8 +723,17 @@ impl ExplorerApp {
             );
         }
         if self.listing.order.is_empty() {
+            let entry_count = self.listing.entries.lock().unwrap().len();
+            let filtered = entry_count > 0
+                && (self.file_filter.is_some()
+                    || self.search_term().is_some()
+                    || !self.show_hidden);
             let label: El = if self.listing.complete {
-                text("empty directory").muted()
+                if filtered {
+                    text("no matches").muted()
+                } else {
+                    text("empty directory").muted()
+                }
             } else {
                 row([spinner(), text("listing…").muted()])
                     .gap(tokens::SPACE_2)
@@ -1057,7 +1137,11 @@ impl ExplorerApp {
     }
 
     fn status_el(&self) -> El {
-        let mut left = format!("{} items", self.listing.order.len());
+        let mut left = if let Some(search) = self.search_term() {
+            format!("{} matches for \"{search}\"", self.listing.order.len())
+        } else {
+            format!("{} items", self.listing.order.len())
+        };
         if !self.listing.complete && self.listing.error.is_none() {
             left.push_str(" · listing…");
         }
@@ -1180,10 +1264,13 @@ impl App for ExplorerApp {
                     if generation != self.listing.generation {
                         continue;
                     }
-                    if self
-                        .listing
-                        .absorb(update, self.show_hidden, self.file_filter.as_ref())
-                    {
+                    let search = self.search_term();
+                    if self.listing.absorb(
+                        update,
+                        self.show_hidden,
+                        self.file_filter.as_ref(),
+                        search.as_deref(),
+                    ) {
                         self.remap_selection();
                     }
                     if let Some(name) = self.pending_select.clone() {
@@ -1203,11 +1290,13 @@ impl App for ExplorerApp {
                     if generation != self.listing.generation {
                         continue;
                     }
+                    let search = self.search_term();
                     if self.listing.apply_stat(
                         id,
                         result,
                         self.show_hidden,
                         self.file_filter.as_ref(),
+                        search.as_deref(),
                     ) {
                         self.remap_selection();
                     }
@@ -1289,6 +1378,23 @@ impl App for ExplorerApp {
 
     fn on_event(&mut self, event: UiEvent, _cx: &EventCx) {
         use damascene_core::widgets::resize_handle::Side;
+        if event.target_key() == Some("browser-search") {
+            let mut search = self.search.clone();
+            if text_input::apply_event(&mut search, &mut self.selection, "browser-search", &event) {
+                self.set_search(search);
+            }
+            return;
+        }
+        if event.is_click_or_activate("search-clear") {
+            self.selection = Selection::default();
+            self.set_search(String::new());
+            return;
+        }
+        if let Some(selection) = event.selection.clone() {
+            self.selection = selection;
+            return;
+        }
+
         if event.route() == Some("sidebar-resize") {
             resize_handle::apply_event_fixed(
                 &mut self.sidebar_w,
@@ -1427,6 +1533,10 @@ impl App for ExplorerApp {
     fn drain_scroll_requests(&mut self) -> Vec<ScrollRequest> {
         std::mem::take(&mut *self.scroll_requests.borrow_mut())
     }
+
+    fn selection(&self) -> Selection {
+        self.selection.clone()
+    }
 }
 
 /// Bound what one mono text leaf has to lay out; the read itself is
@@ -1548,6 +1658,7 @@ pub(crate) mod fixtures {
             },
             false,
             None,
+            None,
         );
         app
     }
@@ -1589,6 +1700,7 @@ pub(crate) mod fixtures {
                 error: None,
             },
             false,
+            None,
             None,
         );
         let thumbed = app
@@ -1749,6 +1861,7 @@ mod tests {
             },
             false,
             None,
+            None,
         );
         app.remap_selection();
 
@@ -1756,6 +1869,24 @@ mod tests {
         assert_eq!(sel_id, id);
         assert_eq!(app.listing.order[sel_pos], id);
         assert!(sel_pos != pos, "position should have shifted");
+    }
+
+    #[test]
+    fn search_filters_visible_names_and_remaps_selection() {
+        let mut app = browse();
+        let photo = id_of(&app, "photo.jxr");
+        app.select_only(photo);
+
+        app.set_search("PHO".into());
+        assert_eq!(app.visible_names(), ["photo.jxr"]);
+        assert_eq!(app.selected_id(), Some(photo));
+
+        app.set_search("docs".into());
+        assert_eq!(app.visible_names(), ["docs"]);
+        assert_eq!(app.selected_id(), None);
+
+        app.set_search(String::new());
+        assert_eq!(app.visible_names(), ["docs", "notes.txt", "photo.jxr"]);
     }
 
     #[test]

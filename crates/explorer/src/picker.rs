@@ -99,6 +99,7 @@ impl PickerApp {
         close: Arc<dyn Fn() + Send + Sync>,
     ) -> Self {
         explorer.set_file_activation(FileActivation::Collect);
+        explorer.set_search_visible(false);
         let filter_idx = request
             .current_filter
             .min(request.filters.len().saturating_sub(1));

@@ -101,6 +101,7 @@ impl Listing {
         update: ListingUpdate,
         show_hidden: bool,
         filter: Option<&FileFilter>,
+        search: Option<&str>,
     ) -> bool {
         if let Some(e) = update.error {
             self.error = Some(e);
@@ -113,7 +114,7 @@ impl Listing {
             .lock()
             .unwrap()
             .extend(update.batch.into_iter().map(Entry::from_raw));
-        self.rebuild_order(show_hidden, filter);
+        self.rebuild_order(show_hidden, filter, search);
         true
     }
 
@@ -125,6 +126,7 @@ impl Listing {
         result: Result<EntryMeta, String>,
         show_hidden: bool,
         filter: Option<&FileFilter>,
+        search: Option<&str>,
     ) -> bool {
         let mut entries = self.entries.lock().unwrap();
         let Some(entry) = entries.get_mut(id as usize) else {
@@ -142,7 +144,7 @@ impl Listing {
         }
         drop(entries);
         if regrouped {
-            self.rebuild_order(show_hidden, filter);
+            self.rebuild_order(show_hidden, filter, search);
         }
         regrouped
     }
@@ -151,12 +153,22 @@ impl Listing {
     /// then case-insensitive by name (raw name as the total-order
     /// tiebreak). The type filter never hides directories — they're
     /// how the user navigates.
-    pub fn rebuild_order(&mut self, show_hidden: bool, filter: Option<&FileFilter>) {
+    pub fn rebuild_order(
+        &mut self,
+        show_hidden: bool,
+        filter: Option<&FileFilter>,
+        search: Option<&str>,
+    ) {
         let entries = self.entries.lock().unwrap();
+        let search = search
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_lowercase);
         let mut order: Vec<EntryId> = (0..entries.len() as EntryId)
             .filter(|&i| {
                 let e = &entries[i as usize];
                 (show_hidden || !e.is_hidden())
+                    && search.as_ref().is_none_or(|q| e.sort_key.contains(q))
                     && (e.is_dir() || filter.is_none_or(|f| f.matches(&e.display)))
             })
             .collect();
@@ -329,6 +341,7 @@ mod tests {
             ),
             false,
             None,
+            None,
         );
         assert_eq!(ordered_names(&l), ["Apps", "zebra.txt"]);
 
@@ -341,13 +354,14 @@ mod tests {
             ),
             false,
             None,
+            None,
         );
         assert_eq!(ordered_names(&l), ["Apps", "Zoo", "banana", "zebra.txt"]);
         assert!(l.complete);
         assert_eq!(l.id_by_name(OsStr::new("zebra.txt")), Some(zebra));
 
         // Hidden toggle re-admits dotfiles.
-        l.rebuild_order(true, None);
+        l.rebuild_order(true, None, None);
         assert_eq!(
             ordered_names(&l),
             ["Apps", "Zoo", ".hidden", "banana", "zebra.txt"]
@@ -405,17 +419,48 @@ mod tests {
             ),
             false,
             None,
+            None,
         );
         let images = FileFilter {
             name: "Images".into(),
             globs: vec!["*.png".into()],
             mimes: vec![],
         };
-        l.rebuild_order(false, Some(&images));
+        l.rebuild_order(false, Some(&images), None);
         assert_eq!(ordered_names(&l), ["docs", "shot.png"]);
         // Dropping the filter restores everything.
-        l.rebuild_order(false, None);
+        l.rebuild_order(false, None, None);
         assert_eq!(ordered_names(&l), ["docs", "notes.txt", "shot.png"]);
+    }
+
+    #[test]
+    fn rebuild_order_search_filters_names_case_insensitive() {
+        let mut l = Listing::new("/test".into(), 0);
+        l.absorb(
+            update(
+                &[
+                    ("Docs", EntryKind::Dir),
+                    ("notes.txt", EntryKind::File),
+                    ("shot.png", EntryKind::File),
+                    ("archive.zip", EntryKind::File),
+                ],
+                true,
+            ),
+            false,
+            None,
+            None,
+        );
+
+        l.rebuild_order(false, None, Some("O"));
+        assert_eq!(ordered_names(&l), ["Docs", "notes.txt", "shot.png"]);
+
+        let images = FileFilter {
+            name: "Images".into(),
+            globs: vec!["*.png".into()],
+            mimes: vec![],
+        };
+        l.rebuild_order(false, Some(&images), Some("shot"));
+        assert_eq!(ordered_names(&l), ["shot.png"]);
     }
 
     #[test]
@@ -427,6 +472,7 @@ mod tests {
                 true,
             ),
             false,
+            None,
             None,
         );
         assert_eq!(ordered_names(&l), ["alpha", "link"]);
@@ -441,6 +487,7 @@ mod tests {
                 is_symlink: true,
             }),
             false,
+            None,
             None,
         );
         assert!(regrouped);
