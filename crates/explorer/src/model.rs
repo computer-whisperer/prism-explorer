@@ -16,7 +16,7 @@ use std::sync::{Arc, Mutex};
 use explorer_io::listing::ListingUpdate;
 use explorer_io::stat::EntryMeta;
 use explorer_io::{EntryKind, RawEntry};
-use explorer_previews::{preview_kind_for_path, Preview, PreviewKind};
+use explorer_previews::{preview_kind_for_path, Preview, PreviewKind, RawPreview};
 
 use crate::places::Place;
 
@@ -229,7 +229,7 @@ pub enum Msg {
     Preview {
         generation: u64,
         id: EntryId,
-        result: Result<Preview, String>,
+        result: PreviewPayload,
     },
     Thumb {
         generation: u64,
@@ -244,6 +244,11 @@ pub enum Msg {
         dir: PathBuf,
         select: Option<OsString>,
     },
+}
+
+pub struct PreviewPayload {
+    pub preview: Result<Preview, String>,
+    pub raw: Result<RawPreview, String>,
 }
 
 /// One file-type filter from a portal request: a display name plus

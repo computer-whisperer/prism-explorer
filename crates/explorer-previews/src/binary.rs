@@ -19,7 +19,7 @@ pub(crate) fn preview_binary(bytes: Vec<u8>, truncated: bool) -> Preview {
 }
 
 impl BinaryPreview {
-    fn from_bytes(bytes: Vec<u8>, truncated: bool) -> Self {
+    pub fn from_bytes(bytes: Vec<u8>, truncated: bool) -> Self {
         let mut counts = [0usize; 256];
         let mut printable = 0usize;
         let mut nul = 0usize;

@@ -29,7 +29,7 @@ pub use binary::BinaryPreview;
 pub use document::PdfHandler;
 pub use image::ImageHandler;
 pub use media::{AudioHandler, VideoHandler};
-pub use text::{TextFallbackHandler, TextHandler};
+pub use text::{raw_preview, RawPreview, TextFallbackHandler, TextHandler};
 
 use achromat::convert::ImageMeta;
 use damascene_core::image::Image;

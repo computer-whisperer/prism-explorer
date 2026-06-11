@@ -4,7 +4,7 @@
 use std::io::Read;
 use std::path::Path;
 
-use crate::{binary::preview_binary, extension, Preview, PreviewHandler};
+use crate::{binary::preview_binary, extension, BinaryPreview, Preview, PreviewHandler};
 
 /// How much of the file a text preview reads. Bounded: this often runs
 /// against multi-gigabyte logs on a slow mount.
@@ -161,7 +161,7 @@ const TEXT_NAMES: &[&str] = &[
     ".vimrc",
 ];
 
-fn read_prefix(path: &Path) -> anyhow::Result<(Vec<u8>, bool)> {
+pub(crate) fn read_prefix(path: &Path) -> anyhow::Result<(Vec<u8>, bool)> {
     let file = std::fs::File::open(path)?;
     let mut buf = Vec::new();
     let read = file.take(PREFIX_BYTES + 1).read_to_end(&mut buf)?;
@@ -170,8 +170,23 @@ fn read_prefix(path: &Path) -> anyhow::Result<(Vec<u8>, bool)> {
     Ok((buf, truncated))
 }
 
-fn looks_binary(prefix: &[u8]) -> bool {
+pub(crate) fn looks_binary(prefix: &[u8]) -> bool {
     prefix[..prefix.len().min(SNIFF_BYTES)].contains(&0)
+}
+
+#[derive(Debug)]
+pub struct RawPreview {
+    pub text: Option<String>,
+    pub binary: BinaryPreview,
+}
+
+pub fn raw_preview(path: &Path) -> anyhow::Result<RawPreview> {
+    let (prefix, truncated) = read_prefix(path)?;
+    let text = (!looks_binary(&prefix)).then(|| String::from_utf8_lossy(&prefix).into_owned());
+    Ok(RawPreview {
+        text,
+        binary: BinaryPreview::from_bytes(prefix, truncated),
+    })
 }
 
 fn to_preview(prefix: Vec<u8>, truncated: bool) -> Preview {
@@ -263,6 +278,14 @@ mod tests {
             }
             _ => panic!("expected binary verdict"),
         }
+
+        let raw_text = raw_preview(&big).unwrap();
+        assert!(raw_text.text.is_some());
+        assert_eq!(raw_text.binary.bytes.len(), PREFIX_BYTES as usize);
+
+        let raw_binary = raw_preview(&liar).unwrap();
+        assert!(raw_binary.text.is_none());
+        assert_eq!(raw_binary.binary.bytes, vec![b'a', 0, b'b']);
 
         std::fs::remove_dir_all(&dir).unwrap();
     }

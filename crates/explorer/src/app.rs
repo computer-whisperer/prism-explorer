@@ -21,17 +21,18 @@ use damascene_core::prelude::*;
 use damascene_core::scroll::{ScrollAlignment, ScrollRequest};
 use damascene_core::selection::{Selection, SelectionPoint, SelectionRange};
 use damascene_core::surface::SurfaceAlpha;
+use damascene_core::widgets::tabs::{self, tabs_list};
 use damascene_core::widgets::text_input::{self, TextInputOpts};
 use damascene_core::{BuildCx, EventCx, KeyChord, Rect, UiEvent, UiEventKind, UiKey};
 use lru::LruCache;
 
 use explorer_io::{listing, stat, EntryKind, Notifier, Pool, Tier};
-use explorer_previews::{BinaryPreview, Preview, Registry};
+use explorer_previews::{BinaryPreview, Preview, RawPreview, Registry};
 use explorer_thumbs::ThumbCache;
 
 use crate::binary_surface::{BinarySurface, BinarySurfaceMetrics};
 use crate::fmt;
-use crate::model::{Entry, EntryId, FileFilter, Listing, Msg};
+use crate::model::{Entry, EntryId, FileFilter, Listing, Msg, PreviewPayload};
 use crate::places::Place;
 
 const ROW_H: f32 = 34.0;
@@ -112,12 +113,70 @@ enum PreviewState {
     },
     Ready {
         id: EntryId,
-        preview: Preview,
+        preview: Result<Preview, String>,
+        raw: Option<RawPreview>,
     },
     Failed {
         id: EntryId,
         error: String,
     },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PreviewMode {
+    Normal,
+    Text,
+    Binary,
+}
+
+impl std::fmt::Display for PreviewMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            PreviewMode::Normal => "normal",
+            PreviewMode::Text => "text",
+            PreviewMode::Binary => "binary",
+        })
+    }
+}
+
+fn parse_preview_mode(value: &str) -> Option<PreviewMode> {
+    match value {
+        "normal" => Some(PreviewMode::Normal),
+        "text" => Some(PreviewMode::Text),
+        "binary" => Some(PreviewMode::Binary),
+        _ => None,
+    }
+}
+
+fn preview_modes(
+    preview: Option<&Preview>,
+    raw: Option<&RawPreview>,
+) -> Vec<(PreviewMode, &'static str)> {
+    let mut modes = vec![(PreviewMode::Normal, "Normal")];
+    if raw.and_then(|raw| raw.text.as_ref()).is_some()
+        || matches!(preview, Some(Preview::Text { .. }))
+    {
+        modes.push((PreviewMode::Text, "Text"));
+    }
+    if raw.is_some() || matches!(preview, Some(Preview::Binary(_))) {
+        modes.push((PreviewMode::Binary, "Bin"));
+    }
+    modes
+}
+
+fn effective_preview_mode(
+    wanted: PreviewMode,
+    preview: Option<&Preview>,
+    raw: Option<&RawPreview>,
+) -> PreviewMode {
+    if preview_modes(preview, raw)
+        .iter()
+        .any(|(mode, _)| *mode == wanted)
+    {
+        wanted
+    } else {
+        PreviewMode::Normal
+    }
 }
 
 pub struct ExplorerApp {
@@ -170,6 +229,7 @@ pub struct ExplorerApp {
     pending_select: Option<OsString>,
 
     preview: PreviewState,
+    preview_mode: PreviewMode,
     /// At most one preview decode in flight; the latest wanted id wins
     /// when it finishes (holding an arrow key through a directory must
     /// not queue fifty decodes).
@@ -224,6 +284,7 @@ impl ExplorerApp {
             anchor: None,
             pending_select: None,
             preview: PreviewState::Empty,
+            preview_mode: PreviewMode::Normal,
             preview_inflight: None,
             preview_wanted: None,
             stat_requested: Arc::new(Mutex::new(HashSet::new())),
@@ -509,7 +570,10 @@ impl ExplorerApp {
         let notify = self.notifier.clone();
         let registry = self.registry.clone();
         self.pool.submit(Tier::Urgent, move || {
-            let result = registry.load(&path).map_err(|e| format!("{e:#}"));
+            let result = PreviewPayload {
+                preview: registry.load(&path).map_err(|e| format!("{e:#}")),
+                raw: explorer_previews::raw_preview(&path).map_err(|e| format!("{e:#}")),
+            };
             let _ = tx.send(Msg::Preview {
                 generation,
                 id,
@@ -1055,58 +1119,88 @@ impl ExplorerApp {
                 PreviewState::Failed { error, .. } => {
                     preview_placeholder_body("alert-circle", error)
                 }
-                PreviewState::Ready { preview, .. } => match preview {
-                    Preview::Image { image: img, meta } => {
-                        let caption = format!("{}×{} · {}", meta.width, meta.height, meta.encoding);
-                        column([
-                            image(img.clone())
-                                .image_fit(ImageFit::Contain)
-                                .dynamic_range_limit(DynamicRangeLimit::NoLimit)
-                                .width(Size::Fill(1.0))
-                                .height(Size::Fill(1.0)),
-                            text(caption).caption().muted(),
-                        ])
-                        .gap(tokens::SPACE_2)
-                        .width(Size::Fill(1.0))
-                        .height(Size::Fill(1.0))
-                    }
-                    Preview::Text {
-                        text: body,
-                        truncated,
-                    } => {
-                        let mut children = vec![scroll([code_block(body.clone())])
-                            .width(Size::Fill(1.0))
-                            .height(Size::Fill(1.0))];
-                        if *truncated {
-                            children.push(text("truncated preview").caption().muted());
-                        }
-                        column(children)
-                            .gap(tokens::SPACE_2)
-                            .width(Size::Fill(1.0))
-                            .height(Size::Fill(1.0))
-                    }
-                    Preview::Details { icon, title, rows } => {
-                        details_preview_body(icon, title, rows)
-                    }
-                    Preview::Binary(binary) => {
-                        let surface = self
-                            .binary_surface
-                            .as_ref()
-                            .map(|s| (s.app_texture(), s.metrics()));
-                        binary_preview_body(binary, self.preview_w, surface)
-                    }
-                    Preview::Unsupported { reason } => preview_placeholder_body("file", reason),
-                },
+                PreviewState::Ready { preview, raw, .. } => {
+                    let mode = effective_preview_mode(
+                        self.preview_mode,
+                        preview.as_ref().ok(),
+                        raw.as_ref(),
+                    );
+                    self.preview_body(preview, raw.as_ref(), mode)
+                }
             }
         };
 
-        card([column([header, body])
+        let mut children = vec![header];
+        if !is_dir && !stale {
+            if let PreviewState::Ready { preview, raw, .. } = &self.preview {
+                let modes = preview_modes(preview.as_ref().ok(), raw.as_ref());
+                if modes.len() > 1 {
+                    let current = effective_preview_mode(
+                        self.preview_mode,
+                        preview.as_ref().ok(),
+                        raw.as_ref(),
+                    );
+                    children
+                        .push(tabs_list("preview-mode", &current, modes).width(Size::Fill(1.0)));
+                }
+            }
+        }
+        children.push(body);
+
+        card([column(children)
             .gap(tokens::SPACE_3)
             .padding(tokens::SPACE_4)
             .width(Size::Fill(1.0))
             .height(Size::Fill(1.0))])
         .width(Size::Fixed(self.preview_w))
         .height(Size::Fill(1.0))
+    }
+
+    fn preview_body(
+        &self,
+        preview: &Result<Preview, String>,
+        raw: Option<&RawPreview>,
+        mode: PreviewMode,
+    ) -> El {
+        match mode {
+            PreviewMode::Normal => match preview {
+                Ok(preview) => {
+                    let surface = self
+                        .binary_surface
+                        .as_ref()
+                        .map(|s| (s.app_texture(), s.metrics()));
+                    normal_preview_body(preview, self.preview_w, surface)
+                }
+                Err(error) => preview_placeholder_body("alert-circle", error),
+            },
+            PreviewMode::Text => match raw.and_then(|raw| raw.text.as_ref()) {
+                Some(text) => {
+                    text_preview_body(text.clone(), raw.is_some_and(|r| r.binary.truncated))
+                }
+                None => match preview {
+                    Ok(Preview::Text { text, truncated }) => {
+                        text_preview_body(text.clone(), *truncated)
+                    }
+                    _ => preview_placeholder_body("file-text", "text view unavailable"),
+                },
+            },
+            PreviewMode::Binary => {
+                let binary = raw.map(|raw| &raw.binary).or_else(|| match preview {
+                    Ok(Preview::Binary(binary)) => Some(binary),
+                    _ => None,
+                });
+                match binary {
+                    Some(binary) => {
+                        let surface = self
+                            .binary_surface
+                            .as_ref()
+                            .map(|s| (s.app_texture(), s.metrics()));
+                        binary_preview_body(binary, self.preview_w, surface)
+                    }
+                    None => preview_placeholder_body("file", "binary view unavailable"),
+                }
+            }
+        }
     }
 
     /// Preview body while the full decode is in flight: the grid's
@@ -1291,6 +1385,47 @@ fn preview_placeholder_body(icon_name: &str, label: &str) -> El {
     .justify(Justify::Center)
     .width(Size::Fill(1.0))
     .height(Size::Fill(1.0))
+}
+
+fn normal_preview_body(
+    preview: &Preview,
+    preview_w: f32,
+    surface_state: Option<(damascene_core::surface::AppTexture, BinarySurfaceMetrics)>,
+) -> El {
+    match preview {
+        Preview::Image { image: img, meta } => {
+            let caption = format!("{}×{} · {}", meta.width, meta.height, meta.encoding);
+            column([
+                image(img.clone())
+                    .image_fit(ImageFit::Contain)
+                    .dynamic_range_limit(DynamicRangeLimit::NoLimit)
+                    .width(Size::Fill(1.0))
+                    .height(Size::Fill(1.0)),
+                text(caption).caption().muted(),
+            ])
+            .gap(tokens::SPACE_2)
+            .width(Size::Fill(1.0))
+            .height(Size::Fill(1.0))
+        }
+        Preview::Text { text, truncated } => text_preview_body(text.clone(), *truncated),
+        Preview::Details { icon, title, rows } => details_preview_body(icon, title, rows),
+        Preview::Binary(binary) => binary_preview_body(binary, preview_w, surface_state),
+        Preview::Unsupported { reason } => preview_placeholder_body("file", reason),
+    }
+}
+
+fn text_preview_body(body: String, truncated: bool) -> El {
+    let (body, capped) = cap_text_body(body);
+    let mut children = vec![scroll([code_block(body)])
+        .width(Size::Fill(1.0))
+        .height(Size::Fill(1.0))];
+    if truncated || capped {
+        children.push(text("truncated preview").caption().muted());
+    }
+    column(children)
+        .gap(tokens::SPACE_2)
+        .width(Size::Fill(1.0))
+        .height(Size::Fill(1.0))
 }
 
 fn details_preview_body(icon_name: &str, title: &str, rows: &[explorer_previews::DetailRow]) -> El {
@@ -1496,12 +1631,11 @@ impl App for ExplorerApp {
                         self.preview_inflight = None;
                     }
                     if generation == self.listing.generation && self.selected_id() == Some(id) {
-                        self.preview = match result {
-                            Ok(preview) => PreviewState::Ready {
-                                id,
-                                preview: cap_text_preview(preview),
-                            },
-                            Err(error) => PreviewState::Failed { id, error },
+                        let preview = result.preview.map(cap_text_preview);
+                        let raw = result.raw.ok();
+                        self.preview = match (preview, raw) {
+                            (Err(error), None) => PreviewState::Failed { id, error },
+                            (preview, raw) => PreviewState::Ready { id, preview, raw },
                         };
                     }
                     if let Some(wanted) = self.preview_wanted.take() {
@@ -1579,6 +1713,14 @@ impl App for ExplorerApp {
         }
         if let Some(selection) = event.selection.clone() {
             self.selection = selection;
+            return;
+        }
+        if tabs::apply_event(
+            &mut self.preview_mode,
+            &event,
+            "preview-mode",
+            parse_preview_mode,
+        ) {
             return;
         }
 
@@ -1746,10 +1888,22 @@ impl crate::host::HostApp for ExplorerApp {
     ) {
         let selected = self.selected.map(|(id, _)| id);
         let binary = match &self.preview {
-            PreviewState::Ready {
-                id,
-                preview: Preview::Binary(binary),
-            } if Some(*id) == selected => Some(binary),
+            PreviewState::Ready { id, preview, raw } if Some(*id) == selected => {
+                let preview_ref = preview.as_ref().ok();
+                match effective_preview_mode(self.preview_mode, preview_ref, raw.as_ref()) {
+                    PreviewMode::Binary => raw.as_ref().map(|raw| &raw.binary).or_else(|| {
+                        preview_ref.and_then(|preview| match preview {
+                            Preview::Binary(binary) => Some(binary),
+                            _ => None,
+                        })
+                    }),
+                    PreviewMode::Normal => preview_ref.and_then(|preview| match preview {
+                        Preview::Binary(binary) => Some(binary),
+                        _ => None,
+                    }),
+                    PreviewMode::Text => None,
+                }
+            }
             _ => None,
         };
         let Some(binary) = binary else {
@@ -1774,20 +1928,7 @@ fn binary_surface_size(preview_w: f32, viewport_h: f32) -> (f32, f32) {
 fn cap_text_preview(preview: Preview) -> Preview {
     match preview {
         Preview::Text { text, truncated } => {
-            let mut end = text.len();
-            let mut lines = 0;
-            for (i, b) in text.bytes().enumerate() {
-                if b == b'\n' {
-                    lines += 1;
-                    if lines >= TEXT_PREVIEW_MAX_LINES {
-                        end = i;
-                        break;
-                    }
-                }
-            }
-            let capped = end < text.len();
-            let mut text = text;
-            text.truncate(end);
+            let (text, capped) = cap_text_body(text);
             Preview::Text {
                 text,
                 truncated: truncated || capped,
@@ -1795,6 +1936,23 @@ fn cap_text_preview(preview: Preview) -> Preview {
         }
         other => other,
     }
+}
+
+fn cap_text_body(mut text: String) -> (String, bool) {
+    let mut end = text.len();
+    let mut lines = 0;
+    for (i, b) in text.bytes().enumerate() {
+        if b == b'\n' {
+            lines += 1;
+            if lines >= TEXT_PREVIEW_MAX_LINES {
+                end = i;
+                break;
+            }
+        }
+    }
+    let capped = end < text.len();
+    text.truncate(end);
+    (text, capped)
 }
 
 /// What the host negotiated with the display server, as a toolbar badge
@@ -1897,12 +2055,14 @@ pub(crate) mod fixtures {
     pub(crate) fn text_preview() -> ExplorerApp {
         let mut app = browse();
         let id = select(&mut app, "notes.txt");
+        let raw_bytes = b"hello\nworld\n".to_vec();
         app.preview = PreviewState::Ready {
             id,
-            preview: Preview::Text {
+            preview: Ok(Preview::Text {
                 text: "hello\nworld\n".into(),
                 truncated: true,
-            },
+            }),
+            raw: Some(raw_preview_fixture(raw_bytes, Some("hello\nworld\n"), true)),
         };
         app
     }
@@ -1924,9 +2084,10 @@ pub(crate) mod fixtures {
             None,
         );
         let id = select(&mut app, "report.pdf");
+        let raw_bytes = b"%PDF-1.7\n1 0 obj\n".to_vec();
         app.preview = PreviewState::Ready {
             id,
-            preview: Preview::Details {
+            preview: Ok(Preview::Details {
                 icon: "file-text",
                 title: "PDF document".into(),
                 rows: vec![
@@ -1943,7 +2104,12 @@ pub(crate) mod fixtures {
                         value: "metadata only".into(),
                     },
                 ],
-            },
+            }),
+            raw: Some(raw_preview_fixture(
+                raw_bytes,
+                Some("%PDF-1.7\n1 0 obj\n"),
+                false,
+            )),
         };
         app
     }
@@ -1975,9 +2141,10 @@ pub(crate) mod fixtures {
             };
             bytes.push(b);
         }
+        let raw = raw_preview_fixture(bytes.clone(), None, true);
         app.preview = PreviewState::Ready {
             id,
-            preview: Preview::Binary(explorer_previews::BinaryPreview {
+            preview: Ok(Preview::Binary(explorer_previews::BinaryPreview {
                 bytes,
                 truncated: true,
                 entropy_bits: 4.75,
@@ -1985,9 +2152,21 @@ pub(crate) mod fixtures {
                 nul_fraction: 0.25,
                 ff_fraction: 0.25,
                 distinct_values: 80,
-            }),
+            })),
+            raw: Some(raw),
         };
         app
+    }
+
+    fn raw_preview_fixture(
+        bytes: Vec<u8>,
+        text: Option<&str>,
+        truncated: bool,
+    ) -> explorer_previews::RawPreview {
+        explorer_previews::RawPreview {
+            text: text.map(str::to_string),
+            binary: explorer_previews::BinaryPreview::from_bytes(bytes, truncated),
+        }
     }
 
     /// Grid view with every cell flavor at once: a decoded thumbnail
@@ -2076,6 +2255,28 @@ mod tests {
         let app = grid();
         crate::fixtures::render(&app, (1500.0, 950.0));
         assert!(app.cols.get() > 1, "grid should lay out multiple columns");
+    }
+
+    #[test]
+    fn preview_tabs_switch_modes() {
+        let mut app = fixtures::text_preview();
+        let cx = EventCx::new();
+        assert_eq!(app.preview_mode, PreviewMode::Normal);
+
+        app.on_event(UiEvent::synthetic_click("preview-mode:tab:text"), &cx);
+        assert_eq!(app.preview_mode, PreviewMode::Text);
+
+        app.on_event(UiEvent::synthetic_click("preview-mode:tab:binary"), &cx);
+        assert_eq!(app.preview_mode, PreviewMode::Binary);
+
+        if let PreviewState::Ready { preview, raw, .. } = &app.preview {
+            assert_eq!(
+                effective_preview_mode(app.preview_mode, preview.as_ref().ok(), raw.as_ref()),
+                PreviewMode::Binary
+            );
+        } else {
+            panic!("fixture should have a loaded preview");
+        }
     }
 
     fn id_of(app: &ExplorerApp, name: &str) -> EntryId {
