@@ -405,6 +405,28 @@ impl App for PickerApp {
     }
 }
 
+impl crate::host::HostApp for PickerApp {
+    fn gpu_setup(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {
+        crate::host::HostApp::gpu_setup(&mut self.explorer, device, queue);
+    }
+
+    fn before_paint(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        viewport: damascene_core::Rect,
+        scale_factor: f32,
+    ) {
+        crate::host::HostApp::before_paint(
+            &mut self.explorer,
+            device,
+            queue,
+            viewport,
+            scale_factor,
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

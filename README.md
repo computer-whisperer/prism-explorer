@@ -52,9 +52,9 @@ hard rule: **no filesystem call ever runs on the UI thread.**
   through `pdftoppm` with metadata fallback, video poster frames
   through `ffmpeg` with container-metadata fallback, known text/code
   types, WAV metadata, and a sniffing fallback that separates unknown
-  text from binary with one bounded read. Binary fallbacks render a
-  pane-native byte map colored by byte class/value, plus entropy and
-  composition stats.
+  text from binary with one bounded read. Binary fallbacks render an
+  app-owned Damascene surface as a pane-native byte map colored by byte
+  class/value, plus entropy and composition stats.
 - **`crates/explorer-thumbs`** — the on-disk thumbnail cache. Unlike
   the freedesktop spec's 8-bit sRGB PNGs, entries store linear-light
   f16 tagged with primaries and reference luminance, so an HDR

@@ -20,14 +20,16 @@ use damascene_core::image::Image;
 use damascene_core::prelude::*;
 use damascene_core::scroll::{ScrollAlignment, ScrollRequest};
 use damascene_core::selection::{Selection, SelectionPoint, SelectionRange};
+use damascene_core::surface::SurfaceAlpha;
 use damascene_core::widgets::text_input::{self, TextInputOpts};
-use damascene_core::{BuildCx, EventCx, KeyChord, UiEvent, UiEventKind, UiKey};
+use damascene_core::{BuildCx, EventCx, KeyChord, Rect, UiEvent, UiEventKind, UiKey};
 use lru::LruCache;
 
 use explorer_io::{listing, stat, EntryKind, Notifier, Pool, Tier};
 use explorer_previews::{BinaryPreview, Preview, Registry};
 use explorer_thumbs::ThumbCache;
 
+use crate::binary_surface::{BinarySurface, BinarySurfaceMetrics};
 use crate::fmt;
 use crate::model::{Entry, EntryId, FileFilter, Listing, Msg};
 use crate::places::Place;
@@ -184,6 +186,7 @@ pub struct ExplorerApp {
     preview_w: f32,
     sidebar_drag: ResizeDrag,
     preview_drag: ResizeDrag,
+    binary_surface: Option<BinarySurface>,
 }
 
 impl ExplorerApp {
@@ -229,6 +232,7 @@ impl ExplorerApp {
             preview_w: 420.0,
             sidebar_drag: ResizeDrag::default(),
             preview_drag: ResizeDrag::default(),
+            binary_surface: None,
         };
         app.spawn_places_probe();
         app.navigate(start, None);
@@ -1084,7 +1088,13 @@ impl ExplorerApp {
                     Preview::Details { icon, title, rows } => {
                         details_preview_body(icon, title, rows)
                     }
-                    Preview::Binary(binary) => binary_preview_body(binary, self.preview_w),
+                    Preview::Binary(binary) => {
+                        let surface = self
+                            .binary_surface
+                            .as_ref()
+                            .map(|s| (s.app_texture(), s.metrics()));
+                        binary_preview_body(binary, self.preview_w, surface)
+                    }
                     Preview::Unsupported { reason } => preview_placeholder_body("file", reason),
                 },
             }
@@ -1306,7 +1316,11 @@ fn details_preview_body(icon_name: &str, title: &str, rows: &[explorer_previews:
         .height(Size::Fill(1.0))
 }
 
-fn binary_preview_body(preview: &BinaryPreview, preview_w: f32) -> El {
+fn binary_preview_body(
+    preview: &BinaryPreview,
+    preview_w: f32,
+    surface_state: Option<(damascene_core::surface::AppTexture, BinarySurfaceMetrics)>,
+) -> El {
     const CELL: f32 = 4.0;
     const GAP: f32 = 1.0;
     const MAX_CELLS: usize = 4096;
@@ -1315,25 +1329,60 @@ fn binary_preview_body(preview: &BinaryPreview, preview_w: f32) -> El {
     let cols = ((available_w + GAP) / (CELL + GAP))
         .floor()
         .clamp(16.0, 160.0) as usize;
-    let shown = preview.bytes.len().min(MAX_CELLS);
-    let mut rows = Vec::new();
-    for chunk in preview.bytes[..shown].chunks(cols) {
-        let cells = chunk.iter().map(|&byte| {
+    let fallback_shown = preview.bytes.len().min(MAX_CELLS);
+    let visible_bytes = surface_state
+        .as_ref()
+        .map(|(_, metrics)| metrics.shown)
+        .unwrap_or(fallback_shown);
+    let map = if let Some((texture, metrics)) = surface_state {
+        stack([
             spacer()
-                .fill(byte_color(byte))
-                .width(Size::Fixed(CELL))
-                .height(Size::Fixed(CELL))
-        });
-        rows.push(row(cells).gap(GAP).width(Size::Fill(1.0)));
-    }
+                .fill(tokens::MUTED)
+                .width(Size::Fill(1.0))
+                .height(Size::Fill(1.0)),
+            surface(texture)
+                .surface_alpha(SurfaceAlpha::Opaque)
+                .width(Size::Fill(1.0))
+                .height(Size::Fill(1.0)),
+        ])
+        .radius(tokens::RADIUS_SM)
+        .clip()
+        .width(Size::Fill(1.0))
+        .height(Size::Fill(1.0))
+        .tooltip(format!(
+            "{} columns × {} rows",
+            metrics.cols.max(1),
+            metrics.rows.max(1)
+        ))
+    } else {
+        let mut rows = Vec::new();
+        for chunk in preview.bytes[..fallback_shown].chunks(cols) {
+            let cells = chunk.iter().map(|&byte| {
+                spacer()
+                    .fill(byte_color(byte))
+                    .width(Size::Fixed(CELL))
+                    .height(Size::Fixed(CELL))
+            });
+            rows.push(row(cells).gap(GAP).width(Size::Fill(1.0)));
+        }
+        scroll([column(rows)
+            .gap(GAP)
+            .width(Size::Fill(1.0))
+            .height(Size::Fill(1.0))])
+        .fill(tokens::MUTED)
+        .radius(tokens::RADIUS_SM)
+        .padding(tokens::SPACE_2)
+        .width(Size::Fill(1.0))
+        .height(Size::Fill(1.0))
+    };
 
     let sample = if preview.truncated {
         format!("first {}", fmt::human_bytes(preview.bytes.len() as u64))
     } else {
         fmt::human_bytes(preview.bytes.len() as u64)
     };
-    let visible = if shown < preview.bytes.len() {
-        format!("{} shown", fmt::human_bytes(shown as u64))
+    let visible = if visible_bytes < preview.bytes.len() {
+        format!("{} shown", fmt::human_bytes(visible_bytes as u64))
     } else {
         "all shown".into()
     };
@@ -1358,15 +1407,7 @@ fn binary_preview_body(preview: &BinaryPreview, preview_w: f32) -> El {
         ])
         .gap(tokens::SPACE_2)
         .width(Size::Fill(1.0)),
-        scroll([column(rows)
-            .gap(GAP)
-            .width(Size::Fill(1.0))
-            .height(Size::Fill(1.0))])
-        .fill(tokens::MUTED)
-        .radius(tokens::RADIUS_SM)
-        .padding(tokens::SPACE_2)
-        .width(Size::Fill(1.0))
-        .height(Size::Fill(1.0)),
+        map,
         text(format!(
             "{visible} · {} distinct byte values",
             preview.distinct_values
@@ -1689,6 +1730,43 @@ impl App for ExplorerApp {
     fn drain_focus_requests(&mut self) -> Vec<String> {
         std::mem::take(&mut self.focus_requests)
     }
+}
+
+impl crate::host::HostApp for ExplorerApp {
+    fn gpu_setup(&mut self, device: &wgpu::Device, _queue: &wgpu::Queue) {
+        self.binary_surface = Some(BinarySurface::new(device));
+    }
+
+    fn before_paint(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        viewport: Rect,
+        scale_factor: f32,
+    ) {
+        let selected = self.selected.map(|(id, _)| id);
+        let binary = match &self.preview {
+            PreviewState::Ready {
+                id,
+                preview: Preview::Binary(binary),
+            } if Some(*id) == selected => Some(binary),
+            _ => None,
+        };
+        let Some(binary) = binary else {
+            return;
+        };
+        let Some(surface) = &mut self.binary_surface else {
+            return;
+        };
+        let (logical_w, logical_h) = binary_surface_size(self.preview_w, viewport.h);
+        surface.write(device, queue, binary, logical_w, logical_h, scale_factor);
+    }
+}
+
+fn binary_surface_size(preview_w: f32, viewport_h: f32) -> (f32, f32) {
+    let width = (preview_w - tokens::SPACE_4 * 2.0).max(96.0);
+    let height = (viewport_h - 250.0).clamp(160.0, 1200.0);
+    (width, height)
 }
 
 /// Bound what one mono text leaf has to lay out; the read itself is

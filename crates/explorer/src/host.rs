@@ -79,7 +79,22 @@ pub struct WindowSpec {
     pub title: String,
     pub width: f32,
     pub height: f32,
-    pub app: Box<dyn App + Send>,
+    pub app: Box<dyn HostApp + Send>,
+}
+
+/// App contract for this custom multi-window host. Most apps only need
+/// [`App`]; GPU hooks are for app-owned `surface()` textures.
+pub trait HostApp: App {
+    fn gpu_setup(&mut self, _device: &wgpu::Device, _queue: &wgpu::Queue) {}
+
+    fn before_paint(
+        &mut self,
+        _device: &wgpu::Device,
+        _queue: &wgpu::Queue,
+        _viewport: Rect,
+        _scale_factor: f32,
+    ) {
+    }
 }
 
 /// Run the host loop with one initial window. Returns when the last
@@ -247,7 +262,7 @@ struct WindowState {
     /// Drop order: `WindowGfx` internally drops its color driver before
     /// its `Window` (they share winit's libwayland connection).
     gfx: WindowGfx,
-    app: Box<dyn App>,
+    app: Box<dyn HostApp + Send>,
     /// Last pointer position in logical pixels.
     last_pointer: Option<(f32, f32)>,
     modifiers: KeyModifiers,
@@ -342,6 +357,7 @@ impl Host {
                     s.samples_time,
                 );
             }
+            app.gpu_setup(&gpu.device, &gpu.queue);
             app.before_build();
             Ok(WindowState {
                 gfx,
@@ -965,6 +981,8 @@ impl WindowState {
         let paint_only = trigger == FrameTrigger::ShaderPaint && self.pending_resize.is_none();
 
         let (prepare, palette, t_after_build, t_after_prepare) = if paint_only {
+            self.app
+                .before_paint(&gfx.device, &gfx.queue, viewport, scale_factor);
             let palette = gfx.renderer.theme().palette().clone();
             let t_after_build = Instant::now();
             let prepare = gfx
@@ -1009,6 +1027,8 @@ impl WindowState {
                 ..HostDiagnostics::default()
             };
             self.app.before_build();
+            self.app
+                .before_paint(&gfx.device, &gfx.queue, viewport, scale_factor);
             let theme = self.app.theme();
             let palette = theme.palette().clone();
             let cx = damascene_core::BuildCx::new(&theme)
