@@ -3,7 +3,7 @@
 A color-managed file explorer for Wayland, built with
 [Damascene](https://github.com/computer-whisperer/damascene). HDR-aware
 image previews via the [achromat] decode stack, PDF/video poster
-previews, text previews, and an IO layer built for big, slow
+previews, WAV metadata, text previews, and an IO layer built for big, slow
 filesystems.
 
 [achromat]: https://github.com/computer-whisperer/achromat
@@ -51,8 +51,8 @@ hard rule: **no filesystem call ever runs on the UI thread.**
   CICP/ICC handling, HDR luminance anchoring), PDF first-page previews
   through `pdftoppm` with metadata fallback, video poster frames
   through `ffmpeg` with container-metadata fallback, known text/code
-  types, and a sniffing fallback that separates unknown text from
-  binary with one bounded read.
+  types, WAV metadata, and a sniffing fallback that separates unknown
+  text from binary with one bounded read.
 - **`crates/explorer-thumbs`** — the on-disk thumbnail cache. Unlike
   the freedesktop spec's 8-bit sRGB PNGs, entries store linear-light
   f16 tagged with primaries and reference luminance, so an HDR
@@ -127,8 +127,8 @@ modality to the caller's window.
 ## Roadmap
 
 - Portal polish: a D-Bus-activatable zero-window service mode
-- Rich PDF navigation and video controls; audio, archives, fonts; file
-  operations; syntax highlighting
+- Rich PDF navigation, video controls, and audio waveforms/playback;
+  archives, fonts; file operations; syntax highlighting
 
 ## License
 

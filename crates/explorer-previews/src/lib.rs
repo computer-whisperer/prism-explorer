@@ -12,8 +12,8 @@
 //!
 //! [`Registry::standard`] wires the built-ins: color-managed images
 //! via achromat, PDF/video poster previews with metadata fallback,
-//! known text/code types, and a sniffing fallback that distinguishes
-//! unknown text from binary with a single bounded read.
+//! WAV metadata, known text/code types, and a sniffing fallback that
+//! distinguishes unknown text from binary with a single bounded read.
 
 mod document;
 mod image;
@@ -25,7 +25,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 pub use document::PdfHandler;
 pub use image::ImageHandler;
-pub use media::VideoHandler;
+pub use media::{AudioHandler, VideoHandler};
 pub use text::{TextFallbackHandler, TextHandler};
 
 use achromat::convert::ImageMeta;
@@ -84,6 +84,7 @@ impl Registry {
                 Box::new(ImageHandler),
                 Box::new(PdfHandler),
                 Box::new(VideoHandler),
+                Box::new(AudioHandler),
                 Box::new(TextHandler),
                 Box::new(TextFallbackHandler),
             ],
@@ -143,6 +144,7 @@ pub enum PreviewKind {
     Image,
     Pdf,
     Video,
+    Audio,
     Text,
     Other,
 }
@@ -154,6 +156,7 @@ impl PreviewKind {
             PreviewKind::Image => "image",
             PreviewKind::Pdf => "PDF document",
             PreviewKind::Video => "video",
+            PreviewKind::Audio => "audio",
             PreviewKind::Text => "text",
             PreviewKind::Other => "file",
         }
@@ -165,6 +168,7 @@ impl PreviewKind {
             PreviewKind::Image => "file-text",
             PreviewKind::Pdf => "file-text",
             PreviewKind::Video => "activity",
+            PreviewKind::Audio => "activity",
             PreviewKind::Text => "file-text",
             PreviewKind::Other => "file",
         }
@@ -181,6 +185,8 @@ pub fn preview_kind_for_path(path: &Path, is_dir: bool) -> PreviewKind {
         PreviewKind::Pdf
     } else if VideoHandler.claims(path) {
         PreviewKind::Video
+    } else if AudioHandler.claims(path) {
+        PreviewKind::Audio
     } else if TextHandler.claims(path) {
         PreviewKind::Text
     } else {
@@ -259,6 +265,21 @@ mod tests {
                 assert!(rows.iter().any(|r| r.value == "ISO BMFF / MP4"));
             }
             _ => panic!("video should preview as details"),
+        }
+
+        let wav_path = dir.join("tone.wav");
+        std::fs::write(
+            &wav_path,
+            b"RIFF(\0\0\0WAVEfmt \x10\0\0\0\x01\0\x02\0D\xac\0\0\x10\xb1\x02\0\x04\0\x10\0data\x10\xb1\x02\0",
+        )
+        .unwrap();
+        match Registry::standard().load(&wav_path).unwrap() {
+            Preview::Details { title, rows, .. } => {
+                assert_eq!(title, "Audio file");
+                assert!(rows.iter().any(|r| r.value == "WAV / PCM"));
+                assert!(rows.iter().any(|r| r.value == "stereo"));
+            }
+            _ => panic!("wav should preview as details"),
         }
 
         let bin_path = dir.join("blob.dat");
