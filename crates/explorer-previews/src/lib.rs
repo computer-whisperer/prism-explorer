@@ -13,8 +13,10 @@
 //! [`Registry::standard`] wires the built-ins: color-managed images
 //! via achromat, PDF/video poster previews with metadata fallback,
 //! WAV metadata, known text/code types, and a sniffing fallback that
-//! distinguishes unknown text from binary with a single bounded read.
+//! distinguishes unknown text from visualized binary data with a
+//! single bounded read.
 
+mod binary;
 mod document;
 mod image;
 mod media;
@@ -23,6 +25,7 @@ mod text;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+pub use binary::BinaryPreview;
 pub use document::PdfHandler;
 pub use image::ImageHandler;
 pub use media::{AudioHandler, VideoHandler};
@@ -38,6 +41,8 @@ pub enum Preview {
     /// Text prefix of the file. `truncated` when the file goes on
     /// beyond what was read.
     Text { text: String, truncated: bool },
+    /// Byte-level visualization data for unknown binary files.
+    Binary(BinaryPreview),
     /// Structured metadata for recognized formats that are not yet
     /// rendered inline.
     Details {
@@ -45,7 +50,7 @@ pub enum Preview {
         title: String,
         rows: Vec<DetailRow>,
     },
-    /// Recognized but deliberately not previewed (binary data, …).
+    /// Recognized but deliberately not previewed.
     /// Distinct from `load` returning `Err`, which means a preview was
     /// attempted and failed.
     Unsupported { reason: String },
@@ -209,7 +214,7 @@ mod tests {
 
     /// End-to-end through the registry: a real PNG decodes to an image
     /// preview, Rust source comes back as text, NUL-bearing data with
-    /// an unknown extension is called binary, and an unknown extension
+    /// an unknown extension gets a binary map, and an unknown extension
     /// with text content falls through to a text preview.
     #[test]
     fn registry_routes_by_type() {
@@ -287,8 +292,11 @@ mod tests {
         f.write_all(&[0u8, 159, 146, 150, 0, 1, 2, 3]).unwrap();
         drop(f);
         match Registry::standard().load(&bin_path).unwrap() {
-            Preview::Unsupported { reason } => assert!(reason.contains("binary"), "{reason}"),
-            _ => panic!("NUL-bearing data should be unsupported"),
+            Preview::Binary(preview) => {
+                assert_eq!(preview.bytes.len(), 8);
+                assert!(preview.nul_fraction > 0.0);
+            }
+            _ => panic!("NUL-bearing data should preview as binary"),
         }
 
         // Oversized images downscale below GPU texture limits (the

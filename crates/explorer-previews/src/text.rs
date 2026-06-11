@@ -4,7 +4,7 @@
 use std::io::Read;
 use std::path::Path;
 
-use crate::{extension, Preview, PreviewHandler};
+use crate::{binary::preview_binary, extension, Preview, PreviewHandler};
 
 /// How much of the file a text preview reads. Bounded: this often runs
 /// against multi-gigabyte logs on a slow mount.
@@ -176,9 +176,7 @@ fn looks_binary(prefix: &[u8]) -> bool {
 
 fn to_preview(prefix: Vec<u8>, truncated: bool) -> Preview {
     if looks_binary(&prefix) {
-        return Preview::Unsupported {
-            reason: "binary data".into(),
-        };
+        return preview_binary(prefix, truncated);
     }
     Preview::Text {
         text: String::from_utf8_lossy(&prefix).into_owned(),
@@ -259,7 +257,10 @@ mod tests {
         std::fs::write(&liar, [b'a', 0, b'b']).unwrap();
         assert!(TextHandler.claims(&liar));
         match TextHandler.load(&liar).unwrap() {
-            Preview::Unsupported { reason } => assert!(reason.contains("binary")),
+            Preview::Binary(preview) => {
+                assert_eq!(preview.bytes, vec![b'a', 0, b'b']);
+                assert!(!preview.truncated);
+            }
             _ => panic!("expected binary verdict"),
         }
 

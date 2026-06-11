@@ -25,7 +25,7 @@ use damascene_core::{BuildCx, EventCx, KeyChord, UiEvent, UiEventKind, UiKey};
 use lru::LruCache;
 
 use explorer_io::{listing, stat, EntryKind, Notifier, Pool, Tier};
-use explorer_previews::{Preview, Registry};
+use explorer_previews::{BinaryPreview, Preview, Registry};
 use explorer_thumbs::ThumbCache;
 
 use crate::fmt;
@@ -1084,6 +1084,7 @@ impl ExplorerApp {
                     Preview::Details { icon, title, rows } => {
                         details_preview_body(icon, title, rows)
                     }
+                    Preview::Binary(binary) => binary_preview_body(binary, self.preview_w),
                     Preview::Unsupported { reason } => preview_placeholder_body("file", reason),
                 },
             }
@@ -1303,6 +1304,101 @@ fn details_preview_body(icon_name: &str, title: &str, rows: &[explorer_previews:
         .justify(Justify::Center)
         .width(Size::Fill(1.0))
         .height(Size::Fill(1.0))
+}
+
+fn binary_preview_body(preview: &BinaryPreview, preview_w: f32) -> El {
+    const CELL: f32 = 4.0;
+    const GAP: f32 = 1.0;
+    const MAX_CELLS: usize = 4096;
+
+    let available_w = (preview_w - tokens::SPACE_4 * 2.0 - tokens::SPACE_2 * 2.0).max(80.0);
+    let cols = ((available_w + GAP) / (CELL + GAP))
+        .floor()
+        .clamp(16.0, 160.0) as usize;
+    let shown = preview.bytes.len().min(MAX_CELLS);
+    let mut rows = Vec::new();
+    for chunk in preview.bytes[..shown].chunks(cols) {
+        let cells = chunk.iter().map(|&byte| {
+            spacer()
+                .fill(byte_color(byte))
+                .width(Size::Fixed(CELL))
+                .height(Size::Fixed(CELL))
+        });
+        rows.push(row(cells).gap(GAP).width(Size::Fill(1.0)));
+    }
+
+    let sample = if preview.truncated {
+        format!("first {}", fmt::human_bytes(preview.bytes.len() as u64))
+    } else {
+        fmt::human_bytes(preview.bytes.len() as u64)
+    };
+    let visible = if shown < preview.bytes.len() {
+        format!("{} shown", fmt::human_bytes(shown as u64))
+    } else {
+        "all shown".into()
+    };
+
+    column([
+        row([
+            binary_stat("Sample", sample),
+            binary_stat("Entropy", format!("{:.2} bits/B", preview.entropy_bits)),
+        ])
+        .gap(tokens::SPACE_2)
+        .width(Size::Fill(1.0)),
+        row([
+            binary_stat("ASCII", percent(preview.printable_fraction)),
+            binary_stat(
+                "NUL / FF",
+                format!(
+                    "{} / {}",
+                    percent(preview.nul_fraction),
+                    percent(preview.ff_fraction)
+                ),
+            ),
+        ])
+        .gap(tokens::SPACE_2)
+        .width(Size::Fill(1.0)),
+        scroll([column(rows)
+            .gap(GAP)
+            .width(Size::Fill(1.0))
+            .height(Size::Fill(1.0))])
+        .fill(tokens::MUTED)
+        .radius(tokens::RADIUS_SM)
+        .padding(tokens::SPACE_2)
+        .width(Size::Fill(1.0))
+        .height(Size::Fill(1.0)),
+        text(format!(
+            "{visible} · {} distinct byte values",
+            preview.distinct_values
+        ))
+        .caption()
+        .muted(),
+    ])
+    .gap(tokens::SPACE_2)
+    .width(Size::Fill(1.0))
+    .height(Size::Fill(1.0))
+}
+
+fn binary_stat(label: &str, value: String) -> El {
+    column([text(label.to_string()).caption().muted(), text(value)])
+        .gap(tokens::SPACE_1)
+        .width(Size::Fill(1.0))
+}
+
+fn percent(value: f32) -> String {
+    format!("{:.0}%", value * 100.0)
+}
+
+fn byte_color(byte: u8) -> Color {
+    let v = byte as f32 / 255.0;
+    match byte {
+        0x00 => tokens::BACKGROUND.with_alpha(0.90),
+        0xff => tokens::FOREGROUND.with_alpha(0.95),
+        b'\t' | b'\n' | b'\r' | b' ' => tokens::INFO.with_alpha(0.35 + v * 0.35),
+        0x01..=0x1f | 0x7f => tokens::DESTRUCTIVE.with_alpha(0.45 + v * 0.45),
+        0x21..=0x7e => tokens::SUCCESS.with_alpha(0.45 + v * 0.40),
+        _ => tokens::WARNING.with_alpha(0.35 + v * 0.55),
+    }
 }
 
 impl App for ExplorerApp {
@@ -1770,6 +1866,48 @@ pub(crate) mod fixtures {
                     },
                 ],
             },
+        };
+        app
+    }
+
+    /// `firmware.bin` selected with a byte-map preview ready.
+    pub(crate) fn binary_preview() -> ExplorerApp {
+        let mut app = browse();
+        app.listing.absorb(
+            ListingUpdate {
+                batch: vec![RawEntry {
+                    name: "firmware.bin".into(),
+                    kind: EntryKind::File,
+                }],
+                done: true,
+                error: None,
+            },
+            false,
+            None,
+            None,
+        );
+        let id = select(&mut app, "firmware.bin");
+        let mut bytes = Vec::new();
+        for i in 0..4096u32 {
+            let b = match i % 64 {
+                0..=15 => 0,
+                16..=31 => b'A' + (i % 26) as u8,
+                32..=47 => 0xff,
+                _ => (i * 37) as u8,
+            };
+            bytes.push(b);
+        }
+        app.preview = PreviewState::Ready {
+            id,
+            preview: Preview::Binary(explorer_previews::BinaryPreview {
+                bytes,
+                truncated: true,
+                entropy_bits: 4.75,
+                printable_fraction: 0.25,
+                nul_fraction: 0.25,
+                ff_fraction: 0.25,
+                distinct_values: 80,
+            }),
         };
         app
     }
