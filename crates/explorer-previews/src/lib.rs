@@ -11,16 +11,17 @@
 //!   block as long as it likes.
 //!
 //! [`Registry::standard`] wires the built-ins: color-managed images
-//! via achromat, PDF/video metadata, known text/code types, and a
-//! sniffing fallback that distinguishes unknown text from binary with
-//! a single bounded read.
+//! via achromat, PDF/video poster previews with metadata fallback,
+//! known text/code types, and a sniffing fallback that distinguishes
+//! unknown text from binary with a single bounded read.
 
 mod document;
 mod image;
 mod media;
 mod text;
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 pub use document::PdfHandler;
 pub use image::ImageHandler;
@@ -106,6 +107,34 @@ impl Registry {
 /// Case-insensitive extension of `path`, if any.
 fn extension(path: &Path) -> Option<String> {
     path.extension().map(|e| e.to_string_lossy().to_lowercase())
+}
+
+pub(crate) struct PreviewTempDir {
+    path: PathBuf,
+}
+
+impl PreviewTempDir {
+    pub(crate) fn new(kind: &str) -> anyhow::Result<Self> {
+        static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+
+        let path = std::env::temp_dir().join(format!(
+            "prism-explorer-preview-{kind}-{}-{}",
+            std::process::id(),
+            NEXT_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&path)?;
+        Ok(Self { path })
+    }
+
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for PreviewTempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

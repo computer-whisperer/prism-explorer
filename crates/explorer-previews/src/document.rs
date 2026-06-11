@@ -1,9 +1,14 @@
-//! Document metadata previews.
+//! Document previews.
 
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
+use std::process::{Command, Stdio};
 
-use crate::{extension, DetailRow, Preview, PreviewHandler};
+use anyhow::{bail, Context};
+
+use crate::{
+    extension, image::load_raster_image, DetailRow, Preview, PreviewHandler, PreviewTempDir,
+};
 
 const PDF_EXTENSIONS: &[&str] = &["pdf"];
 const HEAD_BYTES: usize = 64 * 1024;
@@ -30,28 +35,61 @@ impl PreviewHandler for PdfHandler {
 
         let version = pdf_version(&head).unwrap_or("unknown");
         let pages = count_pdf_pages(&sample);
-        let mut rows = vec![DetailRow {
-            label: "Format".into(),
-            value: format!("PDF {version}"),
-        }];
-        rows.push(DetailRow {
-            label: "Pages".into(),
-            value: if pages == 0 {
-                "not found in sampled xref".into()
-            } else {
-                pages.to_string()
-            },
-        });
-        rows.push(DetailRow {
-            label: "Preview".into(),
-            value: "metadata only".into(),
-        });
+        if let Ok(preview) = render_first_page(path) {
+            return Ok(preview);
+        }
 
-        Ok(Preview::Details {
-            icon: "file-text",
-            title: "PDF document".into(),
-            rows,
-        })
+        Ok(pdf_details(version, pages, "metadata only"))
+    }
+}
+
+fn render_first_page(path: &Path) -> anyhow::Result<Preview> {
+    let dir = PreviewTempDir::new("pdf")?;
+    let prefix = dir.path().join("page");
+    let status = Command::new("pdftoppm")
+        .arg("-f")
+        .arg("1")
+        .arg("-l")
+        .arg("1")
+        .arg("-singlefile")
+        .arg("-png")
+        .arg("-scale-to")
+        .arg("1024")
+        .arg(path)
+        .arg(&prefix)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .with_context(|| "failed to run pdftoppm")?;
+    if !status.success() {
+        bail!("pdftoppm exited with {status}");
+    }
+
+    load_raster_image(&prefix.with_extension("png"))
+}
+
+fn pdf_details(version: &str, pages: usize, preview: &str) -> Preview {
+    let mut rows = vec![DetailRow {
+        label: "Format".into(),
+        value: format!("PDF {version}"),
+    }];
+    rows.push(DetailRow {
+        label: "Pages".into(),
+        value: if pages == 0 {
+            "not found in sampled xref".into()
+        } else {
+            pages.to_string()
+        },
+    });
+    rows.push(DetailRow {
+        label: "Preview".into(),
+        value: preview.into(),
+    });
+
+    Preview::Details {
+        icon: "file-text",
+        title: "PDF document".into(),
+        rows,
     }
 }
 

@@ -1,9 +1,14 @@
-//! Media metadata previews.
+//! Media previews.
 
 use std::io::Read;
 use std::path::Path;
+use std::process::{Command, Stdio};
 
-use crate::{extension, DetailRow, Preview, PreviewHandler};
+use anyhow::{bail, Context};
+
+use crate::{
+    extension, image::load_raster_image, DetailRow, Preview, PreviewHandler, PreviewTempDir,
+};
 
 const VIDEO_EXTENSIONS: &[&str] = &[
     "mp4", "m4v", "mov", "webm", "mkv", "avi", "mpeg", "mpg", "m2ts", "mts", "ts", "ogv",
@@ -25,26 +30,62 @@ impl PreviewHandler for VideoHandler {
         let head = read_head(path)?;
         let ext = extension(path);
         let info = video_info(&head, ext.as_deref());
-        let mut rows = vec![DetailRow {
-            label: "Container".into(),
-            value: info.container.into(),
-        }];
-        if let Some(brand) = info.brand {
-            rows.push(DetailRow {
-                label: "Brand".into(),
-                value: brand,
-            });
+        if let Ok(preview) = extract_video_frame(path) {
+            return Ok(preview);
         }
-        rows.push(DetailRow {
-            label: "Preview".into(),
-            value: "metadata only".into(),
-        });
 
-        Ok(Preview::Details {
-            icon: "activity",
-            title: "Video file".into(),
-            rows,
-        })
+        Ok(video_details(info, "metadata only"))
+    }
+}
+
+fn extract_video_frame(path: &Path) -> anyhow::Result<Preview> {
+    let dir = PreviewTempDir::new("video")?;
+    let png = dir.path().join("frame.png");
+    let status = Command::new("ffmpeg")
+        .arg("-hide_banner")
+        .arg("-loglevel")
+        .arg("error")
+        .arg("-y")
+        .arg("-i")
+        .arg(path)
+        .arg("-frames:v")
+        .arg("1")
+        .arg("-vf")
+        .arg("scale=min(1024\\,iw):-2")
+        .arg("-an")
+        .arg("-sn")
+        .arg(&png)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .with_context(|| "failed to run ffmpeg")?;
+    if !status.success() {
+        bail!("ffmpeg exited with {status}");
+    }
+
+    load_raster_image(&png)
+}
+
+fn video_details(info: VideoInfo, preview: &str) -> Preview {
+    let mut rows = vec![DetailRow {
+        label: "Container".into(),
+        value: info.container.into(),
+    }];
+    if let Some(brand) = info.brand {
+        rows.push(DetailRow {
+            label: "Brand".into(),
+            value: brand,
+        });
+    }
+    rows.push(DetailRow {
+        label: "Preview".into(),
+        value: preview.into(),
+    });
+
+    Preview::Details {
+        icon: "activity",
+        title: "Video file".into(),
+        rows,
     }
 }
 
