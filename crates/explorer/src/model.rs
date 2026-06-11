@@ -215,6 +215,14 @@ impl Listing {
     }
 }
 
+/// Worker result for a grid thumbnail request.
+pub enum ThumbResult {
+    Image(damascene_core::image::Image),
+    /// No thumbnail by policy, usually a cache-only miss.
+    Miss,
+    Error(String),
+}
+
 /// Everything workers post back to the UI thread.
 pub enum Msg {
     Listing {
@@ -234,7 +242,7 @@ pub enum Msg {
     Thumb {
         generation: u64,
         id: EntryId,
-        result: Result<damascene_core::image::Image, String>,
+        result: ThumbResult,
     },
     Places(Vec<Place>),
     /// External command (D-Bus): navigate to `dir`, then select

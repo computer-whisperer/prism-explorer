@@ -103,6 +103,14 @@ impl ThumbCache {
         Ok(image)
     }
 
+    /// Return an already-cached thumbnail for `src`, if one exists for
+    /// its current path/mtime/size. This never decodes the source file.
+    pub fn cached_thumbnail(&self, src: &Path) -> anyhow::Result<Option<Image>> {
+        let meta = fs::metadata(src).with_context(|| format!("stat {}", src.display()))?;
+        let entry = self.entry_path(src, &meta);
+        Ok(self.load_entry(&entry))
+    }
+
     /// Cache file for `src` in its current state. Two-level fan-out so
     /// no single directory grows unbounded.
     fn entry_path(&self, src: &Path, meta: &fs::Metadata) -> PathBuf {
@@ -373,6 +381,23 @@ mod tests {
         let fresh = cache.thumbnail(&src).unwrap();
         assert_ne!(fresh.content_hash(), first.content_hash());
         assert_eq!(cache_files(&cache.root).len(), 2);
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn cached_thumbnail_never_decodes_on_miss() {
+        let dir = scratch("cached-only");
+        let src = dir.join("photo.png");
+        write_png(&src, 64, 32, 200);
+
+        let cache = ThumbCache::new(dir.join("cache"), 16);
+        assert!(cache.cached_thumbnail(&src).unwrap().is_none());
+        assert!(cache_files(&cache.root).is_empty());
+
+        let first = cache.thumbnail(&src).unwrap();
+        let cached = cache.cached_thumbnail(&src).unwrap().unwrap();
+        assert_eq!(cached.content_hash(), first.content_hash());
 
         fs::remove_dir_all(&dir).unwrap();
     }

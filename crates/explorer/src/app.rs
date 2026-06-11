@@ -32,8 +32,9 @@ use explorer_thumbs::ThumbCache;
 
 use crate::binary_surface::{BinarySurface, BinarySurfaceMetrics};
 use crate::fmt;
-use crate::model::{Entry, EntryId, FileFilter, Listing, Msg, PreviewPayload};
+use crate::model::{Entry, EntryId, FileFilter, Listing, Msg, PreviewPayload, ThumbResult};
 use crate::places::Place;
+use crate::preview_policy::{grid_thumbnail_policy, GridThumbPolicy};
 
 const ROW_H: f32 = 34.0;
 const SIDEBAR_MIN: f32 = 160.0;
@@ -71,8 +72,8 @@ struct ThumbState {
     ram: LruCache<EntryId, Image>,
     /// Jobs submitted, to dedupe across frames.
     requested: HashSet<EntryId>,
-    /// Decodes that failed; the cell falls back to a file icon (the
-    /// preview pane is where the user sees the actual error).
+    /// Entries with no usable grid thumbnail. Decode errors are logged;
+    /// policy misses, like oversized cache misses, stay quiet.
     failed: HashSet<EntryId>,
 }
 
@@ -987,8 +988,13 @@ impl ExplorerApp {
                 let name = e.display.clone();
                 let icon_name = entry_icon(e);
                 let preview_label = e.preview_kind.label();
-                let wants_thumb = e.is_image && e.kind != EntryKind::Dir;
-                let path = wants_thumb.then(|| dir.join(&e.name));
+                let thumb_policy =
+                    grid_thumbnail_policy(e.preview_kind, e.kind, e.meta, e.meta_error.is_some());
+                let path = matches!(
+                    thumb_policy,
+                    GridThumbPolicy::Decode | GridThumbPolicy::CacheOnly
+                )
+                .then(|| dir.join(&e.name));
                 drop(entries);
 
                 let media: El = if let Some(path) = path {
@@ -1012,7 +1018,22 @@ impl ExplorerApp {
                             let notify = notify.clone();
                             let thumbs = thumbs.clone();
                             pool.submit(Tier::Visible, move || {
-                                let result = thumbs.thumbnail(&path).map_err(|e| format!("{e:#}"));
+                                let result = match thumb_policy {
+                                    GridThumbPolicy::Decode => match thumbs.thumbnail(&path) {
+                                        Ok(image) => ThumbResult::Image(image),
+                                        Err(error) => ThumbResult::Error(format!("{error:#}")),
+                                    },
+                                    GridThumbPolicy::CacheOnly => {
+                                        match thumbs.cached_thumbnail(&path) {
+                                            Ok(Some(image)) => ThumbResult::Image(image),
+                                            Ok(None) => ThumbResult::Miss,
+                                            Err(error) => ThumbResult::Error(format!("{error:#}")),
+                                        }
+                                    }
+                                    GridThumbPolicy::Never | GridThumbPolicy::WaitForMeta => {
+                                        ThumbResult::Miss
+                                    }
+                                };
                                 let _ = tx.send(Msg::Thumb {
                                     generation,
                                     id,
@@ -1322,8 +1343,8 @@ fn entry_tooltip_by_parts(name: &str, kind: &str) -> String {
     format!("{name} · {kind}")
 }
 
-/// Icon centered in a grid cell's media area (non-image entries, and
-/// image entries whose thumbnail failed).
+/// Icon centered in a grid cell's media area when no thumbnail should
+/// be shown.
 fn tile_icon(name: &'static str) -> El {
     column([icon(name).icon_size(28.0).color(tokens::MUTED_FOREGROUND)])
         .align(Align::Center)
@@ -1655,10 +1676,13 @@ impl App for ExplorerApp {
                         continue;
                     }
                     match result {
-                        Ok(image) => {
+                        ThumbResult::Image(image) => {
                             ts.ram.put(id, image);
                         }
-                        Err(error) => {
+                        ThumbResult::Miss => {
+                            ts.failed.insert(id);
+                        }
+                        ThumbResult::Error(error) => {
                             tracing::warn!(id, error, "thumbnail failed");
                             ts.failed.insert(id);
                         }
@@ -1994,6 +2018,7 @@ fn color_mode_badge(cx: &BuildCx) -> El {
 pub(crate) mod fixtures {
     use super::*;
     use explorer_io::listing::ListingUpdate;
+    use explorer_io::stat::EntryMeta;
     use explorer_io::RawEntry;
 
     /// Browsing `/test/somewhere`: a directory, a text file, an image
@@ -2048,6 +2073,8 @@ pub(crate) mod fixtures {
             None,
             None,
         );
+        stat_file(&mut app, "notes.txt", 12);
+        stat_file(&mut app, "photo.jxr", 1024);
         app
     }
 
@@ -2195,6 +2222,8 @@ pub(crate) mod fixtures {
             None,
             None,
         );
+        stat_file(&mut app, "pending.png", 1024);
+        stat_file(&mut app, "broken.avif", 1024);
         let thumbed = app
             .listing
             .id_by_name(std::ffi::OsStr::new("photo.jxr"))
@@ -2210,6 +2239,25 @@ pub(crate) mod fixtures {
         }
         select(&mut app, "photo.jxr");
         app
+    }
+
+    fn stat_file(app: &mut ExplorerApp, name: &str, size: u64) {
+        let id = app
+            .listing
+            .id_by_name(std::ffi::OsStr::new(name))
+            .expect("fixture entry exists");
+        app.listing.apply_stat(
+            id,
+            Ok(EntryMeta {
+                size,
+                modified: None,
+                kind: EntryKind::File,
+                is_symlink: false,
+            }),
+            false,
+            None,
+            None,
+        );
     }
 
     /// The listing failed outright.
