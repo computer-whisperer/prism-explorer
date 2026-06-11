@@ -25,7 +25,7 @@ prism-explorer [DIRECTORY]    # defaults to $HOME
 | Home / End | first / last entry |
 | `r` / F5 | refresh listing |
 | `.` | toggle hidden files |
-| Search field | filter the current directory by name |
+| Ctrl+F / Search field | filter the current directory by name |
 
 Plain click or any arrow key collapses back to a single selection;
 marked rows show a check accent. A multi-selection is what a portal

@@ -19,7 +19,7 @@ use std::sync::{Arc, Mutex};
 use damascene_core::image::Image;
 use damascene_core::prelude::*;
 use damascene_core::scroll::{ScrollAlignment, ScrollRequest};
-use damascene_core::selection::Selection;
+use damascene_core::selection::{Selection, SelectionPoint, SelectionRange};
 use damascene_core::widgets::text_input::{self, TextInputOpts};
 use damascene_core::{BuildCx, EventCx, KeyChord, UiEvent, UiEventKind, UiKey};
 use lru::LruCache;
@@ -139,6 +139,7 @@ pub struct ExplorerApp {
     search: String,
     selection: Selection,
     show_search: bool,
+    focus_requests: Vec<String>,
     view: ViewMode,
     file_activation: FileActivation,
     /// Files activated under [`FileActivation::Collect`], drained by
@@ -208,6 +209,7 @@ impl ExplorerApp {
             search: String::new(),
             selection: Selection::default(),
             show_search: true,
+            focus_requests: Vec::new(),
             view: ViewMode::List,
             file_activation: FileActivation::SystemOpen,
             activated: Vec::new(),
@@ -552,6 +554,17 @@ impl ExplorerApp {
         }
         self.search = search;
         self.rebuild_visible_order();
+    }
+
+    fn focus_search(&mut self) {
+        if !self.show_search {
+            return;
+        }
+        self.selection.range = Some(SelectionRange {
+            anchor: SelectionPoint::new("browser-search", 0),
+            head: SelectionPoint::new("browser-search", self.search.len()),
+        });
+        self.focus_requests.push("browser-search".into());
     }
 
     fn toggle_view(&mut self) {
@@ -1370,6 +1383,7 @@ impl App for ExplorerApp {
             (KeyChord::vim('l'), "right".into()),
             (KeyChord::vim('g'), "view".into()),
             (KeyChord::vim('r'), "refresh".into()),
+            (KeyChord::ctrl('f'), "search".into()),
             (KeyChord::named(UiKey::Other("F5".into())), "refresh".into()),
             (KeyChord::vim('.'), "hidden".into()),
             (KeyChord::named(UiKey::Space), "mark".into()),
@@ -1511,6 +1525,8 @@ impl App for ExplorerApp {
             self.toggle_view();
         } else if event.is_hotkey("refresh") {
             self.refresh();
+        } else if event.is_hotkey("search") {
+            self.focus_search();
         } else if event.is_hotkey("first") {
             self.select_pos(0);
         } else if event.is_hotkey("last") {
@@ -1536,6 +1552,10 @@ impl App for ExplorerApp {
 
     fn selection(&self) -> Selection {
         self.selection.clone()
+    }
+
+    fn drain_focus_requests(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.focus_requests)
     }
 }
 
@@ -1887,6 +1907,23 @@ mod tests {
 
         app.set_search(String::new());
         assert_eq!(app.visible_names(), ["docs", "notes.txt", "photo.jxr"]);
+    }
+
+    #[test]
+    fn search_focus_request_selects_existing_query() {
+        let mut app = browse();
+        app.set_search("photo".into());
+
+        app.focus_search();
+
+        assert_eq!(app.drain_focus_requests(), ["browser-search"]);
+        assert_eq!(
+            app.selection.range,
+            Some(SelectionRange {
+                anchor: SelectionPoint::new("browser-search", 0),
+                head: SelectionPoint::new("browser-search", 5),
+            })
+        );
     }
 
     #[test]
