@@ -47,9 +47,9 @@ hard rule: **no filesystem call ever runs on the UI thread.**
   `claims(path)` runs on the UI thread from the file name alone (no
   IO); `load(path)` runs on a worker. Built-ins: color-managed images
   (achromat: JPEG XR, JXL, AVIF, EXR, Radiance, PNG, JPEG, WebP — full
-  CICP/ICC handling, HDR luminance anchoring), known text/code types,
-  and a sniffing fallback that separates unknown text from binary with
-  one bounded read.
+  CICP/ICC handling, HDR luminance anchoring), PDF metadata, video
+  container metadata, known text/code types, and a sniffing fallback
+  that separates unknown text from binary with one bounded read.
 - **`crates/explorer-thumbs`** — the on-disk thumbnail cache. Unlike
   the freedesktop spec's 8-bit sRGB PNGs, entries store linear-light
   f16 tagged with primaries and reference luminance, so an HDR
@@ -124,8 +124,8 @@ modality to the caller's window.
 ## Roadmap
 
 - Portal polish: a D-Bus-activatable zero-window service mode
-- More preview handlers (PDF, video, audio, archives, fonts); search;
-  file operations; syntax highlighting
+- Rich PDF/page rendering and video frame thumbnails; audio, archives,
+  fonts; file operations; syntax highlighting
 
 ## License
 

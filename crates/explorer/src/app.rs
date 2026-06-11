@@ -804,7 +804,7 @@ impl ExplorerApp {
                     .icon_size(tokens::ICON_SM)
                     .color(tokens::PRIMARY)
             } else {
-                icon(entry_icon(e.kind))
+                icon(entry_icon(e))
                     .icon_size(tokens::ICON_SM)
                     .color(tokens::MUTED_FOREGROUND)
             };
@@ -839,7 +839,8 @@ impl ExplorerApp {
             .radius(tokens::RADIUS_SM)
             .clip()
             .key(format!("row:{id}"))
-            .focusable();
+            .focusable()
+            .tooltip(entry_tooltip(e));
             if Some(id) == selected_id || is_marked {
                 r.current()
             } else {
@@ -916,7 +917,8 @@ impl ExplorerApp {
                 );
 
                 let name = e.display.clone();
-                let icon_name = entry_icon(e.kind);
+                let icon_name = entry_icon(e);
+                let preview_label = e.preview_kind.label();
                 let wants_thumb = e.is_image && e.kind != EntryKind::Dir;
                 let path = wants_thumb.then(|| dir.join(&e.name));
                 drop(entries);
@@ -984,7 +986,7 @@ impl ExplorerApp {
                     .clip()
                     .key(format!("row:{id}"))
                     .focusable()
-                    .tooltip(name);
+                    .tooltip(entry_tooltip_by_parts(&name, preview_label));
                 cells.push(if Some(id) == selected_id || is_marked {
                     cell.current()
                 } else {
@@ -1078,6 +1080,9 @@ impl ExplorerApp {
                             .gap(tokens::SPACE_2)
                             .width(Size::Fill(1.0))
                             .height(Size::Fill(1.0))
+                    }
+                    Preview::Details { icon, title, rows } => {
+                        details_preview_body(icon, title, rows)
                     }
                     Preview::Unsupported { reason } => preview_placeholder_body("file", reason),
                 },
@@ -1196,12 +1201,20 @@ pub(crate) fn scaffold(page: El) -> El {
     )
 }
 
-fn entry_icon(kind: EntryKind) -> &'static str {
-    match kind {
+fn entry_icon(entry: &Entry) -> &'static str {
+    match entry.kind {
         EntryKind::Dir => "folder",
-        EntryKind::File | EntryKind::Symlink => "file",
+        EntryKind::File | EntryKind::Symlink => entry.preview_kind.icon(),
         EntryKind::Other => "more-horizontal",
     }
+}
+
+fn entry_tooltip(entry: &Entry) -> String {
+    entry_tooltip_by_parts(&entry.display, entry.preview_kind.label())
+}
+
+fn entry_tooltip_by_parts(name: &str, kind: &str) -> String {
+    format!("{name} · {kind}")
 }
 
 /// Icon centered in a grid cell's media area (non-image entries, and
@@ -1267,6 +1280,29 @@ fn preview_placeholder_body(icon_name: &str, label: &str) -> El {
     .justify(Justify::Center)
     .width(Size::Fill(1.0))
     .height(Size::Fill(1.0))
+}
+
+fn details_preview_body(icon_name: &str, title: &str, rows: &[explorer_previews::DetailRow]) -> El {
+    let mut children = vec![
+        icon(icon_name)
+            .icon_size(40.0)
+            .color(tokens::MUTED_FOREGROUND),
+        text(title.to_string()).bold(),
+    ];
+    children.extend(rows.iter().map(|row| {
+        column([
+            text(row.label.clone()).caption().muted(),
+            text(row.value.clone()),
+        ])
+        .gap(tokens::SPACE_1)
+        .width(Size::Fill(1.0))
+    }));
+    column(children)
+        .gap(tokens::SPACE_3)
+        .align(Align::Center)
+        .justify(Justify::Center)
+        .width(Size::Fill(1.0))
+        .height(Size::Fill(1.0))
 }
 
 impl App for ExplorerApp {
@@ -1692,6 +1728,47 @@ pub(crate) mod fixtures {
             preview: Preview::Text {
                 text: "hello\nworld\n".into(),
                 truncated: true,
+            },
+        };
+        app
+    }
+
+    /// `report.pdf` selected with a structured metadata preview.
+    pub(crate) fn details_preview() -> ExplorerApp {
+        let mut app = browse();
+        app.listing.absorb(
+            ListingUpdate {
+                batch: vec![RawEntry {
+                    name: "report.pdf".into(),
+                    kind: EntryKind::File,
+                }],
+                done: true,
+                error: None,
+            },
+            false,
+            None,
+            None,
+        );
+        let id = select(&mut app, "report.pdf");
+        app.preview = PreviewState::Ready {
+            id,
+            preview: Preview::Details {
+                icon: "file-text",
+                title: "PDF document".into(),
+                rows: vec![
+                    explorer_previews::DetailRow {
+                        label: "Format".into(),
+                        value: "PDF 1.7".into(),
+                    },
+                    explorer_previews::DetailRow {
+                        label: "Pages".into(),
+                        value: "12".into(),
+                    },
+                    explorer_previews::DetailRow {
+                        label: "Preview".into(),
+                        value: "metadata only".into(),
+                    },
+                ],
             },
         };
         app

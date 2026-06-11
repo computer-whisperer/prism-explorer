@@ -16,7 +16,7 @@ use std::sync::{Arc, Mutex};
 use explorer_io::listing::ListingUpdate;
 use explorer_io::stat::EntryMeta;
 use explorer_io::{EntryKind, RawEntry};
-use explorer_previews::Preview;
+use explorer_previews::{preview_kind_for_path, Preview, PreviewKind};
 
 use crate::places::Place;
 
@@ -38,19 +38,21 @@ pub struct Entry {
     /// Name claims an image extension (cached: the grid asks every
     /// frame, and the answer can't change without a new listing).
     pub is_image: bool,
+    pub preview_kind: PreviewKind,
     pub meta: Option<EntryMeta>,
     pub meta_error: Option<String>,
 }
 
 impl Entry {
     fn from_raw(raw: RawEntry) -> Self {
-        use explorer_previews::{ImageHandler, PreviewHandler as _};
         let display = raw.name.to_string_lossy().into_owned();
+        let preview_kind =
+            preview_kind_for_path(std::path::Path::new(&raw.name), raw.kind == EntryKind::Dir);
         Entry {
             sort_key: display.to_lowercase(),
             display,
-            is_image: raw.kind != EntryKind::Dir
-                && ImageHandler.claims(std::path::Path::new(&raw.name)),
+            is_image: preview_kind == PreviewKind::Image,
+            preview_kind,
             name: raw.name,
             kind: raw.kind,
             is_symlink: raw.kind == EntryKind::Symlink,
@@ -138,6 +140,10 @@ impl Listing {
                 regrouped = entry.is_dir() != (meta.kind == EntryKind::Dir);
                 entry.kind = meta.kind;
                 entry.is_symlink = meta.is_symlink;
+                if entry.kind == EntryKind::Dir {
+                    entry.preview_kind = PreviewKind::Directory;
+                    entry.is_image = false;
+                }
                 entry.meta = Some(meta);
             }
             Err(e) => entry.meta_error = Some(e),

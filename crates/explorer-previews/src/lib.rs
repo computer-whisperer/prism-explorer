@@ -11,15 +11,20 @@
 //!   block as long as it likes.
 //!
 //! [`Registry::standard`] wires the built-ins: color-managed images
-//! via achromat, known text/code types, and a sniffing fallback that
-//! distinguishes unknown text from binary with a single bounded read.
+//! via achromat, PDF/video metadata, known text/code types, and a
+//! sniffing fallback that distinguishes unknown text from binary with
+//! a single bounded read.
 
+mod document;
 mod image;
+mod media;
 mod text;
 
 use std::path::Path;
 
+pub use document::PdfHandler;
 pub use image::ImageHandler;
+pub use media::VideoHandler;
 pub use text::{TextFallbackHandler, TextHandler};
 
 use achromat::convert::ImageMeta;
@@ -32,10 +37,23 @@ pub enum Preview {
     /// Text prefix of the file. `truncated` when the file goes on
     /// beyond what was read.
     Text { text: String, truncated: bool },
+    /// Structured metadata for recognized formats that are not yet
+    /// rendered inline.
+    Details {
+        icon: &'static str,
+        title: String,
+        rows: Vec<DetailRow>,
+    },
     /// Recognized but deliberately not previewed (binary data, …).
     /// Distinct from `load` returning `Err`, which means a preview was
     /// attempted and failed.
     Unsupported { reason: String },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DetailRow {
+    pub label: String,
+    pub value: String,
 }
 
 pub trait PreviewHandler: Send + Sync {
@@ -63,6 +81,8 @@ impl Registry {
         Registry {
             handlers: vec![
                 Box::new(ImageHandler),
+                Box::new(PdfHandler),
+                Box::new(VideoHandler),
                 Box::new(TextHandler),
                 Box::new(TextFallbackHandler),
             ],
@@ -86,6 +106,57 @@ impl Registry {
 /// Case-insensitive extension of `path`, if any.
 fn extension(path: &Path) -> Option<String> {
     path.extension().map(|e| e.to_string_lossy().to_lowercase())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PreviewKind {
+    Directory,
+    Image,
+    Pdf,
+    Video,
+    Text,
+    Other,
+}
+
+impl PreviewKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            PreviewKind::Directory => "directory",
+            PreviewKind::Image => "image",
+            PreviewKind::Pdf => "PDF document",
+            PreviewKind::Video => "video",
+            PreviewKind::Text => "text",
+            PreviewKind::Other => "file",
+        }
+    }
+
+    pub fn icon(self) -> &'static str {
+        match self {
+            PreviewKind::Directory => "folder",
+            PreviewKind::Image => "file-text",
+            PreviewKind::Pdf => "file-text",
+            PreviewKind::Video => "activity",
+            PreviewKind::Text => "file-text",
+            PreviewKind::Other => "file",
+        }
+    }
+}
+
+pub fn preview_kind_for_path(path: &Path, is_dir: bool) -> PreviewKind {
+    if is_dir {
+        return PreviewKind::Directory;
+    }
+    if ImageHandler.claims(path) {
+        PreviewKind::Image
+    } else if PdfHandler.claims(path) {
+        PreviewKind::Pdf
+    } else if VideoHandler.claims(path) {
+        PreviewKind::Video
+    } else if TextHandler.claims(path) {
+        PreviewKind::Text
+    } else {
+        PreviewKind::Other
+    }
 }
 
 #[cfg(test)]
@@ -134,6 +205,31 @@ mod tests {
                 assert!(!truncated);
             }
             _ => panic!("rust source should preview as text"),
+        }
+
+        let pdf_path = dir.join("doc.pdf");
+        std::fs::write(
+            &pdf_path,
+            b"%PDF-1.7\n1 0 obj << /Type /Pages /Count 1 >> endobj\n2 0 obj << /Type /Page /Parent 1 0 R >> endobj\n",
+        )
+        .unwrap();
+        match Registry::standard().load(&pdf_path).unwrap() {
+            Preview::Details { title, rows, .. } => {
+                assert_eq!(title, "PDF document");
+                assert!(rows.iter().any(|r| r.value == "PDF 1.7"));
+                assert!(rows.iter().any(|r| r.label == "Pages" && r.value == "1"));
+            }
+            _ => panic!("pdf should preview as details"),
+        }
+
+        let mp4_path = dir.join("clip.mp4");
+        std::fs::write(&mp4_path, b"\0\0\0\x18ftypisom\0\0\0\0").unwrap();
+        match Registry::standard().load(&mp4_path).unwrap() {
+            Preview::Details { title, rows, .. } => {
+                assert_eq!(title, "Video file");
+                assert!(rows.iter().any(|r| r.value == "ISO BMFF / MP4"));
+            }
+            _ => panic!("video should preview as details"),
         }
 
         let bin_path = dir.join("blob.dat");

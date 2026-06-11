@@ -42,6 +42,7 @@ pub fn scenes() -> Vec<Scene> {
     vec![
         scene("browse", BROWSER, app::fixtures::browse()),
         scene("text_preview", BROWSER, app::fixtures::text_preview()),
+        scene("details_preview", BROWSER, app::fixtures::details_preview()),
         scene("multiselect", BROWSER, multiselect()),
         scene("grid", BROWSER, app::fixtures::grid()),
         scene("listing_error", BROWSER, app::fixtures::listing_error()),
