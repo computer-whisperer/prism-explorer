@@ -22,6 +22,7 @@ use damascene_core::scroll::{ScrollAlignment, ScrollRequest};
 use damascene_core::selection::{Selection, SelectionPoint, SelectionRange};
 use damascene_core::surface::SurfaceAlpha;
 use damascene_core::widgets::resize_handle::HANDLE_THICKNESS;
+use damascene_core::widgets::select::{self, select_menu, select_trigger};
 use damascene_core::widgets::tabs::{self, tabs_list};
 use damascene_core::widgets::text_input::{self, TextInputOpts};
 use damascene_core::{BuildCx, EventCx, KeyChord, Rect, UiEvent, UiEventKind, UiKey};
@@ -33,7 +34,10 @@ use explorer_thumbs::ThumbCache;
 
 use crate::binary_surface::{BinarySurface, BinarySurfaceMetrics};
 use crate::fmt;
-use crate::model::{Entry, EntryId, FileFilter, Listing, Msg, PreviewPayload, ThumbResult};
+use crate::model::{
+    parse_sort_mode, Entry, EntryId, FileFilter, Listing, Msg, PreviewPayload, SortMode,
+    ThumbResult,
+};
 use crate::places::Place;
 use crate::preview_policy::{grid_thumbnail_policy, GridThumbPolicy};
 
@@ -61,6 +65,7 @@ const RAM_THUMBS: usize = 512;
 /// Display cap for text previews — the handler already bounds the read
 /// at 128 KiB; this bounds what one mono text leaf has to lay out.
 const TEXT_PREVIEW_MAX_LINES: usize = 400;
+const SORT_STAT_BATCH: usize = 512;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ViewMode {
@@ -282,6 +287,8 @@ pub struct ExplorerApp {
     search: String,
     selection: Selection,
     show_search: bool,
+    sort: SortMode,
+    sort_open: bool,
     focus_requests: Vec<String>,
     view: ViewMode,
     file_activation: FileActivation,
@@ -354,6 +361,8 @@ impl ExplorerApp {
             search: String::new(),
             selection: Selection::default(),
             show_search: true,
+            sort: SortMode::default(),
+            sort_open: false,
             focus_requests: Vec::new(),
             view: ViewMode::List,
             file_activation: FileActivation::SystemOpen,
@@ -492,6 +501,7 @@ impl ExplorerApp {
             self.show_hidden,
             self.file_filter.as_ref(),
             search.as_deref(),
+            self.sort,
         );
         self.remap_selection();
     }
@@ -687,6 +697,62 @@ impl ExplorerApp {
         self.rebuild_visible_order();
     }
 
+    fn set_sort_mode(&mut self, sort: SortMode) {
+        if self.sort == sort {
+            return;
+        }
+        self.sort = sort;
+        self.rebuild_visible_order();
+        self.keep_selection_visible();
+        self.request_missing_stats_for_sort();
+    }
+
+    fn keep_selection_visible(&self) {
+        if let Some((_, pos)) = self.selected {
+            self.scroll_requests.borrow_mut().push(ScrollRequest::new(
+                self.scroll_key(),
+                self.scroll_line_of(pos),
+                ScrollAlignment::Visible,
+            ));
+        }
+    }
+
+    fn request_missing_stats_for_sort(&mut self) {
+        if !self.sort.uses_meta() {
+            return;
+        }
+        let generation = self.listing.generation;
+        let jobs = {
+            let entries = self.listing.entries.lock().unwrap();
+            let mut requested = self.stat_requested.lock().unwrap();
+            let mut jobs = Vec::new();
+            for &id in self.listing.order.iter() {
+                if jobs.len() >= SORT_STAT_BATCH {
+                    break;
+                }
+                let Some(e) = entries.get(id as usize) else {
+                    continue;
+                };
+                if e.meta.is_some() || e.meta_error.is_some() || !requested.insert(id) {
+                    continue;
+                }
+                jobs.push((id, self.cwd.join(&e.name)));
+            }
+            jobs
+        };
+        for (id, path) in jobs {
+            submit_stat_job(
+                id,
+                path,
+                generation,
+                Tier::Sweep,
+                &self.pool,
+                &self.tx,
+                &self.notifier,
+            );
+        }
+    }
+
     /// Visible (ordered) entry names — what a row-by-row reading of
     /// the list view would show.
     #[cfg(test)]
@@ -857,6 +923,9 @@ impl ExplorerApp {
             tools.push(self.search_el());
         }
         tools.extend([
+            select_trigger("browser-sort", self.sort.label())
+                .width(Size::Fixed(128.0))
+                .tooltip("sort order"),
             icon_button(view_icon).key("view-toggle").tooltip(view_tip),
             color_mode_badge(cx),
         ]);
@@ -1379,10 +1448,17 @@ impl ExplorerApp {
             .width(Size::Fill(1.0))
             .height(Size::Fill(1.0));
 
-        column([self.toolbar_el(cx), content, self.status_el()])
+        let page = column([self.toolbar_el(cx), content, self.status_el()])
             .gap(tokens::SPACE_3)
             .width(Size::Fill(1.0))
-            .height(Size::Fill(1.0))
+            .height(Size::Fill(1.0));
+        if self.sort_open {
+            stack([page, select_menu("browser-sort", sort_options())])
+                .width(Size::Fill(1.0))
+                .height(Size::Fill(1.0))
+        } else {
+            page
+        }
     }
 
     fn status_el(&self) -> El {
@@ -1480,9 +1556,21 @@ fn maybe_request_stat(
         return;
     }
     let path = dir.join(&e.name);
+    submit_stat_job(id, path, generation, Tier::Visible, pool, tx, notify);
+}
+
+fn submit_stat_job(
+    id: EntryId,
+    path: PathBuf,
+    generation: u64,
+    tier: Tier,
+    pool: &Pool,
+    tx: &Sender<Msg>,
+    notify: &Notifier,
+) {
     let tx = tx.clone();
     let notify = notify.clone();
-    pool.submit(Tier::Visible, move || {
+    pool.submit(tier, move || {
         let result = stat::stat_entry(&path);
         let _ = tx.send(Msg::Stat {
             generation,
@@ -1691,6 +1779,21 @@ fn percent(value: f32) -> String {
     format!("{:.0}%", value * 100.0)
 }
 
+fn sort_options() -> Vec<(String, String)> {
+    [
+        SortMode::NameAsc,
+        SortMode::NameDesc,
+        SortMode::TypeAsc,
+        SortMode::ModifiedDesc,
+        SortMode::ModifiedAsc,
+        SortMode::SizeDesc,
+        SortMode::SizeAsc,
+    ]
+    .into_iter()
+    .map(|mode| (mode.to_string(), mode.label().to_string()))
+    .collect()
+}
+
 fn byte_color(byte: u8) -> Color {
     let v = byte as f32 / 255.0;
     match byte {
@@ -1717,6 +1820,7 @@ impl App for ExplorerApp {
                         self.show_hidden,
                         self.file_filter.as_ref(),
                         search.as_deref(),
+                        self.sort,
                     ) {
                         self.remap_selection();
                     }
@@ -1744,6 +1848,7 @@ impl App for ExplorerApp {
                         self.show_hidden,
                         self.file_filter.as_ref(),
                         search.as_deref(),
+                        self.sort,
                     ) {
                         self.remap_selection();
                     }
@@ -1797,6 +1902,7 @@ impl App for ExplorerApp {
                 Msg::OpenLocation { dir, select } => self.navigate(dir, select),
             }
         }
+        self.request_missing_stats_for_sort();
     }
 
     fn build(&self, cx: &BuildCx) -> El {
@@ -1850,6 +1956,15 @@ impl App for ExplorerApp {
             "preview-mode",
             parse_preview_mode,
         ) {
+            return;
+        }
+        let mut sort = self.sort;
+        let mut sort_open = self.sort_open;
+        if select::apply_event(&mut sort, &mut sort_open, &event, "browser-sort", |s| {
+            parse_sort_mode(&s)
+        }) {
+            self.sort_open = sort_open;
+            self.set_sort_mode(sort);
             return;
         }
 
@@ -2180,6 +2295,7 @@ pub(crate) mod fixtures {
             false,
             None,
             None,
+            app.sort,
         );
         stat_file(&mut app, "notes.txt", 12);
         stat_file(&mut app, "photo.jxr", 1024);
@@ -2217,6 +2333,7 @@ pub(crate) mod fixtures {
             false,
             None,
             None,
+            app.sort,
         );
         let id = select(&mut app, "report.pdf");
         let raw_bytes = b"%PDF-1.7\n1 0 obj\n".to_vec();
@@ -2264,6 +2381,7 @@ pub(crate) mod fixtures {
             false,
             None,
             None,
+            app.sort,
         );
         let id = select(&mut app, "firmware.bin");
         let mut bytes = Vec::new();
@@ -2329,6 +2447,7 @@ pub(crate) mod fixtures {
             false,
             None,
             None,
+            app.sort,
         );
         stat_file(&mut app, "pending.png", 1024);
         stat_file(&mut app, "broken.avif", 1024);
@@ -2365,6 +2484,7 @@ pub(crate) mod fixtures {
             false,
             None,
             None,
+            app.sort,
         );
     }
 
@@ -2477,6 +2597,24 @@ mod tests {
         }
     }
 
+    #[test]
+    fn sort_selector_changes_order() {
+        let mut app = browse();
+        let cx = EventCx::new();
+
+        app.on_event(UiEvent::synthetic_click("browser-sort"), &cx);
+        assert!(app.sort_open);
+
+        app.on_event(
+            UiEvent::synthetic_click("browser-sort:option:size-desc"),
+            &cx,
+        );
+
+        assert_eq!(app.sort, SortMode::SizeDesc);
+        assert!(!app.sort_open);
+        assert_eq!(app.visible_names(), ["docs", "photo.jxr", "notes.txt"]);
+    }
+
     fn id_of(app: &ExplorerApp, name: &str) -> EntryId {
         app.listing.id_by_name(std::ffi::OsStr::new(name)).unwrap()
     }
@@ -2574,6 +2712,7 @@ mod tests {
             false,
             None,
             None,
+            app.sort,
         );
         app.remap_selection();
 

@@ -25,6 +25,66 @@ use crate::places::Place;
 /// in-flight stat/preview results stay attached to the right file.
 pub type EntryId = u32;
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SortMode {
+    #[default]
+    NameAsc,
+    NameDesc,
+    TypeAsc,
+    ModifiedDesc,
+    ModifiedAsc,
+    SizeDesc,
+    SizeAsc,
+}
+
+impl SortMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            SortMode::NameAsc => "Name A-Z",
+            SortMode::NameDesc => "Name Z-A",
+            SortMode::TypeAsc => "Type",
+            SortMode::ModifiedDesc => "Modified newest",
+            SortMode::ModifiedAsc => "Modified oldest",
+            SortMode::SizeDesc => "Size largest",
+            SortMode::SizeAsc => "Size smallest",
+        }
+    }
+
+    pub fn uses_meta(self) -> bool {
+        matches!(
+            self,
+            SortMode::ModifiedDesc | SortMode::ModifiedAsc | SortMode::SizeDesc | SortMode::SizeAsc
+        )
+    }
+}
+
+impl std::fmt::Display for SortMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            SortMode::NameAsc => "name-asc",
+            SortMode::NameDesc => "name-desc",
+            SortMode::TypeAsc => "type-asc",
+            SortMode::ModifiedDesc => "modified-desc",
+            SortMode::ModifiedAsc => "modified-asc",
+            SortMode::SizeDesc => "size-desc",
+            SortMode::SizeAsc => "size-asc",
+        })
+    }
+}
+
+pub fn parse_sort_mode(value: &str) -> Option<SortMode> {
+    match value {
+        "name-asc" => Some(SortMode::NameAsc),
+        "name-desc" => Some(SortMode::NameDesc),
+        "type-asc" => Some(SortMode::TypeAsc),
+        "modified-desc" => Some(SortMode::ModifiedDesc),
+        "modified-asc" => Some(SortMode::ModifiedAsc),
+        "size-desc" => Some(SortMode::SizeDesc),
+        "size-asc" => Some(SortMode::SizeAsc),
+        _ => None,
+    }
+}
+
 pub struct Entry {
     pub name: OsString,
     /// Lossy display name, cached (rows render every frame).
@@ -104,6 +164,7 @@ impl Listing {
         show_hidden: bool,
         filter: Option<&FileFilter>,
         search: Option<&str>,
+        sort: SortMode,
     ) -> bool {
         if let Some(e) = update.error {
             self.error = Some(e);
@@ -116,7 +177,7 @@ impl Listing {
             .lock()
             .unwrap()
             .extend(update.batch.into_iter().map(Entry::from_raw));
-        self.rebuild_order(show_hidden, filter, search);
+        self.rebuild_order(show_hidden, filter, search, sort);
         true
     }
 
@@ -129,6 +190,7 @@ impl Listing {
         show_hidden: bool,
         filter: Option<&FileFilter>,
         search: Option<&str>,
+        sort: SortMode,
     ) -> bool {
         let mut entries = self.entries.lock().unwrap();
         let Some(entry) = entries.get_mut(id as usize) else {
@@ -149,10 +211,12 @@ impl Listing {
             Err(e) => entry.meta_error = Some(e),
         }
         drop(entries);
-        if regrouped {
-            self.rebuild_order(show_hidden, filter, search);
+        if regrouped || sort.uses_meta() {
+            self.rebuild_order(show_hidden, filter, search, sort);
+            true
+        } else {
+            false
         }
-        regrouped
     }
 
     /// Recompute `order`: hidden + type filters, directories first,
@@ -164,6 +228,7 @@ impl Listing {
         show_hidden: bool,
         filter: Option<&FileFilter>,
         search: Option<&str>,
+        sort: SortMode,
     ) {
         let entries = self.entries.lock().unwrap();
         let search = search
@@ -178,13 +243,7 @@ impl Listing {
                     && (e.is_dir() || filter.is_none_or(|f| f.matches(&e.display)))
             })
             .collect();
-        order.sort_by(|&a, &b| {
-            let (ea, eb) = (&entries[a as usize], &entries[b as usize]);
-            eb.is_dir()
-                .cmp(&ea.is_dir())
-                .then_with(|| ea.sort_key.cmp(&eb.sort_key))
-                .then_with(|| ea.name.cmp(&eb.name))
-        });
+        order.sort_by(|&a, &b| compare_entries(&entries[a as usize], &entries[b as usize], sort));
         drop(entries);
         self.order = Arc::new(order);
     }
@@ -212,6 +271,51 @@ impl Listing {
     pub fn path_of(&self, id: EntryId) -> PathBuf {
         let entries = self.entries.lock().unwrap();
         self.dir.join(&entries[id as usize].name)
+    }
+}
+
+fn compare_entries(a: &Entry, b: &Entry, sort: SortMode) -> std::cmp::Ordering {
+    use std::cmp::Reverse;
+
+    let directory_group = b.is_dir().cmp(&a.is_dir());
+    if directory_group != std::cmp::Ordering::Equal {
+        return directory_group;
+    }
+
+    let primary = match sort {
+        SortMode::NameAsc => a.sort_key.cmp(&b.sort_key),
+        SortMode::NameDesc => b.sort_key.cmp(&a.sort_key),
+        SortMode::TypeAsc => a
+            .preview_kind
+            .label()
+            .cmp(b.preview_kind.label())
+            .then_with(|| a.sort_key.cmp(&b.sort_key)),
+        SortMode::ModifiedDesc => known_first(
+            a.meta.and_then(|m| m.modified).map(Reverse),
+            b.meta.and_then(|m| m.modified).map(Reverse),
+        ),
+        SortMode::ModifiedAsc => known_first(
+            a.meta.and_then(|m| m.modified),
+            b.meta.and_then(|m| m.modified),
+        ),
+        SortMode::SizeDesc => known_first(
+            a.meta.map(|m| Reverse(m.size)),
+            b.meta.map(|m| Reverse(m.size)),
+        ),
+        SortMode::SizeAsc => known_first(a.meta.map(|m| m.size), b.meta.map(|m| m.size)),
+    };
+
+    primary
+        .then_with(|| a.sort_key.cmp(&b.sort_key))
+        .then_with(|| a.name.cmp(&b.name))
+}
+
+fn known_first<T: Ord>(a: Option<T>, b: Option<T>) -> std::cmp::Ordering {
+    match (a, b) {
+        (Some(a), Some(b)) => a.cmp(&b),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => std::cmp::Ordering::Equal,
     }
 }
 
@@ -361,6 +465,7 @@ mod tests {
             false,
             None,
             None,
+            SortMode::NameAsc,
         );
         assert_eq!(ordered_names(&l), ["Apps", "zebra.txt"]);
 
@@ -374,13 +479,14 @@ mod tests {
             false,
             None,
             None,
+            SortMode::NameAsc,
         );
         assert_eq!(ordered_names(&l), ["Apps", "Zoo", "banana", "zebra.txt"]);
         assert!(l.complete);
         assert_eq!(l.id_by_name(OsStr::new("zebra.txt")), Some(zebra));
 
         // Hidden toggle re-admits dotfiles.
-        l.rebuild_order(true, None, None);
+        l.rebuild_order(true, None, None, SortMode::NameAsc);
         assert_eq!(
             ordered_names(&l),
             ["Apps", "Zoo", ".hidden", "banana", "zebra.txt"]
@@ -439,16 +545,17 @@ mod tests {
             false,
             None,
             None,
+            SortMode::NameAsc,
         );
         let images = FileFilter {
             name: "Images".into(),
             globs: vec!["*.png".into()],
             mimes: vec![],
         };
-        l.rebuild_order(false, Some(&images), None);
+        l.rebuild_order(false, Some(&images), None, SortMode::NameAsc);
         assert_eq!(ordered_names(&l), ["docs", "shot.png"]);
         // Dropping the filter restores everything.
-        l.rebuild_order(false, None, None);
+        l.rebuild_order(false, None, None, SortMode::NameAsc);
         assert_eq!(ordered_names(&l), ["docs", "notes.txt", "shot.png"]);
     }
 
@@ -468,9 +575,10 @@ mod tests {
             false,
             None,
             None,
+            SortMode::NameAsc,
         );
 
-        l.rebuild_order(false, None, Some("O"));
+        l.rebuild_order(false, None, Some("O"), SortMode::NameAsc);
         assert_eq!(ordered_names(&l), ["Docs", "notes.txt", "shot.png"]);
 
         let images = FileFilter {
@@ -478,7 +586,7 @@ mod tests {
             globs: vec!["*.png".into()],
             mimes: vec![],
         };
-        l.rebuild_order(false, Some(&images), Some("shot"));
+        l.rebuild_order(false, Some(&images), Some("shot"), SortMode::NameAsc);
         assert_eq!(ordered_names(&l), ["shot.png"]);
     }
 
@@ -493,6 +601,7 @@ mod tests {
             false,
             None,
             None,
+            SortMode::NameAsc,
         );
         assert_eq!(ordered_names(&l), ["alpha", "link"]);
 
@@ -508,6 +617,7 @@ mod tests {
             false,
             None,
             None,
+            SortMode::NameAsc,
         );
         assert!(regrouped);
         // Still dirs-first, now sorted among them.
@@ -515,5 +625,65 @@ mod tests {
         let entries = l.entries.lock().unwrap();
         assert!(entries[id as usize].is_dir());
         assert!(entries[id as usize].is_symlink);
+    }
+
+    #[test]
+    fn rebuild_order_sorts_by_type_and_metadata() {
+        let mut l = Listing::new("/test".into(), 0);
+        l.absorb(
+            update(
+                &[
+                    ("docs", EntryKind::Dir),
+                    ("zeta.bin", EntryKind::File),
+                    ("alpha.txt", EntryKind::File),
+                    ("photo.png", EntryKind::File),
+                ],
+                true,
+            ),
+            false,
+            None,
+            None,
+            SortMode::NameAsc,
+        );
+
+        l.rebuild_order(false, None, None, SortMode::TypeAsc);
+        assert_eq!(
+            ordered_names(&l),
+            ["docs", "zeta.bin", "photo.png", "alpha.txt"]
+        );
+
+        let zeta = l.id_by_name(OsStr::new("zeta.bin")).unwrap();
+        let alpha = l.id_by_name(OsStr::new("alpha.txt")).unwrap();
+        l.apply_stat(
+            zeta,
+            Ok(EntryMeta {
+                size: 10,
+                modified: None,
+                kind: EntryKind::File,
+                is_symlink: false,
+            }),
+            false,
+            None,
+            None,
+            SortMode::SizeDesc,
+        );
+        l.apply_stat(
+            alpha,
+            Ok(EntryMeta {
+                size: 20,
+                modified: None,
+                kind: EntryKind::File,
+                is_symlink: false,
+            }),
+            false,
+            None,
+            None,
+            SortMode::SizeDesc,
+        );
+
+        assert_eq!(
+            ordered_names(&l),
+            ["docs", "alpha.txt", "zeta.bin", "photo.png"]
+        );
     }
 }
