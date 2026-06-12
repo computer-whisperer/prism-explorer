@@ -223,16 +223,13 @@ fn browser_chrome_widths(
     let chrome = content_chrome_x(show_sidebar, show_preview);
     if let Some(width) = &mut preview_w {
         let sidebar = sidebar_w.unwrap_or(0.0);
-        let max = (viewport_w - chrome - sidebar - LISTING_MIN)
-            .min(PREVIEW_MAX)
-            .max(PREVIEW_ABSOLUTE_MIN);
+        let max =
+            (viewport_w - chrome - sidebar - LISTING_MIN).clamp(PREVIEW_ABSOLUTE_MIN, PREVIEW_MAX);
         *width = (*width).min(max);
     }
     if let Some(width) = &mut sidebar_w {
         let preview = preview_w.unwrap_or(0.0);
-        let max = (viewport_w - chrome - preview - LISTING_MIN)
-            .min(SIDEBAR_MAX)
-            .max(SIDEBAR_MIN);
+        let max = (viewport_w - chrome - preview - LISTING_MIN).clamp(SIDEBAR_MIN, SIDEBAR_MAX);
         *width = (*width).min(max);
     }
 
@@ -1306,7 +1303,7 @@ impl ExplorerApp {
                 },
             },
             PreviewMode::Binary => {
-                let binary = raw.map(|raw| &raw.binary).or_else(|| match preview {
+                let binary = raw.map(|raw| &raw.binary).or(match preview {
                     Ok(Preview::Binary(binary)) => Some(binary),
                     _ => None,
                 });
