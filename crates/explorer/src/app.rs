@@ -42,14 +42,8 @@ const SIDEBAR_MIN: f32 = 160.0;
 const SIDEBAR_MAX: f32 = 420.0;
 const PREVIEW_MIN: f32 = 260.0;
 const PREVIEW_MAX: f32 = 900.0;
-const PREVIEW_COMPACT_MIN: f32 = 180.0;
 const PREVIEW_ABSOLUTE_MIN: f32 = 160.0;
 const LISTING_MIN: f32 = 280.0;
-
-// Horizontal chrome outside the three content panes: scaffold padding,
-// the four row gaps, and the two resize handles.
-const CONTENT_CHROME_X: f32 =
-    2.0 * tokens::SPACE_4 + 4.0 * tokens::SPACE_2 + 2.0 * HANDLE_THICKNESS;
 
 // Grid view geometry. Cells are media (thumbnail or icon) over a name
 // caption; the virtual list row height bakes the gap in, which also
@@ -76,8 +70,8 @@ enum ViewMode {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct BrowserChrome {
-    sidebar_w: f32,
-    preview_w: f32,
+    sidebar_w: Option<f32>,
+    preview_w: Option<f32>,
 }
 
 /// Decoded thumbnails plus request bookkeeping. Shared with the grid's
@@ -199,38 +193,75 @@ fn browser_chrome_widths(
     viewport_w: f32,
     requested_sidebar_w: f32,
     requested_preview_w: f32,
-    preview_min_w: f32,
+    wants_preview: bool,
 ) -> BrowserChrome {
-    let usable_w = (viewport_w - CONTENT_CHROME_X).max(0.0);
-    let mut sidebar_w = requested_sidebar_w.clamp(SIDEBAR_MIN, SIDEBAR_MAX);
-    let mut preview_w = requested_preview_w.clamp(preview_min_w, PREVIEW_MAX);
+    let mut show_sidebar = true;
+    let mut show_preview = wants_preview;
 
-    let mut over = sidebar_w + preview_w + LISTING_MIN - usable_w;
-    if over <= 0.0 {
-        return BrowserChrome {
-            sidebar_w,
-            preview_w,
-        };
+    if show_sidebar
+        && show_preview
+        && !browser_layout_fits(viewport_w, Some(SIDEBAR_MIN), Some(PREVIEW_MIN))
+    {
+        show_sidebar = false;
+    }
+    if show_sidebar && !show_preview && !browser_layout_fits(viewport_w, Some(SIDEBAR_MIN), None) {
+        show_sidebar = false;
+    }
+    if show_preview
+        && !browser_layout_fits(
+            viewport_w,
+            show_sidebar.then_some(SIDEBAR_MIN),
+            Some(PREVIEW_ABSOLUTE_MIN),
+        )
+    {
+        show_preview = false;
     }
 
-    let preview_floor = preview_min_w.max(PREVIEW_ABSOLUTE_MIN);
-    let shrink = (preview_w - preview_floor).min(over).max(0.0);
-    preview_w -= shrink;
-    over -= shrink;
+    let mut sidebar_w = show_sidebar.then(|| requested_sidebar_w.clamp(SIDEBAR_MIN, SIDEBAR_MAX));
+    let mut preview_w = show_preview.then(|| requested_preview_w.clamp(PREVIEW_MIN, PREVIEW_MAX));
 
-    let shrink = (sidebar_w - SIDEBAR_MIN).min(over).max(0.0);
-    sidebar_w -= shrink;
-    over -= shrink;
-
-    // On very narrow windows, keep the listing usable even if that
-    // means dipping below the normal preview floor.
-    let shrink = (preview_w - PREVIEW_ABSOLUTE_MIN).min(over).max(0.0);
-    preview_w -= shrink;
+    let chrome = content_chrome_x(show_sidebar, show_preview);
+    if let Some(width) = &mut preview_w {
+        let sidebar = sidebar_w.unwrap_or(0.0);
+        let max = (viewport_w - chrome - sidebar - LISTING_MIN)
+            .min(PREVIEW_MAX)
+            .max(PREVIEW_ABSOLUTE_MIN);
+        *width = (*width).min(max);
+    }
+    if let Some(width) = &mut sidebar_w {
+        let preview = preview_w.unwrap_or(0.0);
+        let max = (viewport_w - chrome - preview - LISTING_MIN)
+            .min(SIDEBAR_MAX)
+            .max(SIDEBAR_MIN);
+        *width = (*width).min(max);
+    }
 
     BrowserChrome {
         sidebar_w,
         preview_w,
     }
+}
+
+fn browser_layout_fits(viewport_w: f32, sidebar_w: Option<f32>, preview_w: Option<f32>) -> bool {
+    viewport_w
+        >= content_chrome_x(sidebar_w.is_some(), preview_w.is_some())
+            + sidebar_w.unwrap_or(0.0)
+            + preview_w.unwrap_or(0.0)
+            + LISTING_MIN
+}
+
+fn content_chrome_x(show_sidebar: bool, show_preview: bool) -> f32 {
+    let handles = show_sidebar as usize + show_preview as usize;
+    let children = 1 + handles * 2;
+    let gaps = children.saturating_sub(1);
+    2.0 * tokens::SPACE_4 + gaps as f32 * tokens::SPACE_2 + handles as f32 * HANDLE_THICKNESS
+}
+
+fn listing_available_w(viewport_w: f32, chrome: BrowserChrome) -> f32 {
+    viewport_w
+        - content_chrome_x(chrome.sidebar_w.is_some(), chrome.preview_w.is_some())
+        - chrome.sidebar_w.unwrap_or(0.0)
+        - chrome.preview_w.unwrap_or(0.0)
 }
 
 pub struct ExplorerApp {
@@ -355,23 +386,20 @@ impl ExplorerApp {
     }
 
     fn browser_chrome(&self, viewport_w: f32) -> BrowserChrome {
-        let preview_min = if self.preview_is_placeholder() {
-            PREVIEW_COMPACT_MIN
-        } else {
-            PREVIEW_MIN
-        };
-        browser_chrome_widths(viewport_w, self.sidebar_w, self.preview_w, preview_min)
+        browser_chrome_widths(
+            viewport_w,
+            self.sidebar_w,
+            self.preview_w,
+            self.has_selected_file(),
+        )
     }
 
-    fn preview_is_placeholder(&self) -> bool {
+    fn has_selected_file(&self) -> bool {
         let Some((id, _)) = self.selected else {
-            return true;
+            return false;
         };
         let entries = self.listing.entries.lock().unwrap();
-        if entries.get(id as usize).is_none_or(Entry::is_dir) {
-            return true;
-        }
-        matches!(self.preview, PreviewState::Empty)
+        entries.get(id as usize).is_some_and(|e| !e.is_dir())
     }
 
     /// One-shot at startup, on a detached thread rather than the pool:
@@ -1008,17 +1036,12 @@ impl ExplorerApp {
             return placeholder;
         }
 
-        // Width available to tiles: viewport minus sidebar, preview
-        // pane, page padding, panel gaps, and slack for card padding,
-        // strokes, resize handles, and the scrollbar gutter. Erring
-        // low costs at most one column; erring high overflows the row.
+        // Width available to tiles: center pane width minus slack for
+        // card padding, strokes, resize handles, and the scrollbar
+        // gutter. Erring low costs at most one column; erring high
+        // overflows the row.
         let vw = cx.viewport_width().unwrap_or(1280.0);
-        let avail = vw
-            - chrome.sidebar_w
-            - chrome.preview_w
-            - 2.0 * tokens::SPACE_4
-            - 4.0 * tokens::SPACE_2
-            - 24.0;
+        let avail = listing_available_w(vw, chrome) - 24.0;
         let cols = (((avail + TILE_GAP) / (TILE_W + TILE_GAP)) as usize).max(1);
         self.cols.set(cols);
         let count = self.listing.order.len();
@@ -1340,18 +1363,24 @@ impl ExplorerApp {
             ViewMode::List => self.list_el(),
             ViewMode::Grid => self.grid_el(cx, chrome),
         };
-        let content = row([
-            self.sidebar_el(chrome.sidebar_w),
-            resize_handle("sidebar-resize", Axis::Row),
+        let mut panes = Vec::new();
+        if let Some(sidebar_w) = chrome.sidebar_w {
+            panes.push(self.sidebar_el(sidebar_w));
+            panes.push(resize_handle("sidebar-resize", Axis::Row));
+        }
+        panes.push(
             card([center.padding(tokens::SPACE_2)])
                 .width(Size::Fill(1.0))
                 .height(Size::Fill(1.0)),
-            resize_handle("preview-resize", Axis::Row),
-            self.preview_pane(chrome.preview_w),
-        ])
-        .gap(tokens::SPACE_2)
-        .width(Size::Fill(1.0))
-        .height(Size::Fill(1.0));
+        );
+        if let Some(preview_w) = chrome.preview_w {
+            panes.push(resize_handle("preview-resize", Axis::Row));
+            panes.push(self.preview_pane(preview_w));
+        }
+        let content = row(panes)
+            .gap(tokens::SPACE_2)
+            .width(Size::Fill(1.0))
+            .height(Size::Fill(1.0));
 
         column([self.toolbar_el(cx), content, self.status_el()])
             .gap(tokens::SPACE_3)
@@ -2012,7 +2041,9 @@ impl crate::host::HostApp for ExplorerApp {
         let Some(binary) = binary else {
             return;
         };
-        let preview_w = self.browser_chrome(viewport.w).preview_w;
+        let Some(preview_w) = self.browser_chrome(viewport.w).preview_w else {
+            return;
+        };
         let Some(surface) = &mut self.binary_surface else {
             return;
         };
@@ -2386,26 +2417,43 @@ mod tests {
     }
 
     #[test]
-    fn half_width_browser_reserves_listing_space() {
-        let chrome = browser_chrome_widths(750.0, 220.0, 420.0, PREVIEW_COMPACT_MIN);
-        let listing_w = 750.0 - CONTENT_CHROME_X - chrome.sidebar_w - chrome.preview_w;
+    fn half_width_without_file_drops_preview_pane() {
+        let chrome = browser_chrome_widths(750.0, 220.0, 420.0, false);
+        assert_eq!(chrome.sidebar_w, Some(220.0));
+        assert_eq!(chrome.preview_w, None);
+        let listing_w = listing_available_w(750.0, chrome);
         assert!(
             listing_w >= LISTING_MIN,
             "listing should stay first-class at half width, got {listing_w}"
         );
+    }
+
+    #[test]
+    fn half_width_with_file_drops_places_sidebar() {
+        let chrome = browser_chrome_widths(750.0, 220.0, 420.0, true);
+        assert_eq!(chrome.sidebar_w, None);
+        assert!(chrome.preview_w.is_some());
+        let listing_w = listing_available_w(750.0, chrome);
         assert!(
-            chrome.preview_w < 0.3 * 750.0,
-            "empty preview should be compact at half width"
+            listing_w >= LISTING_MIN,
+            "listing should stay first-class beside a preview, got {listing_w}"
         );
     }
 
     #[test]
-    fn full_width_browser_keeps_requested_chrome() {
+    fn full_width_browser_keeps_requested_visible_chrome() {
         assert_eq!(
-            browser_chrome_widths(1500.0, 220.0, 420.0, PREVIEW_COMPACT_MIN),
+            browser_chrome_widths(1500.0, 220.0, 420.0, true),
             BrowserChrome {
-                sidebar_w: 220.0,
-                preview_w: 420.0,
+                sidebar_w: Some(220.0),
+                preview_w: Some(420.0),
+            }
+        );
+        assert_eq!(
+            browser_chrome_widths(1500.0, 220.0, 420.0, false),
+            BrowserChrome {
+                sidebar_w: Some(220.0),
+                preview_w: None,
             }
         );
     }
