@@ -21,6 +21,8 @@ use damascene_core::prelude::*;
 use damascene_core::scroll::{ScrollAlignment, ScrollRequest};
 use damascene_core::selection::{Selection, SelectionPoint, SelectionRange};
 use damascene_core::surface::SurfaceAlpha;
+use damascene_core::widgets::dialog::{dialog, dialog_footer, dialog_header, dialog_title};
+use damascene_core::widgets::popover::{context_menu, menu_item};
 use damascene_core::widgets::resize_handle::HANDLE_THICKNESS;
 use damascene_core::widgets::select::{self, select_menu, select_trigger};
 use damascene_core::widgets::tabs::{self, tabs_list};
@@ -67,7 +69,7 @@ const RAM_THUMBS: usize = 512;
 const TEXT_PREVIEW_MAX_LINES: usize = 400;
 const SORT_STAT_BATCH: usize = 512;
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum ViewMode {
     List,
     Grid,
@@ -336,6 +338,25 @@ pub struct ExplorerApp {
     sidebar_drag: ResizeDrag,
     preview_drag: ResizeDrag,
     binary_surface: Option<BinarySurface>,
+
+    /// Open right-click context menu: the entry it targets and the
+    /// logical-pixel point to anchor it at. The menu is a non-modal
+    /// popover, so dismissal is handled explicitly in `on_event`.
+    context_menu: Option<ContextMenu>,
+    /// Entry whose Properties modal is open, if any.
+    properties: Option<EntryId>,
+    /// Strings the app wants placed on the system clipboard ("copy
+    /// path"). The clipboard lives in the host, not the app, so this is
+    /// an outbox the host drains (`HostApp::drain_clipboard_writes`).
+    clipboard_writes: Vec<String>,
+}
+
+/// An open entry context menu (right-click). The browser window owns
+/// at most one.
+#[derive(Clone, Copy)]
+struct ContextMenu {
+    target: EntryId,
+    point: (f32, f32),
 }
 
 impl ExplorerApp {
@@ -385,6 +406,9 @@ impl ExplorerApp {
             sidebar_drag: ResizeDrag::default(),
             preview_drag: ResizeDrag::default(),
             binary_surface: None,
+            context_menu: None,
+            properties: None,
+            clipboard_writes: Vec::new(),
         };
         app.spawn_places_probe();
         app.navigate(start, None);
@@ -445,6 +469,9 @@ impl ExplorerApp {
         self.selected = None;
         self.marked.clear();
         self.anchor = None;
+        // Entry ids the menu/dialog targeted belong to the old listing.
+        self.context_menu = None;
+        self.properties = None;
         self.pending_select = select;
         self.preview = PreviewState::Empty;
         self.preview_inflight = None;
@@ -628,6 +655,57 @@ impl ExplorerApp {
                 FileActivation::Collect => self.activated.push(path),
             }
         }
+    }
+
+    // ---- context menu ----------------------------------------------------
+
+    /// Absolute path of the entry `id`, or `None` if it has aged out of
+    /// the listing. Name-join only — no IO.
+    fn entry_path(&self, id: EntryId) -> Option<PathBuf> {
+        let entries = self.listing.entries.lock().unwrap();
+        entries.get(id as usize).map(|e| self.cwd.join(&e.name))
+    }
+
+    /// Right-click opened a context menu for entry `id` at `point`. The
+    /// row is selected first (file-manager convention) so the menu and
+    /// the selection agree on a target.
+    fn open_context_menu(&mut self, id: EntryId, point: (f32, f32)) {
+        self.select_only(id);
+        self.context_menu = Some(ContextMenu { target: id, point });
+    }
+
+    /// Queue the entry's absolute path for the system clipboard. The
+    /// host drains `clipboard_writes` into its `arboard` clipboard.
+    fn copy_path(&mut self, id: EntryId) {
+        if let Some(path) = self.entry_path(id) {
+            self.clipboard_writes
+                .push(path.to_string_lossy().into_owned());
+        }
+    }
+
+    /// Dispatch a `ctx:*` menu item to its action.
+    fn run_context_action(&mut self, action: &str, target: EntryId) {
+        match action {
+            "open" => self.activate_id(target),
+            "copy-path" => self.copy_path(target),
+            "terminal" => self.open_terminal(target),
+            "properties" => self.properties = Some(target),
+            _ => {}
+        }
+    }
+
+    /// Spawn a terminal emulator rooted at the entry (if it's a
+    /// directory) or at the current directory otherwise. Detached; the
+    /// terminal does its own IO in its own process.
+    fn open_terminal(&mut self, id: EntryId) {
+        let dir = {
+            let entries = self.listing.entries.lock().unwrap();
+            match entries.get(id as usize) {
+                Some(e) if e.is_dir() => self.cwd.join(&e.name),
+                _ => self.cwd.clone(),
+            }
+        };
+        spawn_terminal(&dir);
     }
 
     // ---- picker-wrapper surface ------------------------------------------
@@ -1452,13 +1530,77 @@ impl ExplorerApp {
             .gap(tokens::SPACE_3)
             .width(Size::Fill(1.0))
             .height(Size::Fill(1.0));
+        // Overlays stack newest-on-top: sort menu, then the right-click
+        // context menu, then the modal Properties dialog above both.
+        let mut layers: Vec<El> = vec![page];
         if self.sort_open {
-            stack([page, select_menu("browser-sort", sort_options())])
+            layers.push(select_menu("browser-sort", sort_options()));
+        }
+        if let Some(menu) = self.context_menu {
+            layers.push(self.context_menu_el(menu));
+        }
+        if let Some(id) = self.properties {
+            if let Some(dialog) = self.properties_dialog(id) {
+                layers.push(dialog);
+            }
+        }
+        if layers.len() == 1 {
+            layers.pop().unwrap()
+        } else {
+            stack(layers)
                 .width(Size::Fill(1.0))
                 .height(Size::Fill(1.0))
-        } else {
-            page
         }
+    }
+
+    /// The right-click menu popover for `menu`, anchored at the click
+    /// point. Items are keyed `ctx:*` and routed in `on_event`.
+    fn context_menu_el(&self, menu: ContextMenu) -> El {
+        // "Open terminal here" roots at the entry when it's a directory,
+        // otherwise at the current folder (handled in `open_terminal`).
+        let items = [
+            menu_item("Open").key("ctx:open"),
+            menu_item("Copy path").key("ctx:copy-path"),
+            menu_item("Open terminal here").key("ctx:terminal"),
+            menu_item("Properties").key("ctx:properties"),
+        ];
+        context_menu("entry-menu", menu.point, items)
+    }
+
+    /// Modal details dialog for entry `id`. `None` if the entry has
+    /// aged out of the listing.
+    fn properties_dialog(&self, id: EntryId) -> Option<El> {
+        let entries = self.listing.entries.lock().unwrap();
+        let entry = entries.get(id as usize)?;
+        let path = self.cwd.join(&entry.name);
+        let mut rows = vec![
+            property_row("Name", &entry.display),
+            property_row("Where", &path.to_string_lossy()),
+            property_row("Kind", entry.preview_kind.label()),
+        ];
+        match &entry.meta {
+            Some(meta) => {
+                if !entry.is_dir() {
+                    rows.push(property_row("Size", &fmt::human_bytes(meta.size)));
+                }
+                if let Some(modified) = meta.modified {
+                    rows.push(property_row("Modified", &fmt::mtime(modified)));
+                }
+            }
+            None => rows.push(property_row("Size", "—")),
+        }
+        if entry.is_symlink {
+            rows.push(property_row("Link", "symbolic link"));
+        }
+        drop(entries);
+        Some(dialog(
+            "props",
+            [
+                dialog_header([dialog_title("Properties")]),
+                column(rows).gap(tokens::SPACE_2),
+                dialog_footer([button("Close").primary().key("props:close")]),
+            ],
+        ))
     }
 
     fn status_el(&self) -> El {
@@ -1522,6 +1664,55 @@ fn entry_tooltip(entry: &Entry) -> String {
 
 fn entry_tooltip_by_parts(name: &str, kind: &str) -> String {
     format!("{name} · {kind}")
+}
+
+/// One label/value row in the Properties dialog. The label is a fixed
+/// muted column; the value wraps/fills the rest.
+fn property_row(label: &str, value: &str) -> El {
+    row([
+        text(label)
+            .caption()
+            .muted()
+            .width(Size::Fixed(72.0)),
+        text(value).caption(),
+    ])
+    .gap(tokens::SPACE_2)
+    .width(Size::Fill(1.0))
+}
+
+/// Launch a terminal emulator with its working directory set to `dir`.
+/// Honors `$TERMINAL`, then falls back through common emulators; the
+/// first one that launches wins. Detached — like `xdg-open`, the child
+/// runs in its own process. A missing binary is skipped silently; any
+/// other spawn error stops the search and is logged.
+fn spawn_terminal(dir: &Path) {
+    const FALLBACKS: [&str; 7] = [
+        "foot",
+        "alacritty",
+        "kitty",
+        "wezterm",
+        "gnome-terminal",
+        "konsole",
+        "xterm",
+    ];
+    let candidates = std::env::var("TERMINAL")
+        .ok()
+        .into_iter()
+        .chain(FALLBACKS.iter().map(|s| s.to_string()));
+    for term in candidates {
+        match std::process::Command::new(&term)
+            .current_dir(dir)
+            .spawn()
+        {
+            Ok(_) => return,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => {
+                tracing::warn!(terminal = %term, error = %e, "terminal failed to launch");
+                return;
+            }
+        }
+    }
+    tracing::warn!("no terminal emulator found (set $TERMINAL)");
 }
 
 /// Icon centered in a grid cell's media area when no thumbnail should
@@ -1934,6 +2125,40 @@ impl App for ExplorerApp {
 
     fn on_event(&mut self, event: UiEvent, _cx: &EventCx) {
         use damascene_core::widgets::resize_handle::Side;
+        // The Properties dialog is modal: while it's up, only its own
+        // controls are live (Close button, scrim dismiss, Escape).
+        if self.properties.is_some() {
+            if event.is_click_or_activate("props:close")
+                || event.is_click_or_activate("props:dismiss")
+                || event.kind == UiEventKind::Escape
+            {
+                self.properties = None;
+            }
+            return;
+        }
+        // The context menu is a non-modal popover. Item activations
+        // route here; Escape or a click elsewhere dismisses it (a left
+        // click still acts underneath, so clicking another row both
+        // closes the menu and selects that row).
+        if self.context_menu.is_some() {
+            if matches!(event.kind, UiEventKind::Click | UiEventKind::Activate) {
+                if let Some(action) = event.route_suffix("ctx") {
+                    let target = self.context_menu.take().unwrap().target;
+                    self.run_context_action(action, target);
+                    return;
+                }
+            }
+            match event.kind {
+                UiEventKind::Escape => {
+                    self.context_menu = None;
+                    return;
+                }
+                UiEventKind::Click | UiEventKind::SecondaryClick => {
+                    self.context_menu = None;
+                }
+                _ => {}
+            }
+        }
         if event.target_key() == Some("browser-search") {
             let mut search = self.search.clone();
             if text_input::apply_event(&mut search, &mut self.selection, "browser-search", &event) {
@@ -2015,6 +2240,11 @@ impl App for ExplorerApp {
                     } else {
                         self.select_only(id);
                     }
+                    return;
+                }
+                if event.kind == UiEventKind::SecondaryClick {
+                    let point = event.pointer.unwrap_or_default();
+                    self.open_context_menu(id, point);
                     return;
                 }
             }
@@ -2161,6 +2391,10 @@ impl crate::host::HostApp for ExplorerApp {
         };
         let (logical_w, logical_h) = binary_surface_size(preview_w, viewport.h);
         surface.write(device, queue, binary, logical_w, logical_h, scale_factor);
+    }
+
+    fn drain_clipboard_writes(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.clipboard_writes)
     }
 }
 
@@ -2514,12 +2748,30 @@ pub(crate) mod fixtures {
             .expect("fixture entry exists");
         app.marked.insert(id);
     }
+
+    /// Browser with the right-click context menu open on a file —
+    /// exercises the popover anchored mid-list.
+    pub(crate) fn context_menu() -> ExplorerApp {
+        let mut app = browse();
+        let id = select(&mut app, "photo.jxr");
+        app.open_context_menu(id, (520.0, 320.0));
+        app
+    }
+
+    /// Browser with the modal Properties dialog open on a stat'ed file.
+    pub(crate) fn properties() -> ExplorerApp {
+        let mut app = browse();
+        let id = select(&mut app, "notes.txt");
+        app.properties = Some(id);
+        app
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::fixtures::{browse, grid};
     use super::*;
+    use crate::host::HostApp;
     use explorer_io::listing::ListingUpdate;
     use explorer_io::RawEntry;
 
@@ -2770,5 +3022,92 @@ mod tests {
             }
             _ => panic!("expected text"),
         }
+    }
+
+    /// Right-click selects the row and opens the menu targeting it.
+    #[test]
+    fn opening_context_menu_selects_its_target() {
+        let mut app = browse();
+        let photo = id_of(&app, "photo.jxr");
+        app.open_context_menu(photo, (12.0, 34.0));
+        assert_eq!(app.context_menu.map(|m| m.target), Some(photo));
+        assert_eq!(app.selected.map(|(id, _)| id), Some(photo));
+    }
+
+    /// "Copy path" queues the entry's absolute path for the host to
+    /// drain, and closes the menu.
+    #[test]
+    fn context_copy_path_queues_clipboard_write() {
+        let mut app = browse();
+        let cx = EventCx::new();
+        app.open_context_menu(id_of(&app, "photo.jxr"), (0.0, 0.0));
+
+        app.on_event(UiEvent::synthetic_click("ctx:copy-path"), &cx);
+        assert!(app.context_menu.is_none());
+        assert_eq!(app.clipboard_writes, ["/test/somewhere/photo.jxr"]);
+        assert_eq!(app.drain_clipboard_writes(), ["/test/somewhere/photo.jxr"]);
+        assert!(app.clipboard_writes.is_empty(), "drained once");
+    }
+
+    /// "Open" on a directory navigates into it.
+    #[test]
+    fn context_open_enters_directory() {
+        let mut app = browse();
+        let cx = EventCx::new();
+        app.open_context_menu(id_of(&app, "docs"), (0.0, 0.0));
+
+        app.on_event(UiEvent::synthetic_click("ctx:open"), &cx);
+        assert_eq!(app.cwd, PathBuf::from("/test/somewhere/docs"));
+    }
+
+    /// A click that isn't a menu item dismisses the menu and still
+    /// performs its own action underneath.
+    #[test]
+    fn click_outside_dismisses_menu_and_acts() {
+        let mut app = browse();
+        let cx = EventCx::new();
+        app.set_search("no".into());
+        app.open_context_menu(id_of(&app, "photo.jxr"), (0.0, 0.0));
+
+        app.on_event(UiEvent::synthetic_click("search-clear"), &cx);
+        assert!(app.context_menu.is_none(), "outside click dismisses");
+        assert!(app.search_term().is_none(), "and still clears the search");
+    }
+
+    /// "Properties" opens a modal that swallows stray clicks until
+    /// dismissed.
+    #[test]
+    fn context_properties_modal_blocks_then_closes() {
+        let mut app = browse();
+        let cx = EventCx::new();
+        let notes = id_of(&app, "notes.txt");
+        app.open_context_menu(notes, (0.0, 0.0));
+
+        app.on_event(UiEvent::synthetic_click("ctx:properties"), &cx);
+        assert_eq!(app.properties, Some(notes));
+        assert!(app.context_menu.is_none());
+
+        // Modal: an unrelated click is swallowed, the dialog stays up.
+        app.set_search("x".into());
+        app.on_event(UiEvent::synthetic_click("search-clear"), &cx);
+        assert_eq!(app.properties, Some(notes));
+        assert!(app.search_term().is_some(), "modal swallowed the click");
+
+        app.on_event(UiEvent::synthetic_click("props:close"), &cx);
+        assert!(app.properties.is_none());
+    }
+
+    /// Navigating away drops menu/dialog state — their ids belonged to
+    /// the old listing.
+    #[test]
+    fn navigation_clears_menu_and_properties() {
+        let mut app = browse();
+        let docs = id_of(&app, "docs");
+        app.open_context_menu(docs, (0.0, 0.0));
+        app.properties = Some(docs);
+
+        app.navigate(PathBuf::from("/test/elsewhere"), None);
+        assert!(app.context_menu.is_none());
+        assert!(app.properties.is_none());
     }
 }

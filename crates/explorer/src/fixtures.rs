@@ -65,6 +65,8 @@ pub fn scenes() -> Vec<Scene> {
         ),
         scene("multiselect", BROWSER, multiselect()),
         scene("multiselect_half", BROWSER_HALF, multiselect()),
+        scene("context_menu", BROWSER, app::fixtures::context_menu()),
+        scene("properties", BROWSER, app::fixtures::properties()),
         scene("grid", BROWSER, app::fixtures::grid()),
         scene("grid_half", BROWSER_HALF, app::fixtures::grid()),
         scene("listing_error", BROWSER, app::fixtures::listing_error()),

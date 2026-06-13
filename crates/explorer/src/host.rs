@@ -95,6 +95,14 @@ pub trait HostApp: App {
         _scale_factor: f32,
     ) {
     }
+
+    /// Text the app wants placed on the system clipboard since the last
+    /// frame ("copy path"). The clipboard is host-owned (one `arboard`
+    /// shared across windows), so the app queues writes and the host
+    /// drains them here. Last write wins.
+    fn drain_clipboard_writes(&mut self) -> Vec<String> {
+        Vec::new()
+    }
 }
 
 /// Run the host loop with one initial window. Returns when the last
@@ -863,6 +871,15 @@ impl ApplicationHandler<HostCommand> for Host {
             WindowEvent::RedrawRequested => {
                 let backend = self.gpu.as_ref().map(|g| g.backend).unwrap_or("?");
                 win.redraw(backend);
+                // Drain app-initiated clipboard writes ("copy path")
+                // into the host-owned clipboard. Last write wins.
+                if let Some(text) = win.app.drain_clipboard_writes().pop() {
+                    if let Some(clipboard) = self.clipboard.as_mut() {
+                        if let Err(e) = clipboard.set_text(text) {
+                            tracing::warn!(error = %e, "clipboard write failed");
+                        }
+                    }
+                }
             }
 
             _ => {}

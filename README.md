@@ -19,6 +19,7 @@ prism-explorer [DIRECTORY]    # defaults to $HOME
 | arrows / `hjkl` | move the cursor (list: ←/`h` parent, →/`l` enter dir) |
 | Ctrl+click | toggle a file in the multi-selection |
 | Shift+click | select a range from the cursor |
+| Right-click | context menu (open · copy path · open terminal here · properties) |
 | Space | toggle the cursor's row in the multi-selection |
 | `g` | toggle list / thumbnail grid |
 | Enter / double-click | open directory · open file (`xdg-open`) |
@@ -31,6 +32,13 @@ prism-explorer [DIRECTORY]    # defaults to $HOME
 Plain click or any arrow key collapses back to a single selection;
 marked rows show a check accent. A multi-selection is what a portal
 `multiple` open dialog returns.
+
+Right-clicking a row selects it and opens a context menu: **Open**
+(same as Enter), **Copy path** (the absolute path, to the system
+clipboard), **Open terminal here** (`$TERMINAL`, falling back through
+foot/alacritty/kitty/… , rooted at the entry if it's a directory else
+the current folder), and **Properties** (a modal with name, location,
+kind, size, and modified time).
 
 ## Architecture
 
