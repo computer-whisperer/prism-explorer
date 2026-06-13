@@ -27,7 +27,9 @@ use damascene_core::widgets::resize_handle::HANDLE_THICKNESS;
 use damascene_core::widgets::select::{self, select_menu, select_trigger};
 use damascene_core::widgets::tabs::{self, tabs_list};
 use damascene_core::widgets::text_input::{self, TextInputOpts};
-use damascene_core::{BuildCx, EventCx, KeyChord, Rect, UiEvent, UiEventKind, UiKey};
+use damascene_core::{
+    BuildCx, EventCx, KeyChord, KeyModifiers, Rect, UiEvent, UiEventKind, UiKey,
+};
 use lru::LruCache;
 
 use explorer_io::{listing, stat, EntryKind, Notifier, Pool, Tier};
@@ -355,6 +357,46 @@ pub struct ExplorerApp {
     /// path"). The clipboard lives in the host, not the app, so this is
     /// an outbox the host drains (`HostApp::drain_clipboard_writes`).
     clipboard_writes: Vec<String>,
+
+    /// An open New Folder / Rename name-entry prompt (modal). While it's
+    /// up `hotkeys()` returns empty so editing keys reach the field.
+    prompt: Option<Prompt>,
+    /// Entry awaiting a permanent-delete confirmation (modal).
+    confirm_delete: Option<EntryId>,
+    /// Last file-operation failure, shown modally until dismissed.
+    op_error: Option<String>,
+}
+
+/// An open name-entry prompt for a mutating op. The text buffer and its
+/// caret/selection live here (the field is keyed `prompt-field`).
+struct Prompt {
+    kind: PromptKind,
+    value: String,
+    selection: Selection,
+}
+
+enum PromptKind {
+    /// Create a folder in the current directory.
+    NewFolder,
+    /// Rename an existing entry; `original` is its current name (a
+    /// no-op rename to the same name is dropped).
+    Rename { target: EntryId, original: String },
+}
+
+impl PromptKind {
+    fn title(&self) -> &'static str {
+        match self {
+            PromptKind::NewFolder => "New folder",
+            PromptKind::Rename { .. } => "Rename",
+        }
+    }
+
+    fn commit_label(&self) -> &'static str {
+        match self {
+            PromptKind::NewFolder => "Create",
+            PromptKind::Rename { .. } => "Rename",
+        }
+    }
 }
 
 /// An open entry context menu (right-click). The browser window owns
@@ -417,6 +459,9 @@ impl ExplorerApp {
             open_with: None,
             app_db: None,
             clipboard_writes: Vec::new(),
+            prompt: None,
+            confirm_delete: None,
+            op_error: None,
         };
         app.spawn_places_probe();
         app.spawn_app_db_probe();
@@ -500,6 +545,12 @@ impl ExplorerApp {
         self.context_menu = None;
         self.properties = None;
         self.open_with = None;
+        // A rename targets an entry id from this listing; a New Folder
+        // prompt is anchored to this directory. Both are stale now. (A
+        // pending op already in flight is unaffected — it owns absolute
+        // paths and reports back regardless of where we navigate.)
+        self.prompt = None;
+        self.confirm_delete = None;
         self.pending_select = select;
         self.preview = PreviewState::Empty;
         self.preview_inflight = None;
@@ -718,6 +769,9 @@ impl ExplorerApp {
             "open-with" => self.open_with = Some(target),
             "copy-path" => self.copy_path(target),
             "terminal" => self.open_terminal(target),
+            "rename" => self.begin_rename(target),
+            "trash" => self.trash_entry(target),
+            "delete" => self.confirm_delete = Some(target),
             "properties" => self.properties = Some(target),
             _ => {}
         }
@@ -735,6 +789,127 @@ impl ExplorerApp {
             }
         };
         spawn_terminal(&dir);
+    }
+
+    // ---- file operations -------------------------------------------------
+    //
+    // Mutating ops run on a detached thread (NOT the pool — navigation
+    // bumps the pool generation and would cancel them) and report back
+    // as `Msg::OpDone`, handled in `before_build`.
+
+    /// Run `op` off the UI thread and post its outcome back.
+    fn spawn_op(&self, op: crate::ops::FileOp) {
+        let tx = self.tx.clone();
+        let notify = self.notifier.clone();
+        let spawned = std::thread::Builder::new()
+            .name("file-op".into())
+            .spawn(move || {
+                let outcome = op.run();
+                let _ = tx.send(Msg::OpDone(outcome));
+                notify();
+            });
+        if let Err(e) = spawned {
+            tracing::error!(error = %e, "file-op thread failed to spawn");
+        }
+    }
+
+    /// Open the New Folder prompt for the current directory.
+    fn begin_new_folder(&mut self) {
+        self.prompt = Some(Prompt {
+            kind: PromptKind::NewFolder,
+            value: String::new(),
+            selection: Selection::default(),
+        });
+        self.focus_requests.push("prompt-field".into());
+    }
+
+    /// Open the Rename prompt for entry `id`, pre-filled with its name
+    /// and the name pre-selected so typing replaces it.
+    fn begin_rename(&mut self, id: EntryId) {
+        let Some(name) = ({
+            let entries = self.listing.entries.lock().unwrap();
+            entries.get(id as usize).map(|e| e.display.clone())
+        }) else {
+            return;
+        };
+        let selection = Selection {
+            range: Some(SelectionRange {
+                anchor: SelectionPoint::new("prompt-field", 0),
+                head: SelectionPoint::new("prompt-field", name.len()),
+            }),
+        };
+        self.prompt = Some(Prompt {
+            kind: PromptKind::Rename {
+                target: id,
+                original: name.clone(),
+            },
+            value: name,
+            selection,
+        });
+        self.focus_requests.push("prompt-field".into());
+    }
+
+    /// Commit the open prompt. An invalid name keeps the prompt open
+    /// (the user can fix it); a valid one spawns the op and closes. A
+    /// rename to the unchanged name just closes — nothing to do.
+    fn commit_prompt(&mut self) {
+        let Some(prompt) = self.prompt.as_ref() else {
+            return;
+        };
+        let name = prompt.value.trim().to_string();
+        if !crate::ops::valid_name(&name) {
+            return;
+        }
+        // Capture the op while borrowing the prompt, then close and spawn.
+        let op = match &prompt.kind {
+            PromptKind::NewFolder => Some(crate::ops::FileOp::NewFolder {
+                parent: self.cwd.clone(),
+                name,
+            }),
+            PromptKind::Rename { target, original } => {
+                if name == *original {
+                    None
+                } else {
+                    self.entry_path(*target)
+                        .map(|from| crate::ops::FileOp::Rename {
+                            from,
+                            to: self.cwd.join(&name),
+                        })
+                }
+            }
+        };
+        self.prompt = None;
+        if let Some(op) = op {
+            self.spawn_op(op);
+        }
+    }
+
+    /// Move entry `id` to the trash (recoverable).
+    fn trash_entry(&mut self, id: EntryId) {
+        if let Some(path) = self.entry_path(id) {
+            self.spawn_op(crate::ops::FileOp::Trash { path });
+        }
+    }
+
+    /// Permanently delete the entry the confirm dialog targets.
+    fn confirm_delete_now(&mut self) {
+        if let Some(id) = self.confirm_delete.take() {
+            if let Some(path) = self.entry_path(id) {
+                self.spawn_op(crate::ops::FileOp::DeletePermanent { path });
+            }
+        }
+    }
+
+    /// Fold a finished op back into the UI: surface a failure, or refresh
+    /// the affected directory (when we're still in it) and focus the new
+    /// or renamed entry by name. A re-list is the simple, correct choice;
+    /// optimistic in-place row edits are a future refinement.
+    fn apply_op_outcome(&mut self, outcome: crate::ops::OpOutcome) {
+        if let Some(error) = outcome.error {
+            self.op_error = Some(error);
+        } else if outcome.dir == self.cwd {
+            self.navigate(self.cwd.clone(), outcome.select);
+        }
     }
 
     // ---- picker-wrapper surface ------------------------------------------
@@ -1019,6 +1194,9 @@ impl ExplorerApp {
             ViewMode::List => ("layout-dashboard", "grid view (g)"),
             ViewMode::Grid => ("menu", "list view (g)"),
         };
+        // Half-width browsers (tiling WMs) crowd the toolbar; shrink the
+        // search box there so the action buttons still fit on one row.
+        let narrow = cx.viewport_width().unwrap_or(1280.0) < 900.0;
         let mut tools = vec![
             icon_button("chevron-up")
                 .key("up")
@@ -1027,9 +1205,12 @@ impl ExplorerApp {
             spacer(),
         ];
         if self.show_search {
-            tools.push(self.search_el());
+            tools.push(self.search_el(narrow));
         }
         tools.extend([
+            icon_button("plus")
+                .key("new-folder")
+                .tooltip("new folder (Ctrl+Shift+N)"),
             select_trigger("browser-sort", self.sort.label())
                 .width(Size::Fixed(128.0))
                 .tooltip("sort order"),
@@ -1039,7 +1220,12 @@ impl ExplorerApp {
         toolbar(tools)
     }
 
-    fn search_el(&self) -> El {
+    fn search_el(&self, narrow: bool) -> El {
+        let (input_w, row_w) = if narrow {
+            (160.0, 224.0)
+        } else {
+            (220.0, 284.0)
+        };
         let input = text_input::text_input_with(
             "browser-search",
             &self.search,
@@ -1049,7 +1235,7 @@ impl ExplorerApp {
                 ..TextInputOpts::default()
             },
         )
-        .width(Size::Fixed(220.0));
+        .width(Size::Fixed(input_w));
         let mut children = vec![
             icon("search")
                 .icon_size(tokens::ICON_SM)
@@ -1062,7 +1248,7 @@ impl ExplorerApp {
         row(children)
             .gap(tokens::SPACE_2)
             .align(Align::Center)
-            .width(Size::Fixed(284.0))
+            .width(Size::Fixed(row_w))
     }
 
     /// Error / still-empty states shared by both views; `None` once
@@ -1583,6 +1769,17 @@ impl ExplorerApp {
                 layers.push(dialog);
             }
         }
+        if let Some(prompt) = &self.prompt {
+            layers.push(self.prompt_dialog(prompt));
+        }
+        if let Some(id) = self.confirm_delete {
+            if let Some(dialog) = self.confirm_delete_dialog(id) {
+                layers.push(dialog);
+            }
+        }
+        if let Some(message) = &self.op_error {
+            layers.push(self.op_error_dialog(message));
+        }
         if layers.len() == 1 {
             layers.pop().unwrap()
         } else {
@@ -1611,6 +1808,9 @@ impl ExplorerApp {
         // "Open terminal here" roots at the entry when it's a directory,
         // otherwise at the current folder (handled in `open_terminal`).
         items.push(menu_item("Open terminal here").key("ctx:terminal"));
+        items.push(menu_item("Rename…").key("ctx:rename"));
+        items.push(menu_item("Move to Trash").key("ctx:trash"));
+        items.push(menu_item("Delete permanently…").key("ctx:delete"));
         items.push(menu_item("Properties").key("ctx:properties"));
         context_menu("entry-menu", menu.point, items)
     }
@@ -1697,6 +1897,76 @@ impl ExplorerApp {
                 dialog_footer([button("Cancel").ghost().key("open-with:cancel")]),
             ],
         ))
+    }
+
+    /// Modal name-entry dialog for a New Folder / Rename prompt. The
+    /// field is keyed `prompt-field`; chrome is keyed `prompt:*`.
+    fn prompt_dialog(&self, prompt: &Prompt) -> El {
+        let field = text_input::text_input_with(
+            "prompt-field",
+            &prompt.value,
+            &prompt.selection,
+            TextInputOpts {
+                placeholder: Some("name"),
+                ..TextInputOpts::default()
+            },
+        )
+        .width(Size::Fill(1.0));
+        let commit = button(prompt.kind.commit_label()).primary().key("prompt:commit");
+        let commit = if crate::ops::valid_name(prompt.value.trim()) {
+            commit
+        } else {
+            commit.disabled()
+        };
+        dialog(
+            "prompt",
+            [
+                dialog_header([dialog_title(prompt.kind.title())]),
+                field,
+                dialog_footer([
+                    button("Cancel").ghost().key("prompt:cancel"),
+                    commit,
+                ]),
+            ],
+        )
+    }
+
+    /// Modal confirmation before a permanent (non-trash) delete.
+    /// `None` if the target has aged out of the listing.
+    fn confirm_delete_dialog(&self, id: EntryId) -> Option<El> {
+        let name = {
+            let entries = self.listing.entries.lock().unwrap();
+            entries.get(id as usize)?.display.clone()
+        };
+        Some(dialog(
+            "confirm-delete",
+            [
+                dialog_header([dialog_title("Delete permanently?")]),
+                column([
+                    text(format!("\u{201c}{name}\u{201d} will be deleted permanently.")),
+                    text("This cannot be undone — use Move to Trash to keep a copy.")
+                        .caption()
+                        .muted(),
+                ])
+                .gap(tokens::SPACE_2),
+                dialog_footer([
+                    button("Cancel").ghost().key("confirm-delete:cancel"),
+                    button("Delete").destructive().key("confirm-delete:confirm"),
+                ]),
+            ],
+        ))
+    }
+
+    /// Modal notice for a failed file operation.
+    fn op_error_dialog(&self, message: &str) -> El {
+        dialog(
+            "op-error",
+            [
+                dialog_header([dialog_title("Operation failed")]),
+                text(message.to_string()),
+                dialog_footer([button("Close").primary().key("op-error:close")]),
+            ],
+        )
     }
 
     fn status_el(&self) -> El {
@@ -2232,6 +2502,7 @@ impl App for ExplorerApp {
                 }
                 Msg::Places(places) => self.places = places,
                 Msg::AppDb(db) => self.app_db = Some(db),
+                Msg::OpDone(outcome) => self.apply_op_outcome(outcome),
                 Msg::OpenLocation { dir, select } => self.navigate(dir, select),
             }
         }
@@ -2243,6 +2514,17 @@ impl App for ExplorerApp {
     }
 
     fn hotkeys(&self) -> Vec<(KeyChord, String)> {
+        // While the New Folder / Rename prompt is open, register nothing
+        // so every key (Enter, Backspace, Delete, arrows, letters) is
+        // delivered to the focused name field instead of firing a
+        // browser action — hotkeys otherwise win over text-field capture.
+        if self.prompt.is_some() {
+            return Vec::new();
+        }
+        let shift_delete = KeyChord::named(UiKey::Delete).with_modifiers(KeyModifiers {
+            shift: true,
+            ..KeyModifiers::default()
+        });
         vec![
             (KeyChord::named(UiKey::ArrowUp), "prev".into()),
             (KeyChord::named(UiKey::ArrowDown), "next".into()),
@@ -2260,13 +2542,80 @@ impl App for ExplorerApp {
             (KeyChord::vim('r'), "refresh".into()),
             (KeyChord::ctrl('f'), "search".into()),
             (KeyChord::named(UiKey::Other("F5".into())), "refresh".into()),
+            (KeyChord::named(UiKey::Other("F2".into())), "rename".into()),
             (KeyChord::vim('.'), "hidden".into()),
             (KeyChord::named(UiKey::Space), "mark".into()),
+            (KeyChord::ctrl_shift('n'), "new-folder".into()),
+            // Shift+Delete (permanent) must be registered before bare
+            // Delete (trash): `matches` is exact on modifiers, but listing
+            // the more-specific chord first keeps intent obvious.
+            (shift_delete, "delete-permanent".into()),
+            (KeyChord::named(UiKey::Delete), "trash".into()),
         ]
     }
 
     fn on_event(&mut self, event: UiEvent, _cx: &EventCx) {
         use damascene_core::widgets::resize_handle::Side;
+        // A file-op error notice is modal: dismiss and swallow the rest.
+        if self.op_error.is_some() {
+            if event.is_click_or_activate("op-error:close")
+                || event.is_click_or_activate("op-error:dismiss")
+                || event.kind == UiEventKind::Escape
+            {
+                self.op_error = None;
+            }
+            return;
+        }
+        // The New Folder / Rename prompt is modal. `hotkeys()` returns
+        // empty while it's open, so Enter / Escape / editing keys reach
+        // the field here as raw KeyDowns rather than firing browser
+        // actions underneath.
+        if self.prompt.is_some() {
+            if event.is_click_or_activate("prompt:commit") {
+                self.commit_prompt();
+                return;
+            }
+            if event.is_click_or_activate("prompt:cancel")
+                || event.is_click_or_activate("prompt:dismiss")
+            {
+                self.prompt = None;
+                return;
+            }
+            let key = event.key_press.as_ref().map(|kp| kp.key.clone());
+            if event.kind == UiEventKind::KeyDown && key.as_ref() == Some(&UiKey::Enter) {
+                self.commit_prompt();
+                return;
+            }
+            if event.kind == UiEventKind::Escape
+                || (event.kind == UiEventKind::KeyDown && key.as_ref() == Some(&UiKey::Escape))
+            {
+                self.prompt = None;
+                return;
+            }
+            if let Some(prompt) = self.prompt.as_mut() {
+                text_input::apply_event(
+                    &mut prompt.value,
+                    &mut prompt.selection,
+                    "prompt-field",
+                    &event,
+                );
+            }
+            return;
+        }
+        // The permanent-delete confirmation is modal.
+        if self.confirm_delete.is_some() {
+            if event.is_click_or_activate("confirm-delete:confirm") {
+                self.confirm_delete_now();
+                return;
+            }
+            if event.is_click_or_activate("confirm-delete:cancel")
+                || event.is_click_or_activate("confirm-delete:dismiss")
+                || event.kind == UiEventKind::Escape
+            {
+                self.confirm_delete = None;
+            }
+            return;
+        }
         // The Properties dialog is modal: while it's up, only its own
         // controls are live (Close button, scrim dismiss, Escape).
         if self.properties.is_some() {
@@ -2443,6 +2792,10 @@ impl App for ExplorerApp {
                 self.toggle_view();
                 return;
             }
+            if key == "new-folder" && event.is_click_or_activate(key) {
+                self.begin_new_folder();
+                return;
+            }
         }
 
         // Vertical motion is one entry in the list, one grid row in the
@@ -2496,6 +2849,20 @@ impl App for ExplorerApp {
         } else if event.is_hotkey("mark") {
             if let Some(id) = self.selected_id() {
                 self.toggle_mark(id);
+            }
+        } else if event.is_hotkey("new-folder") {
+            self.begin_new_folder();
+        } else if event.is_hotkey("rename") {
+            if let Some(id) = self.selected_id() {
+                self.begin_rename(id);
+            }
+        } else if event.is_hotkey("trash") {
+            if let Some(id) = self.selected_id() {
+                self.trash_entry(id);
+            }
+        } else if event.is_hotkey("delete-permanent") {
+            if let Some(id) = self.selected_id() {
+                self.confirm_delete = Some(id);
             }
         }
     }
@@ -2997,6 +3364,38 @@ pub(crate) mod fixtures {
         app.open_with = Some(id);
         app
     }
+
+    /// Browser with the New Folder name-entry prompt open.
+    pub(crate) fn new_folder_prompt() -> ExplorerApp {
+        let mut app = browse();
+        app.begin_new_folder();
+        app
+    }
+
+    /// Browser with the Rename prompt open on a file, its name
+    /// pre-selected for replacement.
+    pub(crate) fn rename_prompt() -> ExplorerApp {
+        let mut app = browse();
+        let id = select(&mut app, "notes.txt");
+        app.begin_rename(id);
+        app
+    }
+
+    /// Browser with the modal permanent-delete confirmation open.
+    pub(crate) fn confirm_delete() -> ExplorerApp {
+        let mut app = browse();
+        let id = select(&mut app, "notes.txt");
+        app.confirm_delete = Some(id);
+        app
+    }
+
+    /// Browser showing a failed-operation error notice.
+    pub(crate) fn op_error() -> ExplorerApp {
+        let mut app = browse();
+        select(&mut app, "notes.txt");
+        app.op_error = Some("a file with that name already exists".into());
+        app
+    }
 }
 
 #[cfg(test)]
@@ -3380,5 +3779,178 @@ mod tests {
             &cx,
         );
         assert!(app.open_with.is_none());
+    }
+
+    // ---- file operations -------------------------------------------------
+
+    /// Rename pre-fills the field with the entry's name and selects it
+    /// so typing replaces it, and focuses the field.
+    #[test]
+    fn begin_rename_prefills_and_selects_name() {
+        let mut app = browse();
+        let notes = id_of(&app, "notes.txt");
+        app.begin_rename(notes);
+        let prompt = app.prompt.as_ref().expect("prompt open");
+        assert_eq!(prompt.value, "notes.txt");
+        assert!(matches!(prompt.kind, PromptKind::Rename { target, .. } if target == notes));
+        let range = prompt.selection.range.as_ref().expect("name selected");
+        assert_eq!(range.head.byte, "notes.txt".len());
+        assert!(app.focus_requests.contains(&"prompt-field".to_string()));
+    }
+
+    /// New Folder opens an empty prompt and focuses the field.
+    #[test]
+    fn begin_new_folder_opens_empty_prompt() {
+        let mut app = browse();
+        app.begin_new_folder();
+        let prompt = app.prompt.as_ref().expect("prompt open");
+        assert!(prompt.value.is_empty());
+        assert!(matches!(prompt.kind, PromptKind::NewFolder));
+        assert!(app.focus_requests.contains(&"prompt-field".to_string()));
+    }
+
+    /// While the prompt is open, no hotkeys are registered — editing
+    /// keys reach the field instead of firing browser actions.
+    #[test]
+    fn prompt_open_suppresses_hotkeys() {
+        let mut app = browse();
+        assert!(!app.hotkeys().is_empty());
+        app.begin_new_folder();
+        assert!(app.hotkeys().is_empty());
+    }
+
+    /// Committing an invalid (here empty) name keeps the prompt open so
+    /// the user can fix it rather than silently doing nothing.
+    #[test]
+    fn commit_invalid_name_keeps_prompt_open() {
+        let mut app = browse();
+        app.begin_new_folder(); // empty value
+        app.commit_prompt();
+        assert!(app.prompt.is_some(), "empty name keeps the prompt open");
+    }
+
+    /// Committing a rename to the unchanged name just closes the prompt
+    /// — no operation to run.
+    #[test]
+    fn commit_unchanged_rename_closes_quietly() {
+        let mut app = browse();
+        let notes = id_of(&app, "notes.txt");
+        app.begin_rename(notes); // value == "notes.txt" == original
+        app.commit_prompt();
+        assert!(app.prompt.is_none());
+        assert!(app.op_error.is_none());
+    }
+
+    /// The rename prompt is modal: unrelated clicks are swallowed and
+    /// the field stays up; Cancel closes it.
+    #[test]
+    fn prompt_modal_swallows_then_cancels() {
+        let mut app = browse();
+        let cx = EventCx::new();
+        app.set_search("x".into());
+        app.begin_rename(id_of(&app, "notes.txt"));
+
+        app.on_event(UiEvent::synthetic_click("search-clear"), &cx);
+        assert!(app.prompt.is_some(), "modal swallowed the click");
+        assert!(app.search_term().is_some(), "and didn't clear the search");
+
+        app.on_event(UiEvent::synthetic_click("prompt:cancel"), &cx);
+        assert!(app.prompt.is_none());
+    }
+
+    /// "Rename…" in the context menu opens the prompt for that entry.
+    #[test]
+    fn context_rename_opens_prompt() {
+        let mut app = browse();
+        let cx = EventCx::new();
+        let notes = id_of(&app, "notes.txt");
+        app.open_context_menu(notes, (0.0, 0.0));
+
+        app.on_event(UiEvent::synthetic_click("ctx:rename"), &cx);
+        assert!(app.context_menu.is_none());
+        assert!(matches!(
+            app.prompt.as_ref().map(|p| &p.kind),
+            Some(PromptKind::Rename { target, .. }) if *target == notes
+        ));
+    }
+
+    /// "Delete permanently…" opens a confirmation modal that swallows
+    /// stray clicks until cancelled — it never deletes without confirm.
+    #[test]
+    fn context_delete_confirms_then_cancels() {
+        let mut app = browse();
+        let cx = EventCx::new();
+        let notes = id_of(&app, "notes.txt");
+        app.open_context_menu(notes, (0.0, 0.0));
+
+        app.on_event(UiEvent::synthetic_click("ctx:delete"), &cx);
+        assert_eq!(app.confirm_delete, Some(notes));
+        assert!(app.context_menu.is_none());
+
+        app.set_search("y".into());
+        app.on_event(UiEvent::synthetic_click("search-clear"), &cx);
+        assert_eq!(app.confirm_delete, Some(notes), "modal swallowed the click");
+        assert!(app.search_term().is_some());
+
+        app.on_event(UiEvent::synthetic_click("confirm-delete:cancel"), &cx);
+        assert!(app.confirm_delete.is_none());
+    }
+
+    /// A failed op surfaces a modal error notice that swallows clicks
+    /// until closed.
+    #[test]
+    fn op_error_modal_blocks_then_closes() {
+        let mut app = browse();
+        let cx = EventCx::new();
+        app.set_search("z".into());
+        app.apply_op_outcome(crate::ops::OpOutcome {
+            dir: app.cwd.clone(),
+            select: None,
+            error: Some("a file with that name already exists".into()),
+        });
+        assert!(app.op_error.is_some());
+
+        app.on_event(UiEvent::synthetic_click("search-clear"), &cx);
+        assert!(app.op_error.is_some(), "modal swallowed the click");
+        assert!(app.search_term().is_some());
+
+        app.on_event(UiEvent::synthetic_click("op-error:close"), &cx);
+        assert!(app.op_error.is_none());
+    }
+
+    /// A successful op in the current directory triggers a refresh that
+    /// focuses the new/renamed entry by name; one targeting another
+    /// directory leaves the view alone.
+    #[test]
+    fn op_outcome_refreshes_only_current_dir() {
+        let mut app = browse();
+        app.apply_op_outcome(crate::ops::OpOutcome {
+            dir: app.cwd.clone(),
+            select: Some(OsString::from("fresh")),
+            error: None,
+        });
+        assert_eq!(app.pending_select.as_deref(), Some(std::ffi::OsStr::new("fresh")));
+
+        let mut other = browse();
+        other.apply_op_outcome(crate::ops::OpOutcome {
+            dir: PathBuf::from("/test/elsewhere"),
+            select: Some(OsString::from("ignored")),
+            error: None,
+        });
+        assert!(other.pending_select.is_none(), "other-dir op doesn't refresh");
+    }
+
+    /// Navigating away drops a pending prompt / confirmation — their
+    /// ids belong to the old listing.
+    #[test]
+    fn navigation_clears_prompt_and_confirm() {
+        let mut app = browse();
+        let notes = id_of(&app, "notes.txt");
+        app.begin_rename(notes);
+        app.confirm_delete = Some(notes);
+
+        app.navigate(PathBuf::from("/test/elsewhere"), None);
+        assert!(app.prompt.is_none());
+        assert!(app.confirm_delete.is_none());
     }
 }

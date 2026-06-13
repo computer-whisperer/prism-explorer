@@ -61,3 +61,4 @@ async-channel = "2"
 # off drops the gettext-sys C build dependency (we only need the
 # locale-variant Name/Exec/MimeType fields, not Ubuntu gettext domains).
 freedesktop-desktop-entry = { version = "0.8.1", default-features = false }
+trash = "5.2.6"

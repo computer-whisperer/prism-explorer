@@ -11,6 +11,7 @@ pub mod fixtures;
 mod fmt;
 pub mod host;
 pub mod model;
+pub mod ops;
 mod picker;
 pub mod places;
 mod preview_policy;

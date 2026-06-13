@@ -19,12 +19,16 @@ prism-explorer [DIRECTORY]    # defaults to $HOME
 | arrows / `hjkl` | move the cursor (list: ←/`h` parent, →/`l` enter dir) |
 | Ctrl+click | toggle a file in the multi-selection |
 | Shift+click | select a range from the cursor |
-| Right-click | context menu (open · open with… · copy path · open terminal here · properties) |
+| Right-click | context menu (open · open with… · copy path · open terminal here · rename · trash · delete · properties) |
 | Space | toggle the cursor's row in the multi-selection |
 | `g` | toggle list / thumbnail grid |
 | Enter / double-click | open directory · open file (`xdg-open`) |
 | Backspace | parent directory |
 | Home / End | first / last entry |
+| F2 | rename the cursor's entry |
+| Delete | move the cursor's entry to trash |
+| Shift+Delete | delete permanently (with confirmation) |
+| Ctrl+Shift+N | new folder |
 | `r` / F5 | refresh listing |
 | `.` | toggle hidden files |
 | Ctrl+F / Search field | filter the current directory by name |
@@ -41,7 +45,17 @@ absolute path, to the system clipboard), **Open terminal here**
 (`$TERMINAL`, falling back through foot/alacritty/kitty/… , rooted at
 the entry if it's a directory else the current folder), and
 **Properties** (a modal with name, location, kind, size, and modified
-time).
+time), and the file operations: **Rename…**, **Move to Trash** (the
+recoverable XDG trash), and **Delete permanently…** (behind a
+confirmation). **New folder** lives on the toolbar (the `+` button) and
+on Ctrl+Shift+N.
+
+These are the explorer's only mutating operations — creating, renaming,
+and deleting. Like every filesystem touch they run off the UI thread,
+but unlike previews they survive navigation: each runs on its own thread
+and refreshes the affected directory when it lands (or raises a modal on
+failure). Delete defaults to the trash; permanent deletion is a separate,
+confirmed path. Copy and move are not yet implemented.
 
 ## Architecture
 
@@ -142,8 +156,9 @@ modality to the caller's window.
 ## Roadmap
 
 - Portal polish: a D-Bus-activatable zero-window service mode
+- Copy / move file operations (with progress and conflict resolution)
 - Rich PDF navigation, video controls, and audio waveforms/playback;
-  archives, fonts; file operations
+  archives, fonts
 
 ## License
 

@@ -352,6 +352,9 @@ pub enum Msg {
     /// The desktop-application database, loaded once off-thread at
     /// startup for the "Open with…" chooser.
     AppDb(Arc<crate::apps::AppDb>),
+    /// A mutating file operation (create / rename / delete) finished on
+    /// its worker thread. Carries the directory to refresh and any error.
+    OpDone(crate::ops::OpOutcome),
     /// External command (D-Bus): navigate to `dir`, then select
     /// `select` once it streams in. Not generation-tagged — it isn't a
     /// stale result, it's a fresh instruction.
