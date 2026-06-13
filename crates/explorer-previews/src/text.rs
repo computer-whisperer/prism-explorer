@@ -189,13 +189,22 @@ pub fn raw_preview(path: &Path) -> anyhow::Result<RawPreview> {
     })
 }
 
-fn to_preview(prefix: Vec<u8>, truncated: bool) -> Preview {
+fn to_preview(path: &Path, prefix: Vec<u8>, truncated: bool) -> Preview {
     if looks_binary(&prefix) {
         return preview_binary(prefix, truncated);
     }
-    Preview::Text {
-        text: String::from_utf8_lossy(&prefix).into_owned(),
-        truncated,
+    let text = String::from_utf8_lossy(&prefix).into_owned();
+    // A recognized language highlights into Code; everything else
+    // (prose, plain logs, unknown types) stays as plain Text.
+    match crate::highlight::highlight(path, &text) {
+        Some(lines) => {
+            let capped = lines.len() >= crate::highlight::MAX_CODE_LINES;
+            Preview::Code {
+                lines,
+                truncated: truncated || capped,
+            }
+        }
+        None => Preview::Text { text, truncated },
     }
 }
 
@@ -218,7 +227,7 @@ impl PreviewHandler for TextHandler {
 
     fn load(&self, path: &Path) -> anyhow::Result<Preview> {
         let (prefix, truncated) = read_prefix(path)?;
-        Ok(to_preview(prefix, truncated))
+        Ok(to_preview(path, prefix, truncated))
     }
 }
 
@@ -243,7 +252,7 @@ impl PreviewHandler for TextFallbackHandler {
                 reason: "empty file".into(),
             });
         }
-        Ok(to_preview(prefix, truncated))
+        Ok(to_preview(path, prefix, truncated))
     }
 }
 

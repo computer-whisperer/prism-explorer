@@ -18,6 +18,7 @@
 
 mod binary;
 mod document;
+mod highlight;
 mod image;
 mod media;
 mod text;
@@ -41,6 +42,13 @@ pub enum Preview {
     /// Text prefix of the file. `truncated` when the file goes on
     /// beyond what was read.
     Text { text: String, truncated: bool },
+    /// Syntax-highlighted source: one span list per line, each span a
+    /// run of same-colored text. `truncated` when the file (or the
+    /// highlighted prefix) goes on beyond what was rendered.
+    Code {
+        lines: Vec<Vec<CodeSpan>>,
+        truncated: bool,
+    },
     /// Byte-level visualization data for unknown binary files.
     Binary(BinaryPreview),
     /// Structured metadata for recognized formats that are not yet
@@ -60,6 +68,15 @@ pub enum Preview {
 pub struct DetailRow {
     pub label: String,
     pub value: String,
+}
+
+/// One run of same-colored text within a highlighted line. `color` is
+/// sRGB; the UI maps it to a `Color` (the previews crate stays free of
+/// damascene paint types).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CodeSpan {
+    pub text: String,
+    pub color: [u8; 3],
 }
 
 pub trait PreviewHandler: Send + Sync {
@@ -240,11 +257,16 @@ mod tests {
         let rs_path = dir.join("snippet.rs");
         std::fs::write(&rs_path, "fn main() {}\n").unwrap();
         match Registry::standard().load(&rs_path).unwrap() {
-            Preview::Text { text, truncated } => {
+            // Rust has a syntax definition, so it highlights into Code.
+            Preview::Code { lines, truncated } => {
+                let text: String = lines
+                    .iter()
+                    .flat_map(|l| l.iter().map(|s| s.text.as_str()))
+                    .collect();
                 assert!(text.contains("fn main"));
                 assert!(!truncated);
             }
-            _ => panic!("rust source should preview as text"),
+            _ => panic!("rust source should preview as highlighted code"),
         }
 
         let pdf_path = dir.join("doc.pdf");

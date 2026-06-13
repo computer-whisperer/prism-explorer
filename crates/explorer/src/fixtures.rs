@@ -51,6 +51,8 @@ pub fn scenes() -> Vec<Scene> {
             BROWSER_HALF,
             app::fixtures::text_preview(),
         ),
+        scene("code_preview", BROWSER, app::fixtures::code_preview()),
+        scene("code_preview_half", BROWSER_HALF, app::fixtures::code_preview()),
         scene("details_preview", BROWSER, app::fixtures::details_preview()),
         scene(
             "details_preview_half",

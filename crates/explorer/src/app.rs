@@ -31,7 +31,7 @@ use damascene_core::{BuildCx, EventCx, KeyChord, Rect, UiEvent, UiEventKind, UiK
 use lru::LruCache;
 
 use explorer_io::{listing, stat, EntryKind, Notifier, Pool, Tier};
-use explorer_previews::{BinaryPreview, Preview, RawPreview, Registry};
+use explorer_previews::{BinaryPreview, CodeSpan, Preview, RawPreview, Registry};
 use explorer_thumbs::ThumbCache;
 
 use crate::apps::AppDb;
@@ -172,7 +172,7 @@ fn preview_modes(
 ) -> Vec<(PreviewMode, &'static str)> {
     let mut modes = vec![(PreviewMode::Normal, "Auto")];
     if raw.and_then(|raw| raw.text.as_ref()).is_some()
-        || matches!(preview, Some(Preview::Text { .. }))
+        || matches!(preview, Some(Preview::Text { .. } | Preview::Code { .. }))
     {
         modes.push((PreviewMode::Text, "Text"));
     }
@@ -1475,6 +1475,11 @@ impl ExplorerApp {
                     Ok(Preview::Text { text, truncated }) => {
                         text_preview_body(text.clone(), *truncated)
                     }
+                    // The raw plain text is normally present; this is the
+                    // fallback (e.g. fixtures with no RawPreview).
+                    Ok(Preview::Code { lines, truncated }) => {
+                        text_preview_body(code_plain_text(lines), *truncated)
+                    }
                     _ => preview_placeholder_body("file-text", "text view unavailable"),
                 },
             },
@@ -1904,6 +1909,7 @@ fn normal_preview_body(
             .height(Size::Fill(1.0))
         }
         Preview::Text { text, truncated } => text_preview_body(text.clone(), *truncated),
+        Preview::Code { lines, truncated } => code_preview_body(lines, *truncated),
         Preview::Details { icon, title, rows } => details_preview_body(icon, title, rows),
         Preview::Binary(binary) => binary_preview_body(binary, preview_w, surface_state),
         Preview::Unsupported { reason } => preview_placeholder_body("file", reason),
@@ -1916,6 +1922,50 @@ fn text_preview_body(body: String, truncated: bool) -> El {
         .width(Size::Fill(1.0))
         .height(Size::Fill(1.0))];
     if truncated || capped {
+        children.push(text("truncated preview").caption().muted());
+    }
+    column(children)
+        .gap(tokens::SPACE_2)
+        .width(Size::Fill(1.0))
+        .height(Size::Fill(1.0))
+}
+
+/// Flatten highlighted lines back to plain text (the "Text" tab view
+/// when no `RawPreview` text is available).
+fn code_plain_text(lines: &[Vec<CodeSpan>]) -> String {
+    lines
+        .iter()
+        .map(|line| line.iter().map(|s| s.text.as_str()).collect::<String>())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Syntax-highlighted source: one `text_runs` flow with a mono,
+/// per-token-colored run for each span and a hard break between lines,
+/// in the same sunken code-block chrome as the plain text preview.
+fn code_preview_body(lines: &[Vec<CodeSpan>], truncated: bool) -> El {
+    let mut runs: Vec<El> = Vec::new();
+    for (i, line) in lines.iter().enumerate() {
+        if i > 0 {
+            runs.push(hard_break());
+        }
+        for span in line {
+            // Syntax colors are intentionally raw per-token colors, not
+            // theme tokens — the whole point of highlighting.
+            runs.push(
+                text(span.text.clone())
+                    .mono()
+                    .font_size(tokens::TEXT_SM.size)
+                    .text_color(Color::srgb_u8(span.color[0], span.color[1], span.color[2]))
+                    .allow_lint(damascene_core::bundle::lint::FindingKind::RawColor),
+            );
+        }
+    }
+    let body = code_block_chrome(text_runs(runs).width(Size::Fill(1.0)));
+    let mut children = vec![scroll([body])
+        .width(Size::Fill(1.0))
+        .height(Size::Fill(1.0))];
+    if truncated {
         children.push(text("truncated preview").caption().muted());
     }
     column(children)
@@ -2663,6 +2713,49 @@ pub(crate) mod fixtures {
                 truncated: true,
             }),
             raw: Some(raw_preview_fixture(raw_bytes, Some("hello\nworld\n"), true)),
+        };
+        app
+    }
+
+    /// `main.rs` selected with a syntax-highlighted code preview
+    /// (synthetic spans — no syntect call in the fixture).
+    pub(crate) fn code_preview() -> ExplorerApp {
+        let mut app = browse();
+        app.listing.absorb(
+            ListingUpdate {
+                batch: vec![RawEntry {
+                    name: "main.rs".into(),
+                    kind: EntryKind::File,
+                }],
+                done: true,
+                error: None,
+            },
+            false,
+            None,
+            None,
+            app.sort,
+        );
+        let id = select(&mut app, "main.rs");
+        let span = |text: &str, color: [u8; 3]| CodeSpan {
+            text: text.into(),
+            color,
+        };
+        const KW: [u8; 3] = [180, 142, 173];
+        const FUNC: [u8; 3] = [136, 192, 208];
+        const NUM: [u8; 3] = [208, 135, 112];
+        const PLAIN: [u8; 3] = [192, 197, 206];
+        let lines = vec![
+            vec![span("fn ", KW), span("main", FUNC), span("() {", PLAIN)],
+            vec![span("    let x = ", PLAIN), span("42", NUM), span(";", PLAIN)],
+            vec![span("}", PLAIN)],
+        ];
+        app.preview = PreviewState::Ready {
+            id,
+            preview: Ok(Preview::Code {
+                lines,
+                truncated: false,
+            }),
+            raw: None,
         };
         app
     }

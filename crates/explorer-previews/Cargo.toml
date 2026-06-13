@@ -13,6 +13,7 @@ anyhow.workspace = true
 tracing.workspace = true
 achromat.workspace = true
 damascene-core.workspace = true
+syntect = { version = "5.3.0", default-features = false, features = ["parsing", "default-syntaxes", "default-themes", "regex-fancy"] }
 
 [dev-dependencies]
 png = "0.18"
