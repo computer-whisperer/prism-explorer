@@ -3,6 +3,7 @@
 //! the `dump_bundles` artifact bin and the lint tests share.
 
 pub mod app;
+pub mod apps;
 mod binary_surface;
 pub mod filechooser;
 pub mod filemanager1;

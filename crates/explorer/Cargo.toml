@@ -56,3 +56,8 @@ mime_guess = "2"
 zbus = "5"
 # Portal handlers await picker answers without blocking zbus dispatch.
 async-channel = "2"
+
+# "Open with…": parse the XDG desktop-entry database. default-features
+# off drops the gettext-sys C build dependency (we only need the
+# locale-variant Name/Exec/MimeType fields, not Ubuntu gettext domains).
+freedesktop-desktop-entry = { version = "0.8.1", default-features = false }

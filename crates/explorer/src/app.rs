@@ -34,6 +34,7 @@ use explorer_io::{listing, stat, EntryKind, Notifier, Pool, Tier};
 use explorer_previews::{BinaryPreview, Preview, RawPreview, Registry};
 use explorer_thumbs::ThumbCache;
 
+use crate::apps::AppDb;
 use crate::binary_surface::{BinarySurface, BinarySurfaceMetrics};
 use crate::fmt;
 use crate::model::{
@@ -345,6 +346,11 @@ pub struct ExplorerApp {
     context_menu: Option<ContextMenu>,
     /// Entry whose Properties modal is open, if any.
     properties: Option<EntryId>,
+    /// Entry whose "Open with…" app chooser is open, if any.
+    open_with: Option<EntryId>,
+    /// The desktop-app database for "Open with…", loaded off-thread at
+    /// startup (`None` until the probe answers).
+    app_db: Option<Arc<AppDb>>,
     /// Strings the app wants placed on the system clipboard ("copy
     /// path"). The clipboard lives in the host, not the app, so this is
     /// an outbox the host drains (`HostApp::drain_clipboard_writes`).
@@ -408,9 +414,12 @@ impl ExplorerApp {
             binary_surface: None,
             context_menu: None,
             properties: None,
+            open_with: None,
+            app_db: None,
             clipboard_writes: Vec::new(),
         };
         app.spawn_places_probe();
+        app.spawn_app_db_probe();
         app.navigate(start, None);
         app
     }
@@ -459,6 +468,24 @@ impl ExplorerApp {
         }
     }
 
+    /// Load the desktop-app database for "Open with…" off-thread. Like
+    /// the places probe it scans the local disk (XDG dirs), which is
+    /// never the slow browsed filesystem, but the UI thread rule holds.
+    fn spawn_app_db_probe(&self) {
+        let tx = self.tx.clone();
+        let notify = self.notifier.clone();
+        let spawned = std::thread::Builder::new()
+            .name("app-db-probe".into())
+            .spawn(move || {
+                let db = AppDb::load();
+                let _ = tx.send(Msg::AppDb(Arc::new(db)));
+                notify();
+            });
+        if let Err(e) = spawned {
+            tracing::warn!(error = %e, "app-db probe thread failed to spawn");
+        }
+    }
+
     /// Leave for `dir`: invalidate all queued work, reset per-directory
     /// state, and start a streaming listing.
     fn navigate(&mut self, dir: PathBuf, select: Option<OsString>) {
@@ -472,6 +499,7 @@ impl ExplorerApp {
         // Entry ids the menu/dialog targeted belong to the old listing.
         self.context_menu = None;
         self.properties = None;
+        self.open_with = None;
         self.pending_select = select;
         self.preview = PreviewState::Empty;
         self.preview_inflight = None;
@@ -687,6 +715,7 @@ impl ExplorerApp {
     fn run_context_action(&mut self, action: &str, target: EntryId) {
         match action {
             "open" => self.activate_id(target),
+            "open-with" => self.open_with = Some(target),
             "copy-path" => self.copy_path(target),
             "terminal" => self.open_terminal(target),
             "properties" => self.properties = Some(target),
@@ -1544,6 +1573,11 @@ impl ExplorerApp {
                 layers.push(dialog);
             }
         }
+        if let Some(id) = self.open_with {
+            if let Some(dialog) = self.open_with_dialog(id) {
+                layers.push(dialog);
+            }
+        }
         if layers.len() == 1 {
             layers.pop().unwrap()
         } else {
@@ -1556,14 +1590,23 @@ impl ExplorerApp {
     /// The right-click menu popover for `menu`, anchored at the click
     /// point. Items are keyed `ctx:*` and routed in `on_event`.
     fn context_menu_el(&self, menu: ContextMenu) -> El {
+        let is_dir = {
+            let entries = self.listing.entries.lock().unwrap();
+            entries
+                .get(menu.target as usize)
+                .is_some_and(|e| e.is_dir())
+        };
+        let mut items = vec![menu_item("Open").key("ctx:open")];
+        // "Open with…" picks a non-default handler — only meaningful
+        // for files (directories open in the browser itself).
+        if !is_dir {
+            items.push(menu_item("Open with…").key("ctx:open-with"));
+        }
+        items.push(menu_item("Copy path").key("ctx:copy-path"));
         // "Open terminal here" roots at the entry when it's a directory,
         // otherwise at the current folder (handled in `open_terminal`).
-        let items = [
-            menu_item("Open").key("ctx:open"),
-            menu_item("Copy path").key("ctx:copy-path"),
-            menu_item("Open terminal here").key("ctx:terminal"),
-            menu_item("Properties").key("ctx:properties"),
-        ];
+        items.push(menu_item("Open terminal here").key("ctx:terminal"));
+        items.push(menu_item("Properties").key("ctx:properties"));
         context_menu("entry-menu", menu.point, items)
     }
 
@@ -1599,6 +1642,54 @@ impl ExplorerApp {
                 dialog_header([dialog_title("Properties")]),
                 column(rows).gap(tokens::SPACE_2),
                 dialog_footer([button("Close").primary().key("props:close")]),
+            ],
+        ))
+    }
+
+    /// Modal "Open with…" app chooser for entry `id`. App rows are
+    /// keyed `openwith:{desktop-id}`; chrome is keyed `open-with:*`.
+    /// `None` if the entry has aged out of the listing.
+    fn open_with_dialog(&self, id: EntryId) -> Option<El> {
+        let (display, mime) = {
+            let entries = self.listing.entries.lock().unwrap();
+            let entry = entries.get(id as usize)?;
+            let mime = mime_guess::from_path(Path::new(&entry.name)).first_or_octet_stream();
+            (entry.display.clone(), mime)
+        };
+        let body = match &self.app_db {
+            // Probe still running.
+            None => column([text("Loading applications…").caption().muted()]),
+            Some(db) => {
+                let candidates = db.candidates(mime.essence_str());
+                if candidates.is_empty() {
+                    column([text(format!("No applications registered for {}.", mime.essence_str()))
+                        .caption()
+                        .muted()])
+                } else {
+                    let rows: Vec<El> = candidates
+                        .iter()
+                        .map(|c| {
+                            let label = if c.is_default {
+                                format!("{} — default", c.name)
+                            } else {
+                                c.name.clone()
+                            };
+                            button(label)
+                                .ghost()
+                                .key(format!("openwith:{}", c.id))
+                                .width(Size::Fill(1.0))
+                        })
+                        .collect();
+                    column(rows).gap(tokens::SPACE_1)
+                }
+            }
+        };
+        Some(dialog(
+            "open-with",
+            [
+                dialog_header([dialog_title(format!("Open \u{201c}{display}\u{201d} with"))]),
+                body.width(Size::Fill(1.0)),
+                dialog_footer([button("Cancel").ghost().key("open-with:cancel")]),
             ],
         ))
     }
@@ -2090,6 +2181,7 @@ impl App for ExplorerApp {
                     }
                 }
                 Msg::Places(places) => self.places = places,
+                Msg::AppDb(db) => self.app_db = Some(db),
                 Msg::OpenLocation { dir, select } => self.navigate(dir, select),
             }
         }
@@ -2133,6 +2225,29 @@ impl App for ExplorerApp {
                 || event.kind == UiEventKind::Escape
             {
                 self.properties = None;
+            }
+            return;
+        }
+        // The "Open with…" chooser is likewise modal: an app row
+        // launches and closes; cancel/scrim/Escape just close.
+        if let Some(target) = self.open_with {
+            if matches!(event.kind, UiEventKind::Click | UiEventKind::Activate) {
+                if let Some(app_id) = event.route().and_then(|r| r.strip_prefix("openwith:")) {
+                    let app_id = app_id.to_string();
+                    if let Some(path) = self.entry_path(target) {
+                        if let Some(db) = &self.app_db {
+                            db.launch(&app_id, &path);
+                        }
+                    }
+                    self.open_with = None;
+                    return;
+                }
+            }
+            if event.is_click_or_activate("open-with:cancel")
+                || event.is_click_or_activate("open-with:dismiss")
+                || event.kind == UiEventKind::Escape
+            {
+                self.open_with = None;
             }
             return;
         }
@@ -2765,6 +2880,30 @@ pub(crate) mod fixtures {
         app.properties = Some(id);
         app
     }
+
+    /// Browser with the "Open with…" chooser open on a text file,
+    /// backed by a synthetic app database (no real desktop DB).
+    pub(crate) fn open_with() -> ExplorerApp {
+        let mut app = browse();
+        let id = select(&mut app, "notes.txt");
+        app.app_db = Some(Arc::new(AppDb::from_fixture(
+            &[
+                ("org.gnome.gedit.desktop", "gedit"),
+                ("dev.zed.Zed.desktop", "Zed"),
+                ("org.libreoffice.writer.desktop", "LibreOffice Writer"),
+            ],
+            &[(
+                "text/plain",
+                &[
+                    "org.gnome.gedit.desktop",
+                    "dev.zed.Zed.desktop",
+                    "org.libreoffice.writer.desktop",
+                ],
+            )],
+        )));
+        app.open_with = Some(id);
+        app
+    }
 }
 
 #[cfg(test)]
@@ -3105,9 +3244,48 @@ mod tests {
         let docs = id_of(&app, "docs");
         app.open_context_menu(docs, (0.0, 0.0));
         app.properties = Some(docs);
+        app.open_with = Some(docs);
 
         app.navigate(PathBuf::from("/test/elsewhere"), None);
         assert!(app.context_menu.is_none());
         assert!(app.properties.is_none());
+        assert!(app.open_with.is_none());
+    }
+
+    /// "Open with…" opens the modal chooser, which swallows unrelated
+    /// clicks until cancelled.
+    #[test]
+    fn context_open_with_opens_chooser_then_cancels() {
+        let mut app = browse();
+        let cx = EventCx::new();
+        let notes = id_of(&app, "notes.txt");
+        app.open_context_menu(notes, (0.0, 0.0));
+
+        app.on_event(UiEvent::synthetic_click("ctx:open-with"), &cx);
+        assert_eq!(app.open_with, Some(notes));
+        assert!(app.context_menu.is_none());
+
+        app.set_search("x".into());
+        app.on_event(UiEvent::synthetic_click("search-clear"), &cx);
+        assert_eq!(app.open_with, Some(notes), "chooser is modal");
+        assert!(app.search_term().is_some(), "modal swallowed the click");
+
+        app.on_event(UiEvent::synthetic_click("open-with:cancel"), &cx);
+        assert!(app.open_with.is_none());
+    }
+
+    /// Picking an app closes the chooser. (app_db left None so this
+    /// exercises the close path without spawning a real process.)
+    #[test]
+    fn open_with_pick_closes_chooser() {
+        let mut app = browse();
+        let cx = EventCx::new();
+        app.open_with = Some(id_of(&app, "notes.txt"));
+
+        app.on_event(
+            UiEvent::synthetic_click("openwith:org.gnome.gedit.desktop"),
+            &cx,
+        );
+        assert!(app.open_with.is_none());
     }
 }

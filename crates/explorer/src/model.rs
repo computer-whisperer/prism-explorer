@@ -349,6 +349,9 @@ pub enum Msg {
         result: ThumbResult,
     },
     Places(Vec<Place>),
+    /// The desktop-application database, loaded once off-thread at
+    /// startup for the "Open with…" chooser.
+    AppDb(Arc<crate::apps::AppDb>),
     /// External command (D-Bus): navigate to `dir`, then select
     /// `select` once it streams in. Not generation-tagged — it isn't a
     /// stale result, it's a fresh instruction.
