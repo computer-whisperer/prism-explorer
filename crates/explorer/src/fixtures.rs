@@ -52,7 +52,11 @@ pub fn scenes() -> Vec<Scene> {
             app::fixtures::text_preview(),
         ),
         scene("code_preview", BROWSER, app::fixtures::code_preview()),
-        scene("code_preview_half", BROWSER_HALF, app::fixtures::code_preview()),
+        scene(
+            "code_preview_half",
+            BROWSER_HALF,
+            app::fixtures::code_preview(),
+        ),
         scene("details_preview", BROWSER, app::fixtures::details_preview()),
         scene(
             "details_preview_half",
@@ -70,7 +74,11 @@ pub fn scenes() -> Vec<Scene> {
         scene("context_menu", BROWSER, app::fixtures::context_menu()),
         scene("properties", BROWSER, app::fixtures::properties()),
         scene("open_with", BROWSER, app::fixtures::open_with()),
-        scene("new_folder_prompt", BROWSER, app::fixtures::new_folder_prompt()),
+        scene(
+            "new_folder_prompt",
+            BROWSER,
+            app::fixtures::new_folder_prompt(),
+        ),
         scene("rename_prompt", BROWSER, app::fixtures::rename_prompt()),
         scene("confirm_delete", BROWSER, app::fixtures::confirm_delete()),
         scene("op_error", BROWSER, app::fixtures::op_error()),

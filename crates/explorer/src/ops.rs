@@ -164,8 +164,7 @@ mod tests {
     }
 
     fn thread_tag() -> String {
-        format!("{:?}", std::thread::current().id())
-            .replace(|c: char| !c.is_alphanumeric(), "")
+        format!("{:?}", std::thread::current().id()).replace(|c: char| !c.is_alphanumeric(), "")
     }
 
     #[test]
@@ -205,7 +204,10 @@ mod tests {
         }
         .run();
         assert!(out.error.is_none(), "{:?}", out.error);
-        assert_eq!(out.select.as_deref(), Some(std::ffi::OsStr::new("renamed.txt")));
+        assert_eq!(
+            out.select.as_deref(),
+            Some(std::ffi::OsStr::new("renamed.txt"))
+        );
         assert!(!dir.join("a.txt").exists());
         assert!(dir.join("renamed.txt").exists());
 

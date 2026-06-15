@@ -63,11 +63,7 @@ pub(crate) fn highlight(path: &Path, text: &str) -> Option<Vec<Vec<CodeSpan>>> {
 /// Resolve a syntax by extension, then by first line (shebangs,
 /// modelines). "Plain Text" counts as no syntax — prose gets no
 /// highlighting.
-fn syntax_for<'a>(
-    path: &Path,
-    text: &str,
-    syntaxes: &'a SyntaxSet,
-) -> Option<&'a SyntaxReference> {
+fn syntax_for<'a>(path: &Path, text: &str, syntaxes: &'a SyntaxSet) -> Option<&'a SyntaxReference> {
     let plain = syntaxes.find_syntax_plain_text();
     if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
         if let Some(syntax) = syntaxes.find_syntax_by_extension(ext) {

@@ -27,9 +27,7 @@ use damascene_core::widgets::resize_handle::HANDLE_THICKNESS;
 use damascene_core::widgets::select::{self, select_menu, select_trigger};
 use damascene_core::widgets::tabs::{self, tabs_list};
 use damascene_core::widgets::text_input::{self, TextInputOpts};
-use damascene_core::{
-    BuildCx, EventCx, KeyChord, KeyModifiers, Rect, UiEvent, UiEventKind, UiKey,
-};
+use damascene_core::{BuildCx, EventCx, KeyChord, KeyModifiers, Rect, UiEvent, UiEventKind, UiKey};
 use lru::LruCache;
 
 use explorer_io::{listing, stat, EntryKind, Notifier, Pool, Tier};
@@ -1783,9 +1781,7 @@ impl ExplorerApp {
         if layers.len() == 1 {
             layers.pop().unwrap()
         } else {
-            stack(layers)
-                .width(Size::Fill(1.0))
-                .height(Size::Fill(1.0))
+            stack(layers).width(Size::Fill(1.0)).height(Size::Fill(1.0))
         }
     }
 
@@ -1867,9 +1863,12 @@ impl ExplorerApp {
             Some(db) => {
                 let candidates = db.candidates(mime.essence_str());
                 if candidates.is_empty() {
-                    column([text(format!("No applications registered for {}.", mime.essence_str()))
-                        .caption()
-                        .muted()])
+                    column([text(format!(
+                        "No applications registered for {}.",
+                        mime.essence_str()
+                    ))
+                    .caption()
+                    .muted()])
                 } else {
                     let rows: Vec<El> = candidates
                         .iter()
@@ -1912,7 +1911,9 @@ impl ExplorerApp {
             },
         )
         .width(Size::Fill(1.0));
-        let commit = button(prompt.kind.commit_label()).primary().key("prompt:commit");
+        let commit = button(prompt.kind.commit_label())
+            .primary()
+            .key("prompt:commit");
         let commit = if crate::ops::valid_name(prompt.value.trim()) {
             commit
         } else {
@@ -1923,10 +1924,7 @@ impl ExplorerApp {
             [
                 dialog_header([dialog_title(prompt.kind.title())]),
                 field,
-                dialog_footer([
-                    button("Cancel").ghost().key("prompt:cancel"),
-                    commit,
-                ]),
+                dialog_footer([button("Cancel").ghost().key("prompt:cancel"), commit]),
             ],
         )
     }
@@ -1943,7 +1941,9 @@ impl ExplorerApp {
             [
                 dialog_header([dialog_title("Delete permanently?")]),
                 column([
-                    text(format!("\u{201c}{name}\u{201d} will be deleted permanently.")),
+                    text(format!(
+                        "\u{201c}{name}\u{201d} will be deleted permanently."
+                    )),
                     text("This cannot be undone — use Move to Trash to keep a copy.")
                         .caption()
                         .muted(),
@@ -2036,10 +2036,7 @@ fn entry_tooltip_by_parts(name: &str, kind: &str) -> String {
 /// muted column; the value wraps/fills the rest.
 fn property_row(label: &str, value: &str) -> El {
     row([
-        text(label)
-            .caption()
-            .muted()
-            .width(Size::Fixed(72.0)),
+        text(label).caption().muted().width(Size::Fixed(72.0)),
         text(value).caption(),
     ])
     .gap(tokens::SPACE_2)
@@ -2066,10 +2063,7 @@ fn spawn_terminal(dir: &Path) {
         .into_iter()
         .chain(FALLBACKS.iter().map(|s| s.to_string()));
     for term in candidates {
-        match std::process::Command::new(&term)
-            .current_dir(dir)
-            .spawn()
-        {
+        match std::process::Command::new(&term).current_dir(dir).spawn() {
             Ok(_) => return,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
             Err(e) => {
@@ -3113,7 +3107,11 @@ pub(crate) mod fixtures {
         const PLAIN: [u8; 3] = [192, 197, 206];
         let lines = vec![
             vec![span("fn ", KW), span("main", FUNC), span("() {", PLAIN)],
-            vec![span("    let x = ", PLAIN), span("42", NUM), span(";", PLAIN)],
+            vec![
+                span("    let x = ", PLAIN),
+                span("42", NUM),
+                span(";", PLAIN),
+            ],
             vec![span("}", PLAIN)],
         ];
         app.preview = PreviewState::Ready {
@@ -3929,7 +3927,10 @@ mod tests {
             select: Some(OsString::from("fresh")),
             error: None,
         });
-        assert_eq!(app.pending_select.as_deref(), Some(std::ffi::OsStr::new("fresh")));
+        assert_eq!(
+            app.pending_select.as_deref(),
+            Some(std::ffi::OsStr::new("fresh"))
+        );
 
         let mut other = browse();
         other.apply_op_outcome(crate::ops::OpOutcome {
@@ -3937,7 +3938,10 @@ mod tests {
             select: Some(OsString::from("ignored")),
             error: None,
         });
-        assert!(other.pending_select.is_none(), "other-dir op doesn't refresh");
+        assert!(
+            other.pending_select.is_none(),
+            "other-dir op doesn't refresh"
+        );
     }
 
     /// Navigating away drops a pending prompt / confirmation — their

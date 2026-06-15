@@ -392,7 +392,11 @@ mod tests {
             &[],
             &[("text/plain", &["b.desktop"])],
         );
-        let ids: Vec<_> = db.candidates("text/plain").into_iter().map(|c| c.id).collect();
+        let ids: Vec<_> = db
+            .candidates("text/plain")
+            .into_iter()
+            .map(|c| c.id)
+            .collect();
         assert_eq!(ids, vec!["a.desktop".to_string()]);
     }
 
@@ -429,6 +433,10 @@ mod tests {
 
         assert_eq!(apps.defaults.get("text/plain").unwrap(), "high.desktop");
         assert_eq!(apps.added.get("text/plain").unwrap(), &["extra.desktop"]);
-        assert!(apps.removed.get("text/html").unwrap().contains("bad.desktop"));
+        assert!(apps
+            .removed
+            .get("text/html")
+            .unwrap()
+            .contains("bad.desktop"));
     }
 }
