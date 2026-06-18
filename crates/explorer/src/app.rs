@@ -30,7 +30,8 @@ use damascene_core::widgets::text_input::{self, TextInputOpts};
 use damascene_core::{BuildCx, EventCx, KeyChord, KeyModifiers, Rect, UiEvent, UiEventKind, UiKey};
 use lru::LruCache;
 
-use explorer_io::{listing, stat, EntryKind, Notifier, Pool, Tier};
+use explorer_io::transfer::{self, CancelToken, ConflictPolicy, Progress};
+use explorer_io::{listing, stat, EntryKind, Notifier, Pool, Tier, TransferMode};
 use explorer_previews::{BinaryPreview, CodeSpan, Preview, RawPreview, Registry};
 use explorer_thumbs::ThumbCache;
 
@@ -364,6 +365,33 @@ pub struct ExplorerApp {
     confirm_delete: Option<Vec<EntryId>>,
     /// Last file-operation failure, shown modally until dismissed.
     op_error: Option<String>,
+
+    /// Files cut or copied, awaiting a paste. Internal to this process
+    /// (no system-clipboard interop yet) and survives navigation.
+    clipboard: Option<FileClipboard>,
+    /// The copy / move in flight, if any. Holds the shared progress
+    /// snapshot and the cancel handle; survives navigation like the
+    /// metadata ops. One at a time for now.
+    active_transfer: Option<ActiveTransfer>,
+}
+
+/// A pending paste: the source paths and whether paste copies or moves.
+#[derive(Clone)]
+struct FileClipboard {
+    paths: Vec<PathBuf>,
+    mode: TransferMode,
+}
+
+/// A running copy / move. The worker updates `progress` and pokes the
+/// notifier; the UI reads `progress` to draw its strip, and `cancel`
+/// aborts it.
+struct ActiveTransfer {
+    progress: Arc<Mutex<Progress>>,
+    /// Read by the progress strip's Cancel control (a later step); the
+    /// worker already honours it.
+    #[allow(dead_code)]
+    cancel: CancelToken,
+    mode: TransferMode,
 }
 
 /// An open name-entry prompt for a mutating op. The text buffer and its
@@ -469,6 +497,8 @@ impl ExplorerApp {
             prompt: None,
             confirm_delete: None,
             op_error: None,
+            clipboard: None,
+            active_transfer: None,
         };
         app.spawn_places_probe();
         app.spawn_app_db_probe();
@@ -832,6 +862,8 @@ impl ExplorerApp {
         match action {
             "open" => self.activate_id(id),
             "open-with" => self.open_with = Some(id),
+            "copy" => self.set_clipboard(self.bulk_targets(id), TransferMode::Copy),
+            "cut" => self.set_clipboard(self.bulk_targets(id), TransferMode::Move),
             "copy-path" => self.copy_paths(self.bulk_targets(id)),
             "terminal" => self.open_terminal(id),
             "rename" => self.begin_rename(id),
@@ -849,6 +881,7 @@ impl ExplorerApp {
     fn run_background_action(&mut self, action: &str) {
         match action {
             "new-folder" => self.begin_new_folder(),
+            "paste" => self.paste_into(self.cwd.clone()),
             "terminal" => spawn_terminal(&self.cwd),
             _ => {}
         }
@@ -988,6 +1021,124 @@ impl ExplorerApp {
             self.op_error = Some(error);
         } else if outcome.dir == self.cwd {
             self.navigate(self.cwd.clone(), outcome.select);
+        }
+    }
+
+    // ---- copy / cut / paste ----------------------------------------------
+
+    /// Put `ids` on the file clipboard for a later paste. `Copy` leaves
+    /// them in place; `Move` (cut) removes them once pasted.
+    fn set_clipboard(&mut self, ids: Vec<EntryId>, mode: TransferMode) {
+        let paths = self.entry_paths(&ids);
+        if !paths.is_empty() {
+            self.clipboard = Some(FileClipboard { paths, mode });
+        }
+    }
+
+    /// Paste the clipboard into `dest`. Filters out sources that can't go
+    /// there (an item into itself or its own subtree, or a no-op move
+    /// into the directory it already lives in), then spawns the transfer.
+    /// One transfer at a time — a paste while one runs is ignored.
+    fn paste_into(&mut self, dest: PathBuf) {
+        let Some(clip) = self.clipboard.clone() else {
+            return;
+        };
+        if self.active_transfer.is_some() {
+            return;
+        }
+        let sources: Vec<PathBuf> = clip
+            .paths
+            .iter()
+            .filter(|src| paste_source_ok(src, &dest, clip.mode))
+            .cloned()
+            .collect();
+        if sources.is_empty() {
+            return;
+        }
+        self.spawn_transfer(sources, dest, clip.mode);
+    }
+
+    /// Run a copy / move on a detached thread (NOT the pool — a paste must
+    /// survive navigation), updating the shared [`Progress`] and poking
+    /// the notifier so the UI redraws, then posting `Msg::TransferDone`.
+    fn spawn_transfer(&mut self, sources: Vec<PathBuf>, dest: PathBuf, mode: TransferMode) {
+        let cancel = CancelToken::new();
+        let progress = Arc::new(Mutex::new(Progress::default()));
+        self.active_transfer = Some(ActiveTransfer {
+            progress: progress.clone(),
+            cancel: cancel.clone(),
+            mode,
+        });
+        // All sources share a directory in practice (a single selection);
+        // the first one's parent is the side a move empties.
+        let source_dir = sources
+            .first()
+            .and_then(|p| p.parent().map(Path::to_path_buf));
+        let tx = self.tx.clone();
+        let notify = self.notifier.clone();
+        let spawned = std::thread::Builder::new()
+            .name("file-transfer".into())
+            .spawn(move || {
+                let plan = transfer::scan(&sources, &dest, mode, &cancel);
+                let report = if plan.cancelled {
+                    explorer_io::Report {
+                        cancelled: true,
+                        ..Default::default()
+                    }
+                } else {
+                    // Stage 2 has no conflict dialog yet, so default to the
+                    // non-destructive Rename policy; the pre-flight dialog
+                    // will choose this in the next step.
+                    let mut last = std::time::Instant::now();
+                    transfer::run(&plan, ConflictPolicy::Rename, &cancel, &mut |p| {
+                        *progress.lock().unwrap() = p.clone();
+                        // Throttle the redraw poke; the worker can tick the
+                        // callback once per chunk.
+                        if last.elapsed() >= std::time::Duration::from_millis(50) {
+                            notify();
+                            last = std::time::Instant::now();
+                        }
+                    })
+                };
+                let _ = tx.send(Msg::TransferDone(crate::ops::TransferOutcome {
+                    mode,
+                    dest,
+                    source_dir,
+                    report,
+                }));
+                notify();
+            });
+        if let Err(e) = spawned {
+            tracing::error!(error = %e, "file-transfer thread failed to spawn");
+            self.active_transfer = None;
+        }
+    }
+
+    /// Fold a finished transfer back into the UI: clear the in-flight
+    /// state, consume a spent cut clipboard, surface failures, and refresh
+    /// the affected directories if we're still looking at them.
+    fn apply_transfer_outcome(&mut self, outcome: crate::ops::TransferOutcome) {
+        self.active_transfer = None;
+        // A cut is consumed once its move has actually run (not when it was
+        // cancelled before moving anything).
+        let did_something = !(outcome.report.cancelled && outcome.report.copied == 0);
+        if outcome.mode == TransferMode::Move && did_something {
+            self.clipboard = None;
+        }
+        if let Some((path, msg)) = outcome.report.failed.first() {
+            let n = outcome.report.failed.len();
+            self.op_error = Some(if n == 1 {
+                format!(
+                    "Couldn't paste \u{201c}{}\u{201d}: {msg}",
+                    path.file_name().unwrap_or_default().to_string_lossy()
+                )
+            } else {
+                format!("Couldn't paste {n} items: {msg}")
+            });
+        }
+        let here = |d: &Path| d == self.cwd;
+        if here(&outcome.dest) || outcome.source_dir.as_deref().is_some_and(here) {
+            self.navigate(self.cwd.clone(), None);
         }
     }
 
@@ -1895,12 +2046,14 @@ impl ExplorerApp {
         if !is_dir {
             items.push(menu_item("Open with…").key("ctx:open-with"));
         }
-        let copy_label = if n > 1 {
-            format!("Copy {n} paths")
+        let (copy_label, cut_label) = if n > 1 {
+            (format!("Copy {n} items"), format!("Cut {n} items"))
         } else {
-            "Copy path".to_string()
+            ("Copy".to_string(), "Cut".to_string())
         };
-        items.push(menu_item(copy_label).key("ctx:copy-path"));
+        items.push(menu_item(copy_label).key("ctx:copy"));
+        items.push(menu_item(cut_label).key("ctx:cut"));
+        items.push(menu_item("Copy path").key("ctx:copy-path"));
         // "Open terminal here" roots at the entry when it's a directory,
         // otherwise at the current folder (handled in `open_terminal`).
         items.push(menu_item("Open terminal here").key("ctx:terminal"));
@@ -1923,12 +2076,19 @@ impl ExplorerApp {
     }
 
     /// Items for the directory-background right-click menu (empty space).
-    /// Paste joins here once copy/cut exists.
     fn background_menu_items(&self) -> Vec<El> {
-        vec![
-            menu_item("New folder").key("ctx:new-folder"),
-            menu_item("Open terminal here").key("ctx:terminal"),
-        ]
+        let mut items = vec![menu_item("New folder").key("ctx:new-folder")];
+        if let Some(clip) = &self.clipboard {
+            let n = clip.paths.len();
+            let label = if n > 1 {
+                format!("Paste {n} items")
+            } else {
+                "Paste".to_string()
+            };
+            items.push(menu_item(label).key("ctx:paste"));
+        }
+        items.push(menu_item("Open terminal here").key("ctx:terminal"));
+        items
     }
 
     /// Modal details dialog for entry `id`. `None` if the entry has
@@ -2116,13 +2276,29 @@ impl ExplorerApp {
         if !self.show_hidden {
             left.push_str(" · hidden files off (.)");
         }
-        let right = self
-            .selected
-            .and_then(|(id, _)| {
-                let entries = self.listing.entries.lock().unwrap();
-                entries.get(id as usize).map(|e| e.display.clone())
-            })
-            .unwrap_or_default();
+        // A running transfer takes the right slot (transient); otherwise
+        // it shows the selected entry's name. The full progress strip with
+        // a Cancel control is a later step — this is the at-a-glance line.
+        let right = if let Some(transfer) = &self.active_transfer {
+            let p = transfer.progress.lock().unwrap();
+            let verb = match transfer.mode {
+                TransferMode::Copy => "Copying",
+                TransferMode::Move => "Moving",
+            };
+            let pct = p
+                .bytes_done
+                .saturating_mul(100)
+                .checked_div(p.bytes_total)
+                .unwrap_or(0);
+            format!("{verb}… {}/{} files ({pct}%)", p.files_done, p.files_total)
+        } else {
+            self.selected
+                .and_then(|(id, _)| {
+                    let entries = self.listing.entries.lock().unwrap();
+                    entries.get(id as usize).map(|e| e.display.clone())
+                })
+                .unwrap_or_default()
+        };
         row([
             text(left).caption().muted(),
             spacer(),
@@ -2183,6 +2359,20 @@ fn property_row(label: &str, value: &str) -> El {
 /// first one that launches wins. Detached — like `xdg-open`, the child
 /// runs in its own process. A missing binary is skipped silently; any
 /// other spawn error stops the search and is logged.
+/// Whether `src` may be pasted into `dest`. Rejects pasting a thing into
+/// itself or its own subtree (a move there is destructive, a copy would
+/// recurse into its growing self), and a no-op move into the directory
+/// the source already lives in.
+fn paste_source_ok(src: &Path, dest: &Path, mode: TransferMode) -> bool {
+    if dest == src || dest.starts_with(src) {
+        return false;
+    }
+    if mode == TransferMode::Move && src.parent() == Some(dest) {
+        return false;
+    }
+    true
+}
+
 fn spawn_terminal(dir: &Path) {
     const FALLBACKS: [&str; 7] = [
         "foot",
@@ -2632,6 +2822,7 @@ impl App for ExplorerApp {
                 Msg::Places(places) => self.places = places,
                 Msg::AppDb(db) => self.app_db = Some(db),
                 Msg::OpDone(outcome) => self.apply_op_outcome(outcome),
+                Msg::TransferDone(outcome) => self.apply_transfer_outcome(outcome),
                 Msg::OpenLocation { dir, select } => self.navigate(dir, select),
             }
         }
@@ -3480,6 +3671,20 @@ pub(crate) mod fixtures {
         app
     }
 
+    /// Background menu with a loaded clipboard, so the Paste item shows.
+    pub(crate) fn background_menu_paste() -> ExplorerApp {
+        let mut app = browse();
+        app.clipboard = Some(FileClipboard {
+            paths: vec![
+                PathBuf::from("/test/somewhere/notes.txt"),
+                PathBuf::from("/test/somewhere/photo.jxr"),
+            ],
+            mode: TransferMode::Copy,
+        });
+        app.open_background_menu((360.0, 300.0));
+        app
+    }
+
     /// Browser with the modal Properties dialog open on a stat'ed file.
     pub(crate) fn properties() -> ExplorerApp {
         let mut app = browse();
@@ -4124,6 +4329,109 @@ mod tests {
             app.prompt.as_ref().map(|p| &p.kind),
             Some(PromptKind::NewFolder)
         ));
+    }
+
+    /// "Copy" / "Cut" load the file clipboard with the selection's paths
+    /// and the right mode.
+    #[test]
+    fn copy_and_cut_load_the_file_clipboard() {
+        let mut app = browse();
+        let cx = EventCx::new();
+        let notes = id_of(&app, "notes.txt");
+
+        app.open_context_menu(notes, (0.0, 0.0));
+        app.on_event(UiEvent::synthetic_click("ctx:copy"), &cx);
+        let clip = app.clipboard.as_ref().expect("copy set the clipboard");
+        assert_eq!(clip.mode, TransferMode::Copy);
+        assert_eq!(clip.paths, vec![PathBuf::from("/test/somewhere/notes.txt")]);
+
+        app.open_context_menu(notes, (0.0, 0.0));
+        app.on_event(UiEvent::synthetic_click("ctx:cut"), &cx);
+        assert_eq!(app.clipboard.as_ref().unwrap().mode, TransferMode::Move);
+    }
+
+    /// The paste guard refuses self / subtree targets and no-op moves.
+    #[test]
+    fn paste_guard_rejects_unsafe_targets() {
+        let src = Path::new("/a/b");
+        assert!(!paste_source_ok(src, Path::new("/a/b"), TransferMode::Copy));
+        assert!(!paste_source_ok(
+            src,
+            Path::new("/a/b/c"),
+            TransferMode::Move
+        ));
+        assert!(!paste_source_ok(src, Path::new("/a"), TransferMode::Move));
+        assert!(paste_source_ok(src, Path::new("/a"), TransferMode::Copy));
+        assert!(paste_source_ok(
+            src,
+            Path::new("/elsewhere"),
+            TransferMode::Move
+        ));
+    }
+
+    /// A finished move consumes the cut clipboard and refreshes the
+    /// current directory; a copy leaves the clipboard for re-paste.
+    #[test]
+    fn transfer_outcome_consumes_cut_clears_active_and_refreshes() {
+        let mut app = browse();
+        let active = || ActiveTransfer {
+            progress: Arc::new(Mutex::new(Progress::default())),
+            cancel: CancelToken::new(),
+            mode: TransferMode::Move,
+        };
+
+        // A move clears its cut clipboard.
+        app.clipboard = Some(FileClipboard {
+            paths: vec![PathBuf::from("/test/elsewhere/x")],
+            mode: TransferMode::Move,
+        });
+        app.active_transfer = Some(active());
+        app.apply_transfer_outcome(crate::ops::TransferOutcome {
+            mode: TransferMode::Move,
+            dest: app.cwd.clone(),
+            source_dir: None,
+            report: explorer_io::Report {
+                copied: 1,
+                ..Default::default()
+            },
+        });
+        assert!(app.active_transfer.is_none());
+        assert!(app.clipboard.is_none(), "cut consumed by the move");
+
+        // A copy leaves the clipboard in place.
+        app.clipboard = Some(FileClipboard {
+            paths: vec![PathBuf::from("/test/elsewhere/y")],
+            mode: TransferMode::Copy,
+        });
+        app.apply_transfer_outcome(crate::ops::TransferOutcome {
+            mode: TransferMode::Copy,
+            dest: app.cwd.clone(),
+            source_dir: None,
+            report: explorer_io::Report {
+                copied: 1,
+                ..Default::default()
+            },
+        });
+        assert!(app.clipboard.is_some(), "copy keeps the clipboard");
+    }
+
+    /// A transfer that reports failures surfaces a modal error notice.
+    #[test]
+    fn transfer_failure_surfaces_error() {
+        let mut app = browse();
+        app.apply_transfer_outcome(crate::ops::TransferOutcome {
+            mode: TransferMode::Copy,
+            dest: app.cwd.clone(),
+            source_dir: None,
+            report: explorer_io::Report {
+                failed: vec![(PathBuf::from("/test/elsewhere/z"), "disk full".into())],
+                ..Default::default()
+            },
+        });
+        assert!(app
+            .op_error
+            .as_deref()
+            .is_some_and(|m| m.contains("disk full")));
     }
 
     /// A failed op surfaces a modal error notice that swallows clicks

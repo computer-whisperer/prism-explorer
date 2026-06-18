@@ -16,6 +16,21 @@
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
+use explorer_io::{Report, TransferMode};
+
+/// What a finished copy / move reports back to the UI. The worker owns
+/// absolute paths, so (like [`OpOutcome`]) it stays valid wherever the
+/// user has navigated to by the time it lands.
+pub struct TransferOutcome {
+    pub mode: TransferMode,
+    /// The directory pasted into — refreshed if the user is still there.
+    pub dest: PathBuf,
+    /// The directory the moved sources came from — also refreshed (a
+    /// move empties it). `None` for a copy or when sources span dirs.
+    pub source_dir: Option<PathBuf>,
+    pub report: Report,
+}
+
 /// A pending mutating operation, described in full so it can run on a
 /// worker thread with no access to app state.
 pub enum FileOp {

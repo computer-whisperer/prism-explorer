@@ -355,6 +355,9 @@ pub enum Msg {
     /// A mutating file operation (create / rename / delete) finished on
     /// its worker thread. Carries the directory to refresh and any error.
     OpDone(crate::ops::OpOutcome),
+    /// A copy / move finished on its worker thread. Carries the
+    /// directories to refresh and a summary of what landed or failed.
+    TransferDone(crate::ops::TransferOutcome),
     /// External command (D-Bus): navigate to `dir`, then select
     /// `select` once it streams in. Not generation-tagged — it isn't a
     /// stale result, it's a fresh instruction.
