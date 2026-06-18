@@ -16,7 +16,15 @@
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
-use explorer_io::{Report, TransferMode};
+use explorer_io::{Plan, Report, TransferMode};
+
+/// A scanned paste paused for a conflict decision: the measured plan plus
+/// the directory a move would empty. Carried back to the UI so it can ask
+/// the user, then handed to a fresh worker once they choose.
+pub struct PendingTransfer {
+    pub plan: Plan,
+    pub source_dir: Option<PathBuf>,
+}
 
 /// What a finished copy / move reports back to the UI. The worker owns
 /// absolute paths, so (like [`OpOutcome`]) it stays valid wherever the

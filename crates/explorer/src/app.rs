@@ -23,6 +23,7 @@ use damascene_core::selection::{Selection, SelectionPoint, SelectionRange};
 use damascene_core::surface::SurfaceAlpha;
 use damascene_core::widgets::dialog::{dialog, dialog_footer, dialog_header, dialog_title};
 use damascene_core::widgets::popover::{context_menu, menu_item};
+use damascene_core::widgets::progress::{progress, progress_indeterminate};
 use damascene_core::widgets::resize_handle::HANDLE_THICKNESS;
 use damascene_core::widgets::select::{self, select_menu, select_trigger};
 use damascene_core::widgets::tabs::{self, tabs_list};
@@ -373,6 +374,9 @@ pub struct ExplorerApp {
     /// snapshot and the cancel handle; survives navigation like the
     /// metadata ops. One at a time for now.
     active_transfer: Option<ActiveTransfer>,
+    /// A paste paused at the pre-flight conflict dialog, awaiting the
+    /// user's Replace / Skip / Keep-both choice.
+    pending_conflict: Option<crate::ops::PendingTransfer>,
 }
 
 /// A pending paste: the source paths and whether paste copies or moves.
@@ -387,9 +391,8 @@ struct FileClipboard {
 /// aborts it.
 struct ActiveTransfer {
     progress: Arc<Mutex<Progress>>,
-    /// Read by the progress strip's Cancel control (a later step); the
-    /// worker already honours it.
-    #[allow(dead_code)]
+    /// Set by the progress strip's Cancel control; the worker checks it
+    /// between files and chunks.
     cancel: CancelToken,
     mode: TransferMode,
 }
@@ -499,6 +502,7 @@ impl ExplorerApp {
             op_error: None,
             clipboard: None,
             active_transfer: None,
+            pending_conflict: None,
         };
         app.spawn_places_probe();
         app.spawn_app_db_probe();
@@ -1043,7 +1047,7 @@ impl ExplorerApp {
         let Some(clip) = self.clipboard.clone() else {
             return;
         };
-        if self.active_transfer.is_some() {
+        if self.active_transfer.is_some() || self.pending_conflict.is_some() {
             return;
         }
         let sources: Vec<PathBuf> = clip
@@ -1055,13 +1059,15 @@ impl ExplorerApp {
         if sources.is_empty() {
             return;
         }
-        self.spawn_transfer(sources, dest, clip.mode);
+        self.start_paste(sources, dest, clip.mode);
     }
 
-    /// Run a copy / move on a detached thread (NOT the pool — a paste must
-    /// survive navigation), updating the shared [`Progress`] and poking
-    /// the notifier so the UI redraws, then posting `Msg::TransferDone`.
-    fn spawn_transfer(&mut self, sources: Vec<PathBuf>, dest: PathBuf, mode: TransferMode) {
+    /// Begin a paste: scan the sources off-thread (the progress
+    /// denominator + collision check). When the scan is clean the same
+    /// thread runs the transfer; when it finds collisions it hands the
+    /// plan back via `Msg::TransferConflict` so the UI can ask, and a
+    /// later [`resolve_conflict`](Self::resolve_conflict) runs it.
+    fn start_paste(&mut self, sources: Vec<PathBuf>, dest: PathBuf, mode: TransferMode) {
         let cancel = CancelToken::new();
         let progress = Arc::new(Mutex::new(Progress::default()));
         self.active_transfer = Some(ActiveTransfer {
@@ -1080,33 +1086,63 @@ impl ExplorerApp {
             .name("file-transfer".into())
             .spawn(move || {
                 let plan = transfer::scan(&sources, &dest, mode, &cancel);
-                let report = if plan.cancelled {
-                    explorer_io::Report {
-                        cancelled: true,
-                        ..Default::default()
-                    }
+                if !plan.cancelled && plan.has_collisions() {
+                    // Pause for a policy choice; a fresh thread runs it.
+                    let _ = tx.send(Msg::TransferConflict(crate::ops::PendingTransfer {
+                        plan,
+                        source_dir,
+                    }));
+                    notify();
                 } else {
-                    // Stage 2 has no conflict dialog yet, so default to the
-                    // non-destructive Rename policy; the pre-flight dialog
-                    // will choose this in the next step.
-                    let mut last = std::time::Instant::now();
-                    transfer::run(&plan, ConflictPolicy::Rename, &cancel, &mut |p| {
-                        *progress.lock().unwrap() = p.clone();
-                        // Throttle the redraw poke; the worker can tick the
-                        // callback once per chunk.
-                        if last.elapsed() >= std::time::Duration::from_millis(50) {
-                            notify();
-                            last = std::time::Instant::now();
-                        }
-                    })
-                };
-                let _ = tx.send(Msg::TransferDone(crate::ops::TransferOutcome {
-                    mode,
-                    dest,
-                    source_dir,
-                    report,
-                }));
-                notify();
+                    // Clean scan (or cancelled): run now. A surprise
+                    // collision from a race defaults to the safe Skip.
+                    run_transfer(
+                        plan,
+                        ConflictPolicy::Skip,
+                        cancel,
+                        progress,
+                        source_dir,
+                        tx,
+                        notify,
+                    );
+                }
+            });
+        if let Err(e) = spawned {
+            tracing::error!(error = %e, "file-transfer thread failed to spawn");
+            self.active_transfer = None;
+        }
+    }
+
+    /// Answer the conflict dialog. `Some(policy)` runs the pending plan
+    /// under that policy on a fresh worker; `None` cancels the paste.
+    fn resolve_conflict(&mut self, policy: Option<ConflictPolicy>) {
+        let Some(pending) = self.pending_conflict.take() else {
+            return;
+        };
+        let Some(policy) = policy else {
+            return; // cancelled — clipboard kept, nothing moved
+        };
+        let cancel = CancelToken::new();
+        let progress = Arc::new(Mutex::new(Progress::default()));
+        self.active_transfer = Some(ActiveTransfer {
+            progress: progress.clone(),
+            cancel: cancel.clone(),
+            mode: pending.plan.mode,
+        });
+        let tx = self.tx.clone();
+        let notify = self.notifier.clone();
+        let spawned = std::thread::Builder::new()
+            .name("file-transfer".into())
+            .spawn(move || {
+                run_transfer(
+                    pending.plan,
+                    policy,
+                    cancel,
+                    progress,
+                    pending.source_dir,
+                    tx,
+                    notify,
+                );
             });
         if let Err(e) = spawned {
             tracing::error!(error = %e, "file-transfer thread failed to spawn");
@@ -1980,7 +2016,15 @@ impl ExplorerApp {
             .width(Size::Fill(1.0))
             .height(Size::Fill(1.0));
 
-        let page = column([self.toolbar_el(cx), content, self.status_el()])
+        // Toolbar, the panes, an optional transfer strip, then the status
+        // line. The strip sits just above the status bar so a running
+        // paste is visible without covering the listing.
+        let mut rows = vec![self.toolbar_el(cx), content];
+        if let Some(strip) = self.transfer_strip() {
+            rows.push(strip);
+        }
+        rows.push(self.status_el());
+        let page = column(rows)
             .gap(tokens::SPACE_3)
             .width(Size::Fill(1.0))
             .height(Size::Fill(1.0));
@@ -2010,6 +2054,9 @@ impl ExplorerApp {
             if let Some(dialog) = self.confirm_delete_dialog(ids) {
                 layers.push(dialog);
             }
+        }
+        if let Some(pending) = &self.pending_conflict {
+            layers.push(self.conflict_dialog(pending));
         }
         if let Some(message) = &self.op_error {
             layers.push(self.op_error_dialog(message));
@@ -2264,6 +2311,86 @@ impl ExplorerApp {
         )
     }
 
+    /// Pre-flight conflict dialog: some pasted names already exist at the
+    /// destination, so ask once how to combine them.
+    fn conflict_dialog(&self, pending: &crate::ops::PendingTransfer) -> El {
+        let n = pending.plan.items.iter().filter(|i| i.collides).count();
+        let dest = pending
+            .plan
+            .dest
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| pending.plan.dest.display().to_string());
+        let subject = if n == 1 {
+            "item already exists"
+        } else {
+            "items already exist"
+        };
+        dialog(
+            "transfer-conflict",
+            [
+                dialog_header([dialog_title("Items already exist")]),
+                column([
+                    text(format!("{n} {subject} in \u{201c}{dest}\u{201d}.")),
+                    text(
+                        "Replace overwrites them, Skip keeps the existing files, \
+                         Keep both copies alongside.",
+                    )
+                    .caption()
+                    .muted()
+                    .wrap_text()
+                    .width(Size::Fill(1.0)),
+                ])
+                .gap(tokens::SPACE_2),
+                dialog_footer([
+                    button("Cancel").ghost().key("conflict:cancel"),
+                    button("Skip").key("conflict:skip"),
+                    button("Keep both").key("conflict:rename"),
+                    button("Replace").primary().key("conflict:replace"),
+                ]),
+            ],
+        )
+    }
+
+    /// Non-modal progress strip for a running transfer: a one-line status
+    /// (or "Preparing…" during the scan), a bar, and a Cancel button.
+    /// `None` when nothing is in flight.
+    fn transfer_strip(&self) -> Option<El> {
+        let transfer = self.active_transfer.as_ref()?;
+        let p = transfer.progress.lock().unwrap();
+        let verb = match transfer.mode {
+            TransferMode::Copy => "Copying",
+            TransferMode::Move => "Moving",
+        };
+        // No totals yet → still scanning; show an indeterminate bar.
+        let (label, bar) = if p.files_total == 0 {
+            ("Preparing\u{2026}".to_string(), progress_indeterminate())
+        } else {
+            let name = p
+                .current
+                .as_ref()
+                .and_then(|c| c.file_name())
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let frac = p.bytes_done as f32 / p.bytes_total.max(1) as f32;
+            (
+                format!("{verb} {name} — {}/{} files", p.files_done, p.files_total),
+                progress(frac),
+            )
+        };
+        Some(
+            row([
+                column([text(label).caption().muted(), bar.width(Size::Fill(1.0))])
+                    .gap(tokens::SPACE_1)
+                    .width(Size::Fill(1.0)),
+                button("Cancel").ghost().key("transfer:cancel"),
+            ])
+            .gap(tokens::SPACE_3)
+            .align(Align::Center)
+            .width(Size::Fill(1.0)),
+        )
+    }
+
     fn status_el(&self) -> El {
         let mut left = if let Some(search) = self.search_term() {
             format!("{} matches for \"{search}\"", self.listing.order.len())
@@ -2276,29 +2403,15 @@ impl ExplorerApp {
         if !self.show_hidden {
             left.push_str(" · hidden files off (.)");
         }
-        // A running transfer takes the right slot (transient); otherwise
-        // it shows the selected entry's name. The full progress strip with
-        // a Cancel control is a later step — this is the at-a-glance line.
-        let right = if let Some(transfer) = &self.active_transfer {
-            let p = transfer.progress.lock().unwrap();
-            let verb = match transfer.mode {
-                TransferMode::Copy => "Copying",
-                TransferMode::Move => "Moving",
-            };
-            let pct = p
-                .bytes_done
-                .saturating_mul(100)
-                .checked_div(p.bytes_total)
-                .unwrap_or(0);
-            format!("{verb}… {}/{} files ({pct}%)", p.files_done, p.files_total)
-        } else {
-            self.selected
-                .and_then(|(id, _)| {
-                    let entries = self.listing.entries.lock().unwrap();
-                    entries.get(id as usize).map(|e| e.display.clone())
-                })
-                .unwrap_or_default()
-        };
+        // A running transfer has its own progress strip above the status
+        // bar, so this slot just names the selected entry.
+        let right = self
+            .selected
+            .and_then(|(id, _)| {
+                let entries = self.listing.entries.lock().unwrap();
+                entries.get(id as usize).map(|e| e.display.clone())
+            })
+            .unwrap_or_default();
         row([
             text(left).caption().muted(),
             spacer(),
@@ -2371,6 +2484,46 @@ fn paste_source_ok(src: &Path, dest: &Path, mode: TransferMode) -> bool {
         return false;
     }
     true
+}
+
+/// Run a scanned plan to completion on the calling worker thread,
+/// mirroring progress into `progress` (poking `notify` at most every
+/// 50ms so the strip animates without flooding redraws), then posting
+/// `Msg::TransferDone`. Shared by the clean-scan and post-dialog paths.
+#[allow(clippy::too_many_arguments)]
+fn run_transfer(
+    plan: explorer_io::Plan,
+    policy: ConflictPolicy,
+    cancel: CancelToken,
+    progress: Arc<Mutex<Progress>>,
+    source_dir: Option<PathBuf>,
+    tx: Sender<Msg>,
+    notify: Notifier,
+) {
+    let mode = plan.mode;
+    let dest = plan.dest.clone();
+    let report = if plan.cancelled {
+        explorer_io::Report {
+            cancelled: true,
+            ..Default::default()
+        }
+    } else {
+        let mut last = std::time::Instant::now();
+        transfer::run(&plan, policy, &cancel, &mut |p| {
+            *progress.lock().unwrap() = p.clone();
+            if last.elapsed() >= std::time::Duration::from_millis(50) {
+                notify();
+                last = std::time::Instant::now();
+            }
+        })
+    };
+    let _ = tx.send(Msg::TransferDone(crate::ops::TransferOutcome {
+        mode,
+        dest,
+        source_dir,
+        report,
+    }));
+    notify();
 }
 
 fn spawn_terminal(dir: &Path) {
@@ -2822,6 +2975,12 @@ impl App for ExplorerApp {
                 Msg::Places(places) => self.places = places,
                 Msg::AppDb(db) => self.app_db = Some(db),
                 Msg::OpDone(outcome) => self.apply_op_outcome(outcome),
+                Msg::TransferConflict(pending) => {
+                    // Scan finished; the running-state it held is now a
+                    // paused decision.
+                    self.active_transfer = None;
+                    self.pending_conflict = Some(pending);
+                }
                 Msg::TransferDone(outcome) => self.apply_transfer_outcome(outcome),
                 Msg::OpenLocation { dir, select } => self.navigate(dir, select),
             }
@@ -2936,6 +3095,29 @@ impl App for ExplorerApp {
                 || event.kind == UiEventKind::Escape
             {
                 self.confirm_delete = None;
+            }
+            return;
+        }
+        // The pre-flight conflict dialog is modal: pick a policy (which
+        // starts the transfer) or cancel the paste.
+        if self.pending_conflict.is_some() {
+            if event.is_click_or_activate("conflict:replace") {
+                self.resolve_conflict(Some(ConflictPolicy::Replace));
+                return;
+            }
+            if event.is_click_or_activate("conflict:skip") {
+                self.resolve_conflict(Some(ConflictPolicy::Skip));
+                return;
+            }
+            if event.is_click_or_activate("conflict:rename") {
+                self.resolve_conflict(Some(ConflictPolicy::Rename));
+                return;
+            }
+            if event.is_click_or_activate("conflict:cancel")
+                || event.is_click_or_activate("conflict:dismiss")
+                || event.kind == UiEventKind::Escape
+            {
+                self.resolve_conflict(None);
             }
             return;
         }
@@ -3122,6 +3304,12 @@ impl App for ExplorerApp {
             }
             if key == "new-folder" && event.is_click_or_activate(key) {
                 self.begin_new_folder();
+                return;
+            }
+            if key == "transfer:cancel" && event.is_click_or_activate(key) {
+                if let Some(t) = &self.active_transfer {
+                    t.cancel.cancel();
+                }
                 return;
             }
         }
@@ -3695,6 +3883,46 @@ pub(crate) mod fixtures {
             mode: TransferMode::Copy,
         });
         app.open_background_menu((360.0, 300.0));
+        app
+    }
+
+    /// The pre-flight conflict dialog (a paste whose names already exist).
+    pub(crate) fn transfer_conflict() -> ExplorerApp {
+        let mut app = browse();
+        app.pending_conflict = Some(crate::ops::PendingTransfer {
+            plan: explorer_io::Plan {
+                mode: TransferMode::Copy,
+                dest: PathBuf::from("/test/somewhere"),
+                items: vec![explorer_io::PlanItem {
+                    src_root: PathBuf::from("/elsewhere/notes.txt"),
+                    name: "notes.txt".into(),
+                    bytes: 1024,
+                    files: 1,
+                    collides: true,
+                }],
+                total_bytes: 1024,
+                total_files: 1,
+                cancelled: false,
+            },
+            source_dir: None,
+        });
+        app
+    }
+
+    /// The non-modal progress strip mid-copy.
+    pub(crate) fn transfer_progress() -> ExplorerApp {
+        let mut app = browse();
+        app.active_transfer = Some(ActiveTransfer {
+            progress: Arc::new(Mutex::new(Progress {
+                bytes_done: 3_200_000,
+                bytes_total: 10_000_000,
+                files_done: 4,
+                files_total: 12,
+                current: Some(PathBuf::from("/elsewhere/clip.mp4")),
+            })),
+            cancel: CancelToken::new(),
+            mode: TransferMode::Copy,
+        });
         app
     }
 
@@ -4445,6 +4673,71 @@ mod tests {
             .op_error
             .as_deref()
             .is_some_and(|m| m.contains("disk full")));
+    }
+
+    /// The conflict dialog: a policy choice clears the dialog and starts a
+    /// transfer; Cancel clears it and keeps the clipboard untouched.
+    #[test]
+    fn conflict_choice_starts_transfer_cancel_keeps_clipboard() {
+        let cwd = browse().cwd.clone();
+        let pending = || crate::ops::PendingTransfer {
+            plan: explorer_io::Plan {
+                mode: TransferMode::Copy,
+                dest: cwd.clone(),
+                items: vec![explorer_io::PlanItem {
+                    src_root: PathBuf::from("/nope/a.txt"),
+                    name: "a.txt".into(),
+                    bytes: 0,
+                    files: 1,
+                    collides: true,
+                }],
+                total_bytes: 0,
+                total_files: 1,
+                cancelled: false,
+            },
+            source_dir: None,
+        };
+
+        // Cancel: dialog closes, nothing starts, clipboard stays.
+        let mut app = browse();
+        let cx = EventCx::new();
+        app.clipboard = Some(FileClipboard {
+            paths: vec![PathBuf::from("/nope/a.txt")],
+            mode: TransferMode::Copy,
+        });
+        app.pending_conflict = Some(pending());
+        app.on_event(UiEvent::synthetic_click("conflict:cancel"), &cx);
+        assert!(app.pending_conflict.is_none());
+        assert!(app.active_transfer.is_none(), "cancel starts nothing");
+        assert!(app.clipboard.is_some(), "cancel keeps the clipboard");
+
+        // A policy choice closes the dialog and starts the transfer (the
+        // worker runs on the missing paths and fails harmlessly).
+        app.pending_conflict = Some(pending());
+        app.on_event(UiEvent::synthetic_click("conflict:skip"), &cx);
+        assert!(app.pending_conflict.is_none());
+        assert!(app.active_transfer.is_some(), "policy choice starts work");
+    }
+
+    /// Paste is ignored while a transfer is in flight (one at a time).
+    #[test]
+    fn paste_ignored_while_busy() {
+        let mut app = browse();
+        app.clipboard = Some(FileClipboard {
+            paths: vec![PathBuf::from("/nope/a.txt")],
+            mode: TransferMode::Copy,
+        });
+        app.active_transfer = Some(ActiveTransfer {
+            progress: Arc::new(Mutex::new(Progress::default())),
+            cancel: CancelToken::new(),
+            mode: TransferMode::Copy,
+        });
+        let dest = app.cwd.clone();
+        app.paste_into(dest);
+        assert!(
+            app.pending_conflict.is_none(),
+            "a second paste does not start while busy"
+        );
     }
 
     /// A failed op surfaces a modal error notice that swallows clicks

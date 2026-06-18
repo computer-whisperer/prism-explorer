@@ -78,6 +78,16 @@ pub fn scenes() -> Vec<Scene> {
             BROWSER,
             app::fixtures::background_menu_paste(),
         ),
+        scene(
+            "transfer_conflict",
+            BROWSER,
+            app::fixtures::transfer_conflict(),
+        ),
+        scene(
+            "transfer_progress",
+            BROWSER,
+            app::fixtures::transfer_progress(),
+        ),
         scene("properties", BROWSER, app::fixtures::properties()),
         scene("open_with", BROWSER, app::fixtures::open_with()),
         scene(

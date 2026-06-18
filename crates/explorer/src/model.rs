@@ -355,6 +355,9 @@ pub enum Msg {
     /// A mutating file operation (create / rename / delete) finished on
     /// its worker thread. Carries the directory to refresh and any error.
     OpDone(crate::ops::OpOutcome),
+    /// A copy / move scan found name collisions and paused for a policy
+    /// choice. Carries the measured plan for the conflict dialog.
+    TransferConflict(crate::ops::PendingTransfer),
     /// A copy / move finished on its worker thread. Carries the
     /// directories to refresh and a summary of what landed or failed.
     TransferDone(crate::ops::TransferOutcome),
