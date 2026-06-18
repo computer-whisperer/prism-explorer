@@ -15,11 +15,14 @@
 //!   items already exist at the destination. The caller resolves those
 //!   collisions *before* [`run`] starts — one blanket [`ConflictPolicy`]
 //!   for the whole paste — so the worker never has to stop and ask.
-//! - [`run`] does the work. A same-filesystem move is a single atomic
-//!   `rename(2)` (instant, no byte copy); only a cross-device move falls
-//!   back to copy-then-unlink. Copies go in chunks so a large file can
-//!   be cancelled partway, and only fully-copied sources are unlinked on
-//!   a move — a cancelled or failed transfer never loses data.
+//! - [`run`] does the work, with `cp -r` / `mv` semantics: a same-name
+//!   directory is **merged** (existing files the source doesn't touch are
+//!   left alone), not clobbered, and the policy applies per conflicting
+//!   file. A same-filesystem move to a free name is a single atomic
+//!   `rename(2)` (instant, no byte copy); a merge, a cross-device move,
+//!   and every copy walk the tree. Copies go in chunks so a large file
+//!   can be cancelled partway, and only fully-copied sources are unlinked
+//!   on a move — a cancelled or failed transfer never loses data.
 //!
 //! [`Pool`]: crate::Pool
 
@@ -56,21 +59,23 @@ pub enum TransferMode {
     Move,
 }
 
-/// What to do with a top-level source whose name already exists at the
-/// destination. Chosen once, up front, and applied to every colliding
-/// item. (`Cancel` is handled before [`run`] — the caller simply doesn't
-/// start the transfer.)
+/// How to handle a name that already exists at the destination. Chosen
+/// once, up front, and applied throughout the paste. (`Cancel` is handled
+/// before [`run`] — the caller simply doesn't start the transfer.)
 ///
-/// A colliding **directory** is replaced as a whole tree, not merged:
-/// `Replace` removes the existing destination directory first. Per-file
-/// tree merging is a deliberate non-goal for this version.
+/// Same-name **directories always merge** (`cp -r`); the policy decides
+/// only what happens to a conflicting *file*. `Replace` and `Skip` leave
+/// existing destination files the source doesn't touch alone.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConflictPolicy {
-    /// Overwrite the existing destination (removing a directory tree).
+    /// Overwrite a conflicting file; merge into a same-name directory.
+    /// Refuses to swap a directory for a file or vice versa.
     Replace,
-    /// Leave the existing destination untouched; don't copy this item.
+    /// Keep the existing file (merging still adds files the destination
+    /// lacks); on a move the kept file's source is left in place.
     Skip,
-    /// Copy alongside under a freed-up name — `foo` → `foo (copy)`.
+    /// Copy a colliding top-level item alongside under a freed-up name —
+    /// `foo` → `foo (copy)` — never merging or overwriting.
     Rename,
 }
 
@@ -231,77 +236,174 @@ pub fn run(
             report.cancelled = true;
             break;
         }
-
-        // Resolve the destination path under the chosen policy.
-        let plain = plan.dest.join(&item.name);
-        let target = if item.collides {
-            match policy {
-                ConflictPolicy::Skip => {
-                    report.skipped += 1;
-                    // Account for the skipped bytes/files so the bar
-                    // still reaches 100%.
-                    progress.bytes_done += item.bytes;
-                    progress.files_done += item.files;
-                    on_progress(&progress);
-                    continue;
-                }
-                ConflictPolicy::Replace => {
-                    if let Err(e) = remove_any(&plain) {
-                        report.failed.push((item.src_root.clone(), e.to_string()));
-                        continue;
-                    }
-                    plain
-                }
-                ConflictPolicy::Rename => unique_name(&plan.dest, &item.name),
-            }
-        } else {
-            plain
-        };
-
-        match transfer_item(item, &target, plan.mode, cancel, &mut progress, on_progress) {
-            Ok(()) => report.copied += 1,
+        match place_item(
+            item,
+            &plan.dest,
+            plan.mode,
+            policy,
+            cancel,
+            &mut progress,
+            on_progress,
+        ) {
+            Ok(Outcome::Copied) => report.copied += 1,
+            Ok(Outcome::Skipped) => report.skipped += 1,
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {
-                // Cancelled mid-item: drop the partial destination so we
-                // don't leave a half-written file/tree behind.
-                let _ = remove_any(&target);
                 report.cancelled = true;
                 break;
             }
-            Err(e) => {
-                let _ = remove_any(&target);
-                report.failed.push((item.src_root.clone(), e.to_string()));
-            }
+            Err(e) => report.failed.push((item.src_root.clone(), e.to_string())),
         }
     }
 
     report
 }
 
-/// Move or copy a single top-level item to `target`. A same-filesystem
-/// move is one `rename(2)`; everything else copies the subtree, then (on
-/// a move) removes the source once it has fully landed.
-fn transfer_item(
+/// What became of one node — the top-level call's result drives the
+/// report tally; inner-node results are discarded.
+enum Outcome {
+    Copied,
+    Skipped,
+}
+
+/// Place one top-level item under `dest`. `Rename` gives a colliding item
+/// a fresh sibling name (copied whole, never merged); otherwise this
+/// hands off to the merge-aware [`place`], which handles a same-name
+/// directory by merging rather than clobbering.
+fn place_item(
     item: &PlanItem,
-    target: &Path,
+    dest: &Path,
     mode: TransferMode,
+    policy: ConflictPolicy,
     cancel: &CancelToken,
     progress: &mut Progress,
     on_progress: &mut dyn FnMut(&Progress),
-) -> std::io::Result<()> {
-    if mode == TransferMode::Move && same_filesystem(&item.src_root, target) {
-        std::fs::rename(&item.src_root, target)?;
+) -> std::io::Result<Outcome> {
+    let target = if item.collides && policy == ConflictPolicy::Rename {
+        unique_name(dest, &item.name)
+    } else {
+        dest.join(&item.name)
+    };
+
+    // Fast path: a same-filesystem move to a free name is one atomic
+    // rename — no byte copy, no walk. (A collision under Replace/Skip
+    // falls through to the merge path; rename can't merge.)
+    if mode == TransferMode::Move
+        && !target.symlink_exists()
+        && same_filesystem(&item.src_root, &target)
+    {
+        std::fs::rename(&item.src_root, &target)?;
         progress.bytes_done += item.bytes;
         progress.files_done += item.files;
         on_progress(progress);
-        return Ok(());
+        return Ok(Outcome::Copied);
     }
 
-    copy_tree(&item.src_root, target, cancel, progress, on_progress)?;
-    if mode == TransferMode::Move {
-        // Only reached on full success — safe to drop the source.
-        remove_any(&item.src_root)?;
+    place(
+        &item.src_root,
+        &target,
+        mode,
+        policy,
+        cancel,
+        progress,
+        on_progress,
+    )
+}
+
+/// Place `src` at `dst`, merging into an existing directory the way
+/// `cp -r` does:
+///
+/// - `dst` absent → copy `src` whole (and, on a move, remove the source).
+/// - both directories → **merge**: recurse per child, leaving existing
+///   destination files that the source doesn't touch.
+/// - otherwise a conflicting leaf → apply `policy`: `Replace` overwrites
+///   (refusing a directory-vs-file mismatch, like `cp`), `Skip` keeps the
+///   destination and — matching `mv -n` — leaves the source in place too.
+fn place(
+    src: &Path,
+    dst: &Path,
+    mode: TransferMode,
+    policy: ConflictPolicy,
+    cancel: &CancelToken,
+    progress: &mut Progress,
+    on_progress: &mut dyn FnMut(&Progress),
+) -> std::io::Result<Outcome> {
+    if cancel.is_cancelled() {
+        return Err(cancelled_error());
     }
-    Ok(())
+    let src_meta = std::fs::symlink_metadata(src)?;
+    let dst_meta = std::fs::symlink_metadata(dst).ok();
+
+    match dst_meta {
+        // Nothing there: copy the whole node, clean up the source on move.
+        None => {
+            if let Err(e) = copy_tree(src, dst, cancel, progress, on_progress) {
+                // Drop a partial node so a failure/cancel leaves no
+                // half-written file or tree behind.
+                let _ = remove_any(dst);
+                return Err(e);
+            }
+            if mode == TransferMode::Move {
+                remove_any(src)?;
+            }
+            Ok(Outcome::Copied)
+        }
+        // Two directories: merge child by child.
+        Some(dm) if src_meta.is_dir() && dm.is_dir() => {
+            for entry in std::fs::read_dir(src)? {
+                if cancel.is_cancelled() {
+                    return Err(cancelled_error());
+                }
+                let entry = entry?;
+                place(
+                    &entry.path(),
+                    &dst.join(entry.file_name()),
+                    mode,
+                    policy,
+                    cancel,
+                    progress,
+                    on_progress,
+                )?;
+            }
+            preserve_permissions(&src_meta, dst);
+            if mode == TransferMode::Move {
+                // Best-effort: succeeds only if every child moved out
+                // (skipped files keep the source directory alive).
+                let _ = std::fs::remove_dir(src);
+            }
+            Ok(Outcome::Copied)
+        }
+        // A conflicting leaf (file vs file, or a type mismatch).
+        Some(dm) => match policy {
+            ConflictPolicy::Replace => {
+                if src_meta.is_dir() || dm.is_dir() {
+                    // cp/mv refuse to swap a directory for a non-directory
+                    // (or vice versa) — never silently delete a tree here.
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::AlreadyExists,
+                        "refusing to replace a directory with a file or vice versa",
+                    ));
+                }
+                remove_any(dst)?;
+                if let Err(e) = copy_tree(src, dst, cancel, progress, on_progress) {
+                    let _ = remove_any(dst);
+                    return Err(e);
+                }
+                if mode == TransferMode::Move {
+                    remove_any(src)?;
+                }
+                Ok(Outcome::Copied)
+            }
+            // Skip / Rename (Rename is resolved at the top level; reaching
+            // it here means a deep collision, which we treat as Skip).
+            _ => {
+                // Account for the skipped leaf so the bar still completes.
+                progress.bytes_done += src_meta.len();
+                progress.files_done += 1;
+                on_progress(progress);
+                Ok(Outcome::Skipped)
+            }
+        },
+    }
 }
 
 /// Recursively copy `src` to `dst`: directories are recreated and walked,
@@ -654,6 +756,109 @@ mod tests {
         let report = run(&plan, ConflictPolicy::Replace, &cancel, &mut |_| {});
         assert_eq!(report.copied, 1);
         assert_eq!(std::fs::read(dst.join("a.txt")).unwrap(), b"new");
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// A same-name directory merges (cp -r) rather than clobbering: the
+    /// destination keeps files the source doesn't touch, and the policy
+    /// decides colliding files.
+    #[test]
+    fn directory_collision_merges_and_applies_policy_per_file() {
+        let make = |root: &Path| {
+            let src = root.join("d");
+            std::fs::create_dir_all(&src).unwrap();
+            std::fs::write(src.join("shared.txt"), b"new").unwrap();
+            std::fs::write(src.join("added.txt"), b"new").unwrap();
+            let dst = root.join("dest");
+            std::fs::create_dir_all(dst.join("d")).unwrap();
+            std::fs::write(dst.join("d/shared.txt"), b"old").unwrap();
+            std::fs::write(dst.join("d/keep.txt"), b"old").unwrap();
+            (src, dst)
+        };
+
+        // Replace: disjoint dest file survives, shared is overwritten,
+        // new file is added.
+        let root = scratch("merge-replace");
+        let (src, dst) = make(&root);
+        let report = transfer(
+            std::slice::from_ref(&src),
+            &dst,
+            TransferMode::Copy,
+            ConflictPolicy::Replace,
+        );
+        assert_eq!(report.copied, 1);
+        assert_eq!(std::fs::read(dst.join("d/keep.txt")).unwrap(), b"old");
+        assert_eq!(std::fs::read(dst.join("d/shared.txt")).unwrap(), b"new");
+        assert_eq!(std::fs::read(dst.join("d/added.txt")).unwrap(), b"new");
+        std::fs::remove_dir_all(&root).unwrap();
+
+        // Skip: shared is kept as-is, new file still lands.
+        let root = scratch("merge-skip");
+        let (src, dst) = make(&root);
+        transfer(
+            std::slice::from_ref(&src),
+            &dst,
+            TransferMode::Copy,
+            ConflictPolicy::Skip,
+        );
+        assert_eq!(std::fs::read(dst.join("d/shared.txt")).unwrap(), b"old");
+        assert_eq!(std::fs::read(dst.join("d/keep.txt")).unwrap(), b"old");
+        assert_eq!(std::fs::read(dst.join("d/added.txt")).unwrap(), b"new");
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// A move that merges leaves the source's skipped files behind (mv -n)
+    /// but removes the ones that actually moved.
+    #[test]
+    fn move_merge_removes_moved_sources_keeps_skipped() {
+        let root = scratch("move-merge");
+        let src = root.join("d");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("shared.txt"), b"new").unwrap();
+        std::fs::write(src.join("added.txt"), b"new").unwrap();
+        let dst = root.join("dest");
+        std::fs::create_dir_all(dst.join("d")).unwrap();
+        std::fs::write(dst.join("d/shared.txt"), b"old").unwrap();
+
+        transfer(
+            std::slice::from_ref(&src),
+            &dst,
+            TransferMode::Move,
+            ConflictPolicy::Skip,
+        );
+        // Skipped file stays at the source; moved file is gone; the
+        // non-empty source directory survives.
+        assert!(src.join("shared.txt").exists(), "skipped source kept");
+        assert!(!src.join("added.txt").exists(), "moved source removed");
+        assert_eq!(std::fs::read(dst.join("d/added.txt")).unwrap(), b"new");
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// Replace refuses a directory-vs-file mismatch instead of deleting a
+    /// tree (matching cp/mv).
+    #[test]
+    fn replace_refuses_directory_file_mismatch() {
+        let root = scratch("mismatch");
+        let src = root.join("x"); // a file
+        std::fs::write(&src, b"file").unwrap();
+        let dst = root.join("dest");
+        std::fs::create_dir_all(dst.join("x/inner")).unwrap(); // x is a dir
+
+        let report = transfer(
+            std::slice::from_ref(&src),
+            &dst,
+            TransferMode::Copy,
+            ConflictPolicy::Replace,
+        );
+        assert_eq!(report.copied, 0);
+        assert_eq!(
+            report.failed.len(),
+            1,
+            "mismatch is reported, not destructive"
+        );
+        assert!(dst.join("x/inner").is_dir(), "existing tree untouched");
 
         std::fs::remove_dir_all(&root).unwrap();
     }
