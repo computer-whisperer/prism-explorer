@@ -72,6 +72,7 @@ pub fn scenes() -> Vec<Scene> {
         scene("multiselect", BROWSER, multiselect()),
         scene("multiselect_half", BROWSER_HALF, multiselect()),
         scene("context_menu", BROWSER, app::fixtures::context_menu()),
+        scene("background_menu", BROWSER, app::fixtures::background_menu()),
         scene("properties", BROWSER, app::fixtures::properties()),
         scene("open_with", BROWSER, app::fixtures::open_with()),
         scene(

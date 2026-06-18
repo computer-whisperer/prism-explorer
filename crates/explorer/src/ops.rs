@@ -23,11 +23,13 @@ pub enum FileOp {
     NewFolder { parent: PathBuf, name: String },
     /// Rename `from` to `to` within the same directory.
     Rename { from: PathBuf, to: PathBuf },
-    /// Move `path` to the XDG trash (recoverable).
-    Trash { path: PathBuf },
-    /// Permanently remove `path` — a file, a symlink (not its target),
-    /// or a directory tree. Irreversible.
-    DeletePermanent { path: PathBuf },
+    /// Move every path to the XDG trash (recoverable). One op per
+    /// multi-selection: the paths share a directory, so a single
+    /// post-op refresh covers them all.
+    Trash { paths: Vec<PathBuf> },
+    /// Permanently remove every path — a file, a symlink (not its
+    /// target), or a directory tree. Irreversible.
+    DeletePermanent { paths: Vec<PathBuf> },
 }
 
 /// What the UI should do once an op finishes. Always produced — failures
@@ -50,22 +52,28 @@ impl FileOp {
         match self {
             FileOp::NewFolder { parent, .. } => parent.clone(),
             FileOp::Rename { from, .. } => parent_of(from),
-            FileOp::Trash { path } | FileOp::DeletePermanent { path } => parent_of(path),
+            FileOp::Trash { paths } | FileOp::DeletePermanent { paths } => {
+                paths.first().map(|p| parent_of(p)).unwrap_or_default()
+            }
         }
     }
 
     /// Run the operation (blocking IO). The outcome carries the parent
     /// directory to refresh, the entry to re-select, and any error —
-    /// prefixed with what was being attempted so the modal names it.
+    /// prefixed with what was being attempted so the modal names it. A
+    /// batch op (trash / delete) runs every path even if one fails, and
+    /// reports a summary of the failures.
     pub fn run(self) -> OpOutcome {
         let dir = self.dir();
-        let describe = self.describe();
-        let (select, result) = match self {
+        let (select, error) = match self {
             FileOp::NewFolder { parent, name } => {
                 let target = parent.join(&name);
                 // create_dir (not _all) refuses to clobber an existing
                 // entry — a single atomic syscall, no check-then-act gap.
-                (Some(OsString::from(&name)), std::fs::create_dir(&target))
+                let error = std::fs::create_dir(&target)
+                    .err()
+                    .map(|e| format!("Couldn't create the folder \u{201c}{name}\u{201d}: {e}"));
+                (Some(OsString::from(&name)), error)
             }
             FileOp::Rename { from, to } => {
                 let select = to.file_name().map(OsString::from);
@@ -75,47 +83,64 @@ impl FileOp {
                 // create between the two could still be clobbered. std
                 // has no `renameat2(RENAME_NOREPLACE)`; for a local
                 // single-user browser the window is acceptable.
-                match to.try_exists() {
-                    Ok(true) => (
-                        select,
-                        Err(std::io::Error::new(
-                            std::io::ErrorKind::AlreadyExists,
-                            "a file with that name already exists",
-                        )),
-                    ),
-                    Ok(false) => (select, std::fs::rename(&from, &to)),
-                    Err(e) => (select, Err(e)),
-                }
+                let result = match to.try_exists() {
+                    Ok(true) => Err(std::io::Error::new(
+                        std::io::ErrorKind::AlreadyExists,
+                        "a file with that name already exists",
+                    )),
+                    Ok(false) => std::fs::rename(&from, &to),
+                    Err(e) => Err(e),
+                };
+                let error = result.err().map(|e| {
+                    format!(
+                        "Couldn't rename to \u{201c}{}\u{201d}: {e}",
+                        file_name_str(&to)
+                    )
+                });
+                (select, error)
             }
-            FileOp::Trash { path } => (
+            FileOp::Trash { paths } => (
                 None,
-                trash::delete(&path).map_err(|e| std::io::Error::other(e.to_string())),
+                batch_error(&paths, "move", " to Trash", |p| {
+                    trash::delete(p).map_err(|e| std::io::Error::other(e.to_string()))
+                }),
             ),
-            FileOp::DeletePermanent { path } => (None, delete_permanent(&path)),
+            FileOp::DeletePermanent { paths } => {
+                (None, batch_error(&paths, "delete", "", delete_permanent))
+            }
         };
-        OpOutcome {
-            dir,
-            select,
-            error: result.err().map(|e| format!("Couldn't {describe}: {e}")),
-        }
+        OpOutcome { dir, select, error }
     }
+}
 
-    /// A human phrase for the attempt, used to prefix error messages —
-    /// e.g. `move "notes.txt" to Trash`.
-    fn describe(&self) -> String {
-        match self {
-            FileOp::NewFolder { name, .. } => format!("create the folder \u{201c}{name}\u{201d}"),
-            FileOp::Rename { to, .. } => {
-                format!("rename to \u{201c}{}\u{201d}", file_name_str(to))
-            }
-            FileOp::Trash { path } => {
-                format!("move \u{201c}{}\u{201d} to Trash", file_name_str(path))
-            }
-            FileOp::DeletePermanent { path } => {
-                format!("delete \u{201c}{}\u{201d}", file_name_str(path))
-            }
+/// Run `run_one` over every path, then summarise any failures into one
+/// message. `None` means everything succeeded. The phrasing matches the
+/// single-item wording when there's exactly one path (`Couldn't move
+/// "x" to Trash: …`) and counts otherwise (`Couldn't move 2 of 5 items
+/// to Trash: …`), always naming the first error.
+fn batch_error(
+    paths: &[PathBuf],
+    verb: &str,
+    suffix: &str,
+    run_one: impl Fn(&Path) -> std::io::Result<()>,
+) -> Option<String> {
+    let mut first: Option<(String, std::io::Error)> = None;
+    let mut failed = 0usize;
+    for path in paths {
+        if let Err(e) = run_one(path) {
+            failed += 1;
+            first.get_or_insert_with(|| (file_name_str(path), e));
         }
     }
+    let (name, err) = first?;
+    Some(if paths.len() == 1 {
+        format!("Couldn't {verb} \u{201c}{name}\u{201d}{suffix}: {err}")
+    } else {
+        format!(
+            "Couldn't {verb} {failed} of {} items{suffix}: {err}",
+            paths.len()
+        )
+    })
 }
 
 /// Permanently remove `path`. Directories go recursively; a symlink is
@@ -231,7 +256,7 @@ mod tests {
         std::fs::write(dir.join("tree/inner/leaf"), b"y").unwrap();
 
         assert!(FileOp::DeletePermanent {
-            path: dir.join("file"),
+            paths: vec![dir.join("file")],
         }
         .run()
         .error
@@ -239,12 +264,33 @@ mod tests {
         assert!(!dir.join("file").exists());
 
         assert!(FileOp::DeletePermanent {
-            path: dir.join("tree"),
+            paths: vec![dir.join("tree")],
         }
         .run()
         .error
         .is_none());
         assert!(!dir.join("tree").exists());
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn trash_and_delete_run_every_path_and_summarise_failures() {
+        let dir = scratch("batch");
+        std::fs::write(dir.join("a"), b"a").unwrap();
+        std::fs::write(dir.join("b"), b"b").unwrap();
+
+        // Two real entries plus one that doesn't exist: the present ones
+        // are removed and the single failure is reported with a count.
+        let out = FileOp::DeletePermanent {
+            paths: vec![dir.join("a"), dir.join("missing"), dir.join("b")],
+        }
+        .run();
+        assert!(!dir.join("a").exists());
+        assert!(!dir.join("b").exists());
+        let msg = out.error.expect("the missing path should fail");
+        assert!(msg.contains("1 of 3 items"), "{msg}");
+        assert_eq!(out.dir, dir);
 
         std::fs::remove_dir_all(&dir).unwrap();
     }

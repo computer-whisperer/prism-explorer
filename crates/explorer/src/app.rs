@@ -359,8 +359,9 @@ pub struct ExplorerApp {
     /// An open New Folder / Rename name-entry prompt (modal). While it's
     /// up `hotkeys()` returns empty so editing keys reach the field.
     prompt: Option<Prompt>,
-    /// Entry awaiting a permanent-delete confirmation (modal).
-    confirm_delete: Option<EntryId>,
+    /// Entries awaiting a permanent-delete confirmation (modal). Holds
+    /// the whole selection so the dialog can name the count.
+    confirm_delete: Option<Vec<EntryId>>,
     /// Last file-operation failure, shown modally until dismissed.
     op_error: Option<String>,
 }
@@ -397,12 +398,20 @@ impl PromptKind {
     }
 }
 
-/// An open entry context menu (right-click). The browser window owns
-/// at most one.
+/// An open context menu (right-click). The browser window owns at most
+/// one.
 #[derive(Clone, Copy)]
 struct ContextMenu {
-    target: EntryId,
+    target: ContextTarget,
     point: (f32, f32),
+}
+
+/// What a context menu acts on: a specific entry (the row that was
+/// right-clicked) or the directory background (empty space).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ContextTarget {
+    Entry(EntryId),
+    Background,
 }
 
 impl ExplorerApp {
@@ -743,34 +752,104 @@ impl ExplorerApp {
         entries.get(id as usize).map(|e| self.cwd.join(&e.name))
     }
 
-    /// Right-click opened a context menu for entry `id` at `point`. The
-    /// row is selected first (file-manager convention) so the menu and
-    /// the selection agree on a target.
+    /// Right-click opened a context menu for entry `id` at `point`.
+    /// Right-clicking a row outside the current multi-selection collapses
+    /// to it (file-manager convention) so the menu and selection agree;
+    /// right-clicking one already in the selection keeps the whole set so
+    /// a bulk action covers all of it.
     fn open_context_menu(&mut self, id: EntryId, point: (f32, f32)) {
-        self.select_only(id);
-        self.context_menu = Some(ContextMenu { target: id, point });
+        if !self.marked.contains(&id) {
+            self.select_only(id);
+        }
+        self.context_menu = Some(ContextMenu {
+            target: ContextTarget::Entry(id),
+            point,
+        });
     }
 
-    /// Queue the entry's absolute path for the system clipboard. The
-    /// host drains `clipboard_writes` into its `arboard` clipboard.
-    fn copy_path(&mut self, id: EntryId) {
-        if let Some(path) = self.entry_path(id) {
-            self.clipboard_writes
-                .push(path.to_string_lossy().into_owned());
+    /// Right-click landed on empty listing space — open the directory
+    /// (background) menu at `point`.
+    fn open_background_menu(&mut self, point: (f32, f32)) {
+        self.context_menu = Some(ContextMenu {
+            target: ContextTarget::Background,
+            point,
+        });
+    }
+
+    /// The entries a bulk action (trash / delete / copy-path) targets:
+    /// the whole multi-selection when `anchor` is part of it, otherwise
+    /// just `anchor`. Returned in listing order.
+    fn bulk_targets(&self, anchor: EntryId) -> Vec<EntryId> {
+        if self.marked.contains(&anchor) {
+            self.listing
+                .order
+                .iter()
+                .copied()
+                .filter(|id| self.marked.contains(id))
+                .collect()
+        } else {
+            vec![anchor]
+        }
+    }
+
+    /// Absolute paths of `ids` (dirs included), skipping any that have
+    /// aged out of the listing.
+    fn entry_paths(&self, ids: &[EntryId]) -> Vec<PathBuf> {
+        let entries = self.listing.entries.lock().unwrap();
+        ids.iter()
+            .filter_map(|&id| entries.get(id as usize).map(|e| self.cwd.join(&e.name)))
+            .collect()
+    }
+
+    /// Queue the entries' absolute paths for the system clipboard, one
+    /// per line. The host drains `clipboard_writes` into its `arboard`
+    /// clipboard (taking the last entry, so a multi-selection must be a
+    /// single newline-joined string).
+    fn copy_paths(&mut self, ids: Vec<EntryId>) {
+        let paths = self.entry_paths(&ids);
+        if !paths.is_empty() {
+            let joined = paths
+                .iter()
+                .map(|p| p.to_string_lossy())
+                .collect::<Vec<_>>()
+                .join("\n");
+            self.clipboard_writes.push(joined);
         }
     }
 
     /// Dispatch a `ctx:*` menu item to its action.
-    fn run_context_action(&mut self, action: &str, target: EntryId) {
+    fn run_context_action(&mut self, action: &str, target: ContextTarget) {
+        match target {
+            ContextTarget::Entry(id) => self.run_entry_action(action, id),
+            ContextTarget::Background => self.run_background_action(action),
+        }
+    }
+
+    /// Dispatch an entry-menu item. Destructive and copy actions span the
+    /// whole multi-selection (`bulk_targets`); open / rename / properties
+    /// stay on the right-clicked entry.
+    fn run_entry_action(&mut self, action: &str, id: EntryId) {
         match action {
-            "open" => self.activate_id(target),
-            "open-with" => self.open_with = Some(target),
-            "copy-path" => self.copy_path(target),
-            "terminal" => self.open_terminal(target),
-            "rename" => self.begin_rename(target),
-            "trash" => self.trash_entry(target),
-            "delete" => self.confirm_delete = Some(target),
-            "properties" => self.properties = Some(target),
+            "open" => self.activate_id(id),
+            "open-with" => self.open_with = Some(id),
+            "copy-path" => self.copy_paths(self.bulk_targets(id)),
+            "terminal" => self.open_terminal(id),
+            "rename" => self.begin_rename(id),
+            "trash" => {
+                let targets = self.bulk_targets(id);
+                self.trash_entries(targets);
+            }
+            "delete" => self.confirm_delete = Some(self.bulk_targets(id)),
+            "properties" => self.properties = Some(id),
+            _ => {}
+        }
+    }
+
+    /// Dispatch a background-menu item (acts on the current directory).
+    fn run_background_action(&mut self, action: &str) {
+        match action {
+            "new-folder" => self.begin_new_folder(),
+            "terminal" => spawn_terminal(&self.cwd),
             _ => {}
         }
     }
@@ -882,18 +961,20 @@ impl ExplorerApp {
         }
     }
 
-    /// Move entry `id` to the trash (recoverable).
-    fn trash_entry(&mut self, id: EntryId) {
-        if let Some(path) = self.entry_path(id) {
-            self.spawn_op(crate::ops::FileOp::Trash { path });
+    /// Move `ids` to the trash (recoverable) in one op.
+    fn trash_entries(&mut self, ids: Vec<EntryId>) {
+        let paths = self.entry_paths(&ids);
+        if !paths.is_empty() {
+            self.spawn_op(crate::ops::FileOp::Trash { paths });
         }
     }
 
-    /// Permanently delete the entry the confirm dialog targets.
+    /// Permanently delete the entries the confirm dialog targets.
     fn confirm_delete_now(&mut self) {
-        if let Some(id) = self.confirm_delete.take() {
-            if let Some(path) = self.entry_path(id) {
-                self.spawn_op(crate::ops::FileOp::DeletePermanent { path });
+        if let Some(ids) = self.confirm_delete.take() {
+            let paths = self.entry_paths(&ids);
+            if !paths.is_empty() {
+                self.spawn_op(crate::ops::FileOp::DeletePermanent { paths });
             }
         }
     }
@@ -1730,10 +1811,14 @@ impl ExplorerApp {
             panes.push(self.sidebar_el(sidebar_w));
             panes.push(resize_handle("sidebar-resize", Axis::Row));
         }
+        // Keyed so a right-click on empty listing space (below the rows,
+        // or in an empty directory) routes here for the background menu;
+        // the rows inside claim their own hits first.
         panes.push(
             card([center.padding(tokens::SPACE_2)])
                 .width(Size::Fill(1.0))
-                .height(Size::Fill(1.0)),
+                .height(Size::Fill(1.0))
+                .key("listing-area"),
         );
         if let Some(preview_w) = chrome.preview_w {
             panes.push(resize_handle("preview-resize", Axis::Row));
@@ -1770,8 +1855,8 @@ impl ExplorerApp {
         if let Some(prompt) = &self.prompt {
             layers.push(self.prompt_dialog(prompt));
         }
-        if let Some(id) = self.confirm_delete {
-            if let Some(dialog) = self.confirm_delete_dialog(id) {
+        if let Some(ids) = &self.confirm_delete {
+            if let Some(dialog) = self.confirm_delete_dialog(ids) {
                 layers.push(dialog);
             }
         }
@@ -1788,27 +1873,62 @@ impl ExplorerApp {
     /// The right-click menu popover for `menu`, anchored at the click
     /// point. Items are keyed `ctx:*` and routed in `on_event`.
     fn context_menu_el(&self, menu: ContextMenu) -> El {
+        let items = match menu.target {
+            ContextTarget::Entry(id) => self.entry_menu_items(id),
+            ContextTarget::Background => self.background_menu_items(),
+        };
+        context_menu("context-menu", menu.point, items)
+    }
+
+    /// Items for an entry's right-click menu. Destructive / copy actions
+    /// name the multi-selection count when one is active so the user can
+    /// see the menu acts on all of it.
+    fn entry_menu_items(&self, id: EntryId) -> Vec<El> {
         let is_dir = {
             let entries = self.listing.entries.lock().unwrap();
-            entries
-                .get(menu.target as usize)
-                .is_some_and(|e| e.is_dir())
+            entries.get(id as usize).is_some_and(|e| e.is_dir())
         };
+        let n = self.bulk_targets(id).len();
         let mut items = vec![menu_item("Open").key("ctx:open")];
         // "Open with…" picks a non-default handler — only meaningful
         // for files (directories open in the browser itself).
         if !is_dir {
             items.push(menu_item("Open with…").key("ctx:open-with"));
         }
-        items.push(menu_item("Copy path").key("ctx:copy-path"));
+        let copy_label = if n > 1 {
+            format!("Copy {n} paths")
+        } else {
+            "Copy path".to_string()
+        };
+        items.push(menu_item(copy_label).key("ctx:copy-path"));
         // "Open terminal here" roots at the entry when it's a directory,
         // otherwise at the current folder (handled in `open_terminal`).
         items.push(menu_item("Open terminal here").key("ctx:terminal"));
         items.push(menu_item("Rename…").key("ctx:rename"));
-        items.push(menu_item("Move to Trash").key("ctx:trash"));
-        items.push(menu_item("Delete permanently…").key("ctx:delete"));
+        let (trash_label, delete_label) = if n > 1 {
+            (
+                format!("Move {n} items to Trash"),
+                format!("Delete {n} items permanently…"),
+            )
+        } else {
+            (
+                "Move to Trash".to_string(),
+                "Delete permanently…".to_string(),
+            )
+        };
+        items.push(menu_item(trash_label).key("ctx:trash"));
+        items.push(menu_item(delete_label).key("ctx:delete"));
         items.push(menu_item("Properties").key("ctx:properties"));
-        context_menu("entry-menu", menu.point, items)
+        items
+    }
+
+    /// Items for the directory-background right-click menu (empty space).
+    /// Paste joins here once copy/cut exists.
+    fn background_menu_items(&self) -> Vec<El> {
+        vec![
+            menu_item("New folder").key("ctx:new-folder"),
+            menu_item("Open terminal here").key("ctx:terminal"),
+        ]
     }
 
     /// Modal details dialog for entry `id`. `None` if the entry has
@@ -1929,21 +2049,36 @@ impl ExplorerApp {
         )
     }
 
-    /// Modal confirmation before a permanent (non-trash) delete.
-    /// `None` if the target has aged out of the listing.
-    fn confirm_delete_dialog(&self, id: EntryId) -> Option<El> {
-        let name = {
+    /// Modal confirmation before a permanent (non-trash) delete. Names
+    /// the single entry, or the count for a multi-selection. `None` if
+    /// every target has aged out of the listing.
+    fn confirm_delete_dialog(&self, ids: &[EntryId]) -> Option<El> {
+        let lead = {
             let entries = self.listing.entries.lock().unwrap();
-            entries.get(id as usize)?.display.clone()
+            match ids {
+                [id] => format!(
+                    "\u{201c}{}\u{201d} will be deleted permanently.",
+                    entries.get(*id as usize)?.display
+                ),
+                _ => {
+                    // Skip any that aged out; bail only if all are gone.
+                    let live = ids
+                        .iter()
+                        .filter(|&&id| entries.get(id as usize).is_some())
+                        .count();
+                    if live == 0 {
+                        return None;
+                    }
+                    format!("{live} items will be deleted permanently.")
+                }
+            }
         };
         Some(dialog(
             "confirm-delete",
             [
                 dialog_header([dialog_title("Delete permanently?")]),
                 column([
-                    text(format!(
-                        "\u{201c}{name}\u{201d} will be deleted permanently."
-                    )),
+                    text(lead),
                     text("This cannot be undone — use Move to Trash to keep a copy.")
                         .caption()
                         .muted(),
@@ -2756,6 +2891,11 @@ impl App for ExplorerApp {
                     return;
                 }
             }
+            if key == "listing-area" && event.kind == UiEventKind::SecondaryClick {
+                let point = event.pointer.unwrap_or_default();
+                self.open_background_menu(point);
+                return;
+            }
             if let Some(i) = key
                 .strip_prefix("place:")
                 .and_then(|s| s.parse::<usize>().ok())
@@ -2852,11 +2992,12 @@ impl App for ExplorerApp {
             }
         } else if event.is_hotkey("trash") {
             if let Some(id) = self.selected_id() {
-                self.trash_entry(id);
+                let targets = self.bulk_targets(id);
+                self.trash_entries(targets);
             }
         } else if event.is_hotkey("delete-permanent") {
             if let Some(id) = self.selected_id() {
-                self.confirm_delete = Some(id);
+                self.confirm_delete = Some(self.bulk_targets(id));
             }
         }
     }
@@ -3331,6 +3472,14 @@ pub(crate) mod fixtures {
         app
     }
 
+    /// Browser with the directory-background (empty-space) menu open —
+    /// the New Folder / terminal popover, no entry targeted.
+    pub(crate) fn background_menu() -> ExplorerApp {
+        let mut app = browse();
+        app.open_background_menu((360.0, 300.0));
+        app
+    }
+
     /// Browser with the modal Properties dialog open on a stat'ed file.
     pub(crate) fn properties() -> ExplorerApp {
         let mut app = browse();
@@ -3383,7 +3532,7 @@ pub(crate) mod fixtures {
     pub(crate) fn confirm_delete() -> ExplorerApp {
         let mut app = browse();
         let id = select(&mut app, "notes.txt");
-        app.confirm_delete = Some(id);
+        app.confirm_delete = Some(vec![id]);
         app
     }
 
@@ -3398,7 +3547,7 @@ pub(crate) mod fixtures {
 
 #[cfg(test)]
 mod tests {
-    use super::fixtures::{browse, grid};
+    use super::fixtures::{browse, grid, mark};
     use super::*;
     use crate::host::HostApp;
     use explorer_io::listing::ListingUpdate;
@@ -3659,7 +3808,10 @@ mod tests {
         let mut app = browse();
         let photo = id_of(&app, "photo.jxr");
         app.open_context_menu(photo, (12.0, 34.0));
-        assert_eq!(app.context_menu.map(|m| m.target), Some(photo));
+        assert_eq!(
+            app.context_menu.map(|m| m.target),
+            Some(ContextTarget::Entry(photo))
+        );
         assert_eq!(app.selected.map(|(id, _)| id), Some(photo));
     }
 
@@ -3882,16 +4034,96 @@ mod tests {
         app.open_context_menu(notes, (0.0, 0.0));
 
         app.on_event(UiEvent::synthetic_click("ctx:delete"), &cx);
-        assert_eq!(app.confirm_delete, Some(notes));
+        assert_eq!(app.confirm_delete, Some(vec![notes]));
         assert!(app.context_menu.is_none());
 
         app.set_search("y".into());
         app.on_event(UiEvent::synthetic_click("search-clear"), &cx);
-        assert_eq!(app.confirm_delete, Some(notes), "modal swallowed the click");
+        assert_eq!(
+            app.confirm_delete,
+            Some(vec![notes]),
+            "modal swallowed the click"
+        );
         assert!(app.search_term().is_some());
 
         app.on_event(UiEvent::synthetic_click("confirm-delete:cancel"), &cx);
         assert!(app.confirm_delete.is_none());
+    }
+
+    /// A bulk action spans the whole multi-selection (listing order) when
+    /// its anchor is part of it, and just the anchor otherwise.
+    #[test]
+    fn bulk_targets_span_the_marked_selection() {
+        let mut app = browse();
+        mark(&mut app, "notes.txt");
+        mark(&mut app, "photo.jxr");
+        let notes = id_of(&app, "notes.txt");
+        let photo = id_of(&app, "photo.jxr");
+
+        let mut spanned = app.bulk_targets(notes);
+        spanned.sort_unstable();
+        let mut both = vec![notes, photo];
+        both.sort_unstable();
+        assert_eq!(spanned, both, "anchor in the set → whole set");
+
+        let docs = id_of(&app, "docs");
+        assert_eq!(
+            app.bulk_targets(docs),
+            vec![docs],
+            "anchor outside the set → just the anchor"
+        );
+    }
+
+    /// Right-clicking a row already in the multi-selection keeps the set
+    /// (so the menu acts on all of it); right-clicking outside collapses.
+    #[test]
+    fn context_menu_keeps_or_collapses_selection() {
+        let mut app = browse();
+        mark(&mut app, "notes.txt");
+        mark(&mut app, "photo.jxr");
+        let notes = id_of(&app, "notes.txt");
+
+        app.open_context_menu(notes, (0.0, 0.0));
+        assert_eq!(app.marked.len(), 2, "right-click inside keeps the set");
+
+        let docs = id_of(&app, "docs");
+        app.open_context_menu(docs, (0.0, 0.0));
+        assert!(app.marked.is_empty(), "right-click outside collapses");
+        assert_eq!(app.selected.map(|(id, _)| id), Some(docs));
+    }
+
+    /// "Delete permanently…" on a multi-selection confirms the whole set.
+    #[test]
+    fn context_delete_targets_whole_selection() {
+        let mut app = browse();
+        let cx = EventCx::new();
+        mark(&mut app, "notes.txt");
+        mark(&mut app, "photo.jxr");
+        let notes = id_of(&app, "notes.txt");
+
+        app.open_context_menu(notes, (0.0, 0.0));
+        app.on_event(UiEvent::synthetic_click("ctx:delete"), &cx);
+        let confirmed = app.confirm_delete.expect("confirmation opened");
+        assert_eq!(confirmed.len(), 2, "both marked entries are confirmed");
+    }
+
+    /// The directory-background menu's "New folder" opens the prompt.
+    #[test]
+    fn background_menu_new_folder_opens_prompt() {
+        let mut app = browse();
+        let cx = EventCx::new();
+        app.open_background_menu((10.0, 10.0));
+        assert_eq!(
+            app.context_menu.map(|m| m.target),
+            Some(ContextTarget::Background)
+        );
+
+        app.on_event(UiEvent::synthetic_click("ctx:new-folder"), &cx);
+        assert!(app.context_menu.is_none());
+        assert!(matches!(
+            app.prompt.as_ref().map(|p| &p.kind),
+            Some(PromptKind::NewFolder)
+        ));
     }
 
     /// A failed op surfaces a modal error notice that swallows clicks
@@ -3951,7 +4183,7 @@ mod tests {
         let mut app = browse();
         let notes = id_of(&app, "notes.txt");
         app.begin_rename(notes);
-        app.confirm_delete = Some(notes);
+        app.confirm_delete = Some(vec![notes]);
 
         app.navigate(PathBuf::from("/test/elsewhere"), None);
         assert!(app.prompt.is_none());
