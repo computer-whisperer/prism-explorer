@@ -88,6 +88,7 @@ pub fn scenes() -> Vec<Scene> {
             BROWSER,
             app::fixtures::transfer_progress(),
         ),
+        scene("cut_entries", BROWSER, app::fixtures::cut_entries()),
         scene("properties", BROWSER, app::fixtures::properties()),
         scene("open_with", BROWSER, app::fixtures::open_with()),
         scene(

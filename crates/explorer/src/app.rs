@@ -47,6 +47,8 @@ use crate::places::Place;
 use crate::preview_policy::{grid_thumbnail_policy, GridThumbPolicy};
 
 const ROW_H: f32 = 34.0;
+/// Paint alpha for entries cut to the clipboard (faded until pasted).
+const CUT_DIM: f32 = 0.45;
 const SIDEBAR_MIN: f32 = 160.0;
 const SIDEBAR_MAX: f32 = 420.0;
 const PREVIEW_MIN: f32 = 260.0;
@@ -1039,6 +1041,21 @@ impl ExplorerApp {
         }
     }
 
+    /// Names in the current directory that are on the clipboard as a cut
+    /// (mode `Move`), so the views can dim them until the paste lands.
+    /// Empty for a copy or an empty clipboard.
+    fn cut_names(&self) -> HashSet<OsString> {
+        match &self.clipboard {
+            Some(clip) if clip.mode == TransferMode::Move => clip
+                .paths
+                .iter()
+                .filter(|p| p.parent() == Some(self.cwd.as_path()))
+                .filter_map(|p| p.file_name().map(OsString::from))
+                .collect(),
+            _ => HashSet::new(),
+        }
+    }
+
     /// Paste the clipboard into `dest`. Filters out sources that can't go
     /// there (an item into itself or its own subtree, or a no-op move
     /// into the directory it already lives in), then spawns the transfer.
@@ -1577,6 +1594,7 @@ impl ExplorerApp {
         let stat_requested = self.stat_requested.clone();
         let selected_id = self.selected_id();
         let marked = self.marked.clone();
+        let cut = self.cut_names();
 
         virtual_list(order.len(), ROW_H, move |i| {
             let id = order[i];
@@ -1639,10 +1657,17 @@ impl ExplorerApp {
             .key(format!("row:{id}"))
             .focusable()
             .tooltip(entry_tooltip(e));
-            if Some(id) == selected_id || is_marked {
+            let r = if Some(id) == selected_id || is_marked {
                 r.current()
             } else {
                 r.ghost()
+            };
+            // Cut entries fade until the paste lands or the clipboard
+            // changes.
+            if cut.contains(&e.name) {
+                r.opacity(CUT_DIM)
+            } else {
+                r
             }
         })
         // The gap keeps row focus rings from being occluded by the
@@ -1685,6 +1710,7 @@ impl ExplorerApp {
         let thumbs = self.thumbs.clone();
         let selected_id = self.selected_id();
         let marked = self.marked.clone();
+        let cut = self.cut_names();
 
         virtual_list(rows, TILE_H + TILE_GAP, move |r| {
             let mut cells = Vec::with_capacity(cols);
@@ -1710,6 +1736,7 @@ impl ExplorerApp {
                 );
 
                 let name = e.display.clone();
+                let is_cut = cut.contains(&e.name);
                 let icon_name = entry_icon(e);
                 let preview_label = e.preview_kind.label();
                 let thumb_policy =
@@ -1800,10 +1827,16 @@ impl ExplorerApp {
                     .key(format!("row:{id}"))
                     .focusable()
                     .tooltip(entry_tooltip_by_parts(&name, preview_label));
-                cells.push(if Some(id) == selected_id || is_marked {
+                let cell = if Some(id) == selected_id || is_marked {
                     cell.current()
                 } else {
                     cell.ghost()
+                };
+                // Cut tiles fade until the paste lands.
+                cells.push(if is_cut {
+                    cell.opacity(CUT_DIM)
+                } else {
+                    cell
                 });
             }
             row(cells).gap(TILE_GAP)
@@ -3909,6 +3942,16 @@ pub(crate) mod fixtures {
         app
     }
 
+    /// A listing with two entries cut to the clipboard (shown dimmed).
+    pub(crate) fn cut_entries() -> ExplorerApp {
+        let mut app = browse();
+        app.clipboard = Some(FileClipboard {
+            paths: vec![app.cwd.join("notes.txt"), app.cwd.join("photo.jxr")],
+            mode: TransferMode::Move,
+        });
+        app
+    }
+
     /// The non-modal progress strip mid-copy.
     pub(crate) fn transfer_progress() -> ExplorerApp {
         let mut app = browse();
@@ -4589,6 +4632,30 @@ mod tests {
         app.open_context_menu(notes, (0.0, 0.0));
         app.on_event(UiEvent::synthetic_click("ctx:cut"), &cx);
         assert_eq!(app.clipboard.as_ref().unwrap().mode, TransferMode::Move);
+    }
+
+    /// Cut (not copy) clipboard entries in the current directory are
+    /// reported for dimming; entries elsewhere and copies are not.
+    #[test]
+    fn cut_names_covers_only_cut_entries_in_cwd() {
+        let mut app = browse();
+
+        app.clipboard = Some(FileClipboard {
+            paths: vec![app.cwd.join("notes.txt")],
+            mode: TransferMode::Copy,
+        });
+        assert!(app.cut_names().is_empty(), "a copy doesn't dim anything");
+
+        app.clipboard = Some(FileClipboard {
+            paths: vec![app.cwd.join("notes.txt"), PathBuf::from("/other/x")],
+            mode: TransferMode::Move,
+        });
+        let cut = app.cut_names();
+        assert!(cut.contains(std::ffi::OsStr::new("notes.txt")));
+        assert!(
+            !cut.contains(std::ffi::OsStr::new("x")),
+            "only entries in the current directory dim"
+        );
     }
 
     /// The paste guard refuses self / subtree targets and no-op moves.
