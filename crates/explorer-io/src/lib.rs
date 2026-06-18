@@ -28,8 +28,10 @@ mod pool;
 
 pub mod listing;
 pub mod stat;
+pub mod transfer;
 
 pub use pool::{Notifier, Pool, Tier};
+pub use transfer::{CancelToken, ConflictPolicy, Plan, PlanItem, Progress, Report, TransferMode};
 
 use std::ffi::OsString;
 
