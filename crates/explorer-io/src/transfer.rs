@@ -166,7 +166,11 @@ pub fn scan(sources: &[PathBuf], dest: &Path, mode: TransferMode, cancel: &Cance
         let (bytes, files) = measure(src, cancel);
         total_bytes += bytes;
         total_files += files;
-        let collides = dest.join(&name).symlink_exists();
+        // A name that resolves back to the source itself (pasting into its
+        // own directory) isn't a user-facing conflict — it becomes a
+        // duplicate, handled automatically in `place_item`.
+        let target = dest.join(&name);
+        let collides = target.symlink_exists() && target != *src;
         items.push(PlanItem {
             src_root: src.clone(),
             name,
@@ -278,10 +282,16 @@ fn place_item(
     progress: &mut Progress,
     on_progress: &mut dyn FnMut(&Progress),
 ) -> std::io::Result<Outcome> {
-    let target = if item.collides && policy == ConflictPolicy::Rename {
+    let plain = dest.join(&item.name);
+    // Pasting an item into its own directory can only mean "duplicate"
+    // (merging or replacing it onto itself is nonsensical and would be
+    // destructive), so it always gets a fresh name — no dialog, matching
+    // how GUI file managers turn a same-folder paste into "x (copy)".
+    let self_paste = plain == item.src_root;
+    let target = if self_paste || (item.collides && policy == ConflictPolicy::Rename) {
         unique_name(dest, &item.name)
     } else {
-        dest.join(&item.name)
+        plain
     };
 
     // Fast path: a same-filesystem move to a free name is one atomic
@@ -698,6 +708,38 @@ mod tests {
             b"leaf"
         );
         assert!(src.join("top.txt").exists(), "copy keeps the source tree");
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// Copying an item into its own directory duplicates it — no
+    /// collision is reported (so no dialog) and the original is untouched.
+    #[test]
+    fn copy_into_source_directory_duplicates_silently() {
+        let root = scratch("self-paste");
+        std::fs::create_dir_all(root.join("test1")).unwrap();
+        std::fs::write(root.join("test1/a.txt"), b"x").unwrap();
+
+        let cancel = CancelToken::new();
+        let plan = scan(
+            std::slice::from_ref(&root.join("test1")),
+            &root,
+            TransferMode::Copy,
+            &cancel,
+        );
+        assert!(
+            !plan.has_collisions(),
+            "a paste into the source's own dir is not a user-facing conflict"
+        );
+
+        let report = run(&plan, ConflictPolicy::Skip, &cancel, &mut |_| {});
+        assert_eq!(report.copied, 1);
+        assert!(root.join("test1").is_dir(), "original kept");
+        assert_eq!(
+            std::fs::read(root.join("test1 (copy)/a.txt")).unwrap(),
+            b"x",
+            "duplicate created alongside"
+        );
 
         std::fs::remove_dir_all(&root).unwrap();
     }
