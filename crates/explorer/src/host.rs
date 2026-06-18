@@ -1054,7 +1054,19 @@ impl WindowState {
                 .with_viewport(viewport.w, viewport.h);
             let mut tree = self.app.build(&cx);
             gfx.renderer.set_theme(theme);
-            gfx.renderer.set_hotkeys(self.app.hotkeys());
+            // Yield hotkeys to a focused text input. Registered chords
+            // otherwise beat a `capture_keys` widget's own key handling
+            // (the runtime checks hotkeys first), so a bare 'j' or a
+            // global Ctrl+C would hijack typing / clipboard in the search
+            // field. The renderer reflects the previous frame's focus
+            // here — a one-frame lag that's harmless, since focusing a
+            // field is itself a redraw before any key is typed.
+            let hotkeys = if gfx.renderer.focused_captures_keys() {
+                Vec::new()
+            } else {
+                self.app.hotkeys()
+            };
+            gfx.renderer.set_hotkeys(hotkeys);
             gfx.renderer.set_selection(self.app.selection());
             gfx.renderer.push_toasts(self.app.drain_toasts());
             gfx.renderer

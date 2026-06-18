@@ -2861,6 +2861,9 @@ impl App for ExplorerApp {
             (KeyChord::vim('g'), "view".into()),
             (KeyChord::vim('r'), "refresh".into()),
             (KeyChord::ctrl('f'), "search".into()),
+            (KeyChord::ctrl('c'), "copy-files".into()),
+            (KeyChord::ctrl('x'), "cut-files".into()),
+            (KeyChord::ctrl('v'), "paste-files".into()),
             (KeyChord::named(UiKey::Other("F5".into())), "refresh".into()),
             (KeyChord::named(UiKey::Other("F2".into())), "rename".into()),
             (KeyChord::vim('.'), "hidden".into()),
@@ -3190,6 +3193,16 @@ impl App for ExplorerApp {
             if let Some(id) = self.selected_id() {
                 self.confirm_delete = Some(self.bulk_targets(id));
             }
+        } else if event.is_hotkey("copy-files") {
+            if let Some(id) = self.selected_id() {
+                self.set_clipboard(self.bulk_targets(id), TransferMode::Copy);
+            }
+        } else if event.is_hotkey("cut-files") {
+            if let Some(id) = self.selected_id() {
+                self.set_clipboard(self.bulk_targets(id), TransferMode::Move);
+            }
+        } else if event.is_hotkey("paste-files") {
+            self.paste_into(self.cwd.clone());
         }
     }
 
