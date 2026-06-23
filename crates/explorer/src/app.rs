@@ -1799,22 +1799,27 @@ impl ExplorerApp {
             if e.meta_error.is_some() {
                 name = name.muted();
             }
+            // CephFS storage pool, as a pill between the name and the
+            // size column (only present on CephFS listings).
+            let pool_tag = e.ceph.as_ref().and_then(|c| c.pool.as_deref());
 
-            let r = row([
-                lead_icon,
-                name,
-                text(size).caption().muted().width(Size::Fixed(76.0)),
-                text(date).caption().muted().width(Size::Fixed(118.0)),
-            ])
-            .gap(tokens::SPACE_3)
-            .padding(Sides::xy(tokens::SPACE_3, 0.0))
-            .align(Align::Center)
-            .height(Size::Fixed(ROW_H))
-            .radius(tokens::RADIUS_SM)
-            .clip()
-            .key(format!("row:{id}"))
-            .focusable()
-            .tooltip(entry_tooltip(e));
+            let mut cells: Vec<El> = vec![lead_icon, name];
+            if let Some(p) = pool_tag {
+                cells.push(badge(p.to_string()).muted().tooltip("CephFS storage pool"));
+            }
+            cells.push(text(size).caption().muted().width(Size::Fixed(76.0)));
+            cells.push(text(date).caption().muted().width(Size::Fixed(118.0)));
+
+            let r = row(cells)
+                .gap(tokens::SPACE_3)
+                .padding(Sides::xy(tokens::SPACE_3, 0.0))
+                .align(Align::Center)
+                .height(Size::Fixed(ROW_H))
+                .radius(tokens::RADIUS_SM)
+                .clip()
+                .key(format!("row:{id}"))
+                .focusable()
+                .tooltip(entry_tooltip(e));
             let r = if Some(id) == selected_id || is_marked {
                 r.current()
             } else {
