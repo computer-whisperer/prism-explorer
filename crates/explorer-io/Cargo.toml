@@ -10,3 +10,7 @@ authors.workspace = true
 
 [dependencies]
 tracing.workspace = true
+
+# CephFS surfaces the storage pool and recursive directory rollups
+# through virtual extended attributes; `xattr` is a thin getxattr wrapper.
+xattr = "1"

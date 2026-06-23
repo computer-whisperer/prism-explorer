@@ -33,7 +33,7 @@ use damascene_core::{BuildCx, EventCx, KeyChord, KeyModifiers, Rect, UiEvent, Ui
 use lru::LruCache;
 
 use explorer_io::transfer::{self, CancelToken, ConflictPolicy, Progress};
-use explorer_io::{listing, stat, EntryKind, Notifier, Pool, Tier, TransferMode};
+use explorer_io::{ceph, listing, stat, EntryKind, Notifier, Pool, Tier, TransferMode};
 use explorer_previews::{BinaryPreview, CodeSpan, Preview, RawPreview, Registry};
 use explorer_thumbs::ThumbCache;
 
@@ -338,6 +338,9 @@ pub struct ExplorerApp {
     /// re-runs for visible rows every frame). Shared with the builder
     /// closure, hence the mutex (uncontended; UI thread only).
     stat_requested: Arc<Mutex<HashSet<EntryId>>>,
+    /// CephFS info jobs submitted, deduped like `stat_requested`. Only
+    /// populated on CephFS mounts (the gate is `Listing::is_ceph`).
+    ceph_requested: Arc<Mutex<HashSet<EntryId>>>,
     scroll_requests: RefCell<Vec<ScrollRequest>>,
 
     sidebar_w: f32,
@@ -504,6 +507,7 @@ impl ExplorerApp {
             preview_inflight: None,
             preview_wanted: None,
             stat_requested: Arc::new(Mutex::new(HashSet::new())),
+            ceph_requested: Arc::new(Mutex::new(HashSet::new())),
             scroll_requests: RefCell::new(Vec::new()),
             sidebar_w: 220.0,
             preview_w: 420.0,
@@ -617,6 +621,7 @@ impl ExplorerApp {
         self.preview_inflight = None;
         self.preview_wanted = None;
         self.stat_requested.lock().unwrap().clear();
+        self.ceph_requested.lock().unwrap().clear();
         self.thumb_state.lock().unwrap().reset();
         self.scroll_requests.borrow_mut().push(ScrollRequest::new(
             self.scroll_key(),
@@ -636,6 +641,20 @@ impl ExplorerApp {
                 notify();
                 alive
             });
+        });
+
+        // Probe once whether this directory is on CephFS; the result
+        // switches on the per-entry pool / recursive-size fetches.
+        let probe_dir = self.cwd.clone();
+        let tx = self.tx.clone();
+        let notify = self.notifier.clone();
+        self.pool.submit(Tier::Urgent, move || {
+            let is_ceph = ceph::is_ceph_dir(&probe_dir);
+            let _ = tx.send(Msg::CephProbe {
+                generation,
+                is_ceph,
+            });
+            notify();
         });
     }
 
@@ -896,9 +915,41 @@ impl ExplorerApp {
                 self.trash_entries(targets);
             }
             "delete" => self.confirm_delete = Some(self.bulk_targets(id)),
-            "properties" => self.properties = Some(id),
+            "properties" => {
+                self.request_ceph_urgent(id);
+                self.properties = Some(id);
+            }
             _ => {}
         }
+    }
+
+    /// Fetch an entry's CephFS info at urgent priority if it's still
+    /// missing — so the Properties dialog shows the pool and recursive
+    /// size even when the row was never realized on screen.
+    fn request_ceph_urgent(&self, id: EntryId) {
+        if !self.listing.is_ceph {
+            return;
+        }
+        {
+            let entries = self.listing.entries.lock().unwrap();
+            match entries.get(id as usize) {
+                Some(e) if e.ceph.is_none() => {}
+                _ => return,
+            }
+        }
+        if !self.ceph_requested.lock().unwrap().insert(id) {
+            return; // already queued at visible tier; it'll arrive
+        }
+        let path = self.listing.path_of(id);
+        submit_ceph_job(
+            id,
+            path,
+            self.listing.generation,
+            Tier::Urgent,
+            &self.pool,
+            &self.tx,
+            &self.notifier,
+        );
     }
 
     /// Dispatch a background-menu item (acts on the current directory).
@@ -1686,6 +1737,8 @@ impl ExplorerApp {
         let tx = self.tx.clone();
         let notify = self.notifier.clone();
         let stat_requested = self.stat_requested.clone();
+        let ceph_requested = self.ceph_requested.clone();
+        let is_ceph = self.listing.is_ceph;
         let selected_id = self.selected_id();
         let marked = self.marked.clone();
         let cut = self.cut_names();
@@ -1704,6 +1757,17 @@ impl ExplorerApp {
                 &tx,
                 &notify,
                 &stat_requested,
+            );
+            maybe_request_ceph(
+                e,
+                id,
+                &dir,
+                generation,
+                is_ceph,
+                &pool,
+                &tx,
+                &notify,
+                &ceph_requested,
             );
 
             // Marked rows swap their kind icon for a check accent (no
@@ -1800,6 +1864,8 @@ impl ExplorerApp {
         let tx = self.tx.clone();
         let notify = self.notifier.clone();
         let stat_requested = self.stat_requested.clone();
+        let ceph_requested = self.ceph_requested.clone();
+        let is_ceph = self.listing.is_ceph;
         let thumb_state = self.thumb_state.clone();
         let thumbs = self.thumbs.clone();
         let selected_id = self.selected_id();
@@ -1827,6 +1893,17 @@ impl ExplorerApp {
                     &tx,
                     &notify,
                     &stat_requested,
+                );
+                maybe_request_ceph(
+                    e,
+                    id,
+                    &dir,
+                    generation,
+                    is_ceph,
+                    &pool,
+                    &tx,
+                    &notify,
+                    &ceph_requested,
                 );
 
                 let name = e.display.clone();
@@ -2286,16 +2363,39 @@ impl ExplorerApp {
             property_row("Where", &path.to_string_lossy()),
             property_row("Kind", entry.preview_kind.label()),
         ];
-        match &entry.meta {
-            Some(meta) => {
+        // CephFS reports a recursive size for directories (the MDS keeps
+        // a running rollup); plain `stat` gives them nothing meaningful.
+        let recursive = entry.ceph.as_ref().and_then(|c| c.recursive);
+        match (&entry.meta, recursive) {
+            (_, Some(r)) if entry.is_dir() => {
+                rows.push(property_row(
+                    "Size",
+                    &format!("{} (recursive)", fmt::human_bytes(r.bytes)),
+                ));
+                rows.push(property_row(
+                    "Items",
+                    &format!(
+                        "{} files, {} subdirs",
+                        fmt::grouped(r.files),
+                        fmt::grouped(r.subdirs)
+                    ),
+                ));
+            }
+            (Some(meta), _) => {
                 if !entry.is_dir() {
                     rows.push(property_row("Size", &fmt::human_bytes(meta.size)));
                 }
-                if let Some(modified) = meta.modified {
-                    rows.push(property_row("Modified", &fmt::mtime(modified)));
-                }
             }
-            None => rows.push(property_row("Size", "—")),
+            (None, _) if !entry.is_dir() => rows.push(property_row("Size", "—")),
+            _ => {}
+        }
+        if let Some(meta) = &entry.meta {
+            if let Some(modified) = meta.modified {
+                rows.push(property_row("Modified", &fmt::mtime(modified)));
+            }
+        }
+        if let Some(pool) = entry.ceph.as_ref().and_then(|c| c.pool.as_deref()) {
+            rows.push(property_row("Pool", pool));
         }
         if entry.is_symlink {
             rows.push(property_row("Link", "symbolic link"));
@@ -2747,6 +2847,60 @@ fn submit_stat_job(
     });
 }
 
+/// Realized row/cell on a CephFS listing: queue a pool / recursive-size
+/// lookup, once per entry. A no-op off CephFS (`is_ceph` is false until
+/// the directory probe lands).
+#[allow(clippy::too_many_arguments)]
+fn maybe_request_ceph(
+    e: &Entry,
+    id: EntryId,
+    dir: &Path,
+    generation: u64,
+    is_ceph: bool,
+    pool: &Pool,
+    tx: &Sender<Msg>,
+    notify: &Notifier,
+    ceph_requested: &Arc<Mutex<HashSet<EntryId>>>,
+) {
+    if !is_ceph || e.ceph.is_some() {
+        return;
+    }
+    if !ceph_requested.lock().unwrap().insert(id) {
+        return;
+    }
+    submit_ceph_job(
+        id,
+        dir.join(&e.name),
+        generation,
+        Tier::Visible,
+        pool,
+        tx,
+        notify,
+    );
+}
+
+fn submit_ceph_job(
+    id: EntryId,
+    path: PathBuf,
+    generation: u64,
+    tier: Tier,
+    pool: &Pool,
+    tx: &Sender<Msg>,
+    notify: &Notifier,
+) {
+    let tx = tx.clone();
+    let notify = notify.clone();
+    pool.submit(tier, move || {
+        let info = ceph::info(&path);
+        let _ = tx.send(Msg::Ceph {
+            generation,
+            id,
+            info,
+        });
+        notify();
+    });
+}
+
 fn preview_placeholder(icon_name: &str, label: &str) -> El {
     card([preview_placeholder_body(icon_name, label).padding(tokens::SPACE_4)])
         .width(Size::Fixed(420.0))
@@ -3062,6 +3216,25 @@ impl App for ExplorerApp {
                         self.sort,
                     ) {
                         self.remap_selection();
+                    }
+                }
+                Msg::CephProbe {
+                    generation,
+                    is_ceph,
+                } => {
+                    if generation == self.listing.generation {
+                        // Visible rows pick up the per-entry fetch on the
+                        // next build now that the gate is open.
+                        self.listing.is_ceph = is_ceph;
+                    }
+                }
+                Msg::Ceph {
+                    generation,
+                    id,
+                    info,
+                } => {
+                    if generation == self.listing.generation {
+                        self.listing.apply_ceph(id, info);
                     }
                 }
                 Msg::Preview {

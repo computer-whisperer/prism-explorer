@@ -13,6 +13,7 @@ use std::ffi::{OsStr, OsString};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
+use explorer_io::ceph::CephInfo;
 use explorer_io::listing::ListingUpdate;
 use explorer_io::stat::EntryMeta;
 use explorer_io::{EntryKind, RawEntry};
@@ -101,6 +102,10 @@ pub struct Entry {
     pub preview_kind: PreviewKind,
     pub meta: Option<EntryMeta>,
     pub meta_error: Option<String>,
+    /// CephFS storage pool and (for dirs) recursive size, fetched lazily
+    /// like `meta` but only on CephFS mounts. `None` until fetched, or
+    /// where the mount isn't CephFS.
+    pub ceph: Option<CephInfo>,
 }
 
 impl Entry {
@@ -118,6 +123,7 @@ impl Entry {
             is_symlink: raw.kind == EntryKind::Symlink,
             meta: None,
             meta_error: None,
+            ceph: None,
         }
     }
 
@@ -142,6 +148,10 @@ pub struct Listing {
     pub order: Arc<Vec<EntryId>>,
     pub complete: bool,
     pub error: Option<String>,
+    /// Whether this directory lives on CephFS, probed once when the
+    /// listing starts. Gates the per-entry [`CephInfo`] fetches so other
+    /// mounts pay no extra `getxattr` calls.
+    pub is_ceph: bool,
 }
 
 impl Listing {
@@ -153,6 +163,7 @@ impl Listing {
             order: Arc::new(Vec::new()),
             complete: false,
             error: None,
+            is_ceph: false,
         }
     }
 
@@ -216,6 +227,15 @@ impl Listing {
             true
         } else {
             false
+        }
+    }
+
+    /// Attach a CephFS info result to an entry. Never reorders — the pool
+    /// and recursive size only feed the badge and Properties, not sort.
+    pub fn apply_ceph(&mut self, id: EntryId, info: Option<CephInfo>) {
+        let mut entries = self.entries.lock().unwrap();
+        if let Some(entry) = entries.get_mut(id as usize) {
+            entry.ceph = info;
         }
     }
 
@@ -337,6 +357,19 @@ pub enum Msg {
         generation: u64,
         id: EntryId,
         result: Result<EntryMeta, String>,
+    },
+    /// The listing's directory was probed for CephFS membership; `true`
+    /// turns on the per-entry pool/recursive-size fetches.
+    CephProbe {
+        generation: u64,
+        is_ceph: bool,
+    },
+    /// A per-entry CephFS lookup landed: pool and (for dirs) recursive
+    /// size, or `None` for an entry that carries neither.
+    Ceph {
+        generation: u64,
+        id: EntryId,
+        info: Option<CephInfo>,
     },
     Preview {
         generation: u64,
@@ -700,5 +733,44 @@ mod tests {
             ordered_names(&l),
             ["docs", "alpha.txt", "zeta.bin", "photo.png"]
         );
+    }
+
+    #[test]
+    fn ceph_info_attaches_without_reordering() {
+        use explorer_io::ceph::{CephInfo, RecursiveStats};
+
+        let mut l = Listing::new("/test".into(), 0);
+        l.absorb(
+            update(
+                &[("media", EntryKind::Dir), ("clip.mp4", EntryKind::File)],
+                true,
+            ),
+            false,
+            None,
+            None,
+            SortMode::NameAsc,
+        );
+        let before = ordered_names(&l);
+        let dir = l.id_by_name(OsStr::new("media")).unwrap();
+
+        l.apply_ceph(
+            dir,
+            Some(CephInfo {
+                pool: Some("data_hdd".into()),
+                recursive: Some(RecursiveStats {
+                    bytes: 12_000_000_000_000,
+                    files: 1_234_567,
+                    subdirs: 8_900,
+                }),
+            }),
+        );
+
+        let entries = l.entries.lock().unwrap();
+        let info = entries[dir as usize].ceph.as_ref().unwrap();
+        assert_eq!(info.pool.as_deref(), Some("data_hdd"));
+        assert_eq!(info.recursive.unwrap().files, 1_234_567);
+        drop(entries);
+        // Attaching pool/size never disturbs the sort order.
+        assert_eq!(ordered_names(&l), before);
     }
 }

@@ -19,6 +19,8 @@
 //!   directory starts rendering after the first few dozen entries.
 //! - [`stat`] — per-entry metadata, fetched lazily for rows that are
 //!   actually on screen.
+//! - [`ceph`] — CephFS-only extras (storage pool, recursive directory
+//!   size) read from virtual xattrs, gated on the mount being CephFS.
 //!
 //! The pool runs plain closures and has no opinion about channels or
 //! UI frameworks; callers capture their own result sender plus a
@@ -26,6 +28,7 @@
 
 mod pool;
 
+pub mod ceph;
 pub mod listing;
 pub mod stat;
 pub mod transfer;
