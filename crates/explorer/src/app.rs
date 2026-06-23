@@ -13,6 +13,7 @@ use std::collections::HashSet;
 use std::ffi::OsString;
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 
@@ -45,6 +46,7 @@ use crate::model::{
 };
 use crate::places::Place;
 use crate::preview_policy::{grid_thumbnail_policy, GridThumbPolicy};
+use crate::sysclip;
 
 const ROW_H: f32 = 34.0;
 /// Paint alpha for entries cut to the clipboard (faded until pasted).
@@ -369,9 +371,23 @@ pub struct ExplorerApp {
     /// Last file-operation failure, shown modally until dismissed.
     op_error: Option<String>,
 
-    /// Files cut or copied, awaiting a paste. Internal to this process
-    /// (no system-clipboard interop yet) and survives navigation.
+    /// Files cut or copied within this process, awaiting a paste.
+    /// Survives navigation. On Wayland it is also published to the system
+    /// clipboard (see [`clipboard_owned`](Self::clipboard_owned)) so other
+    /// file managers can paste it.
     clipboard: Option<FileClipboard>,
+    /// While we hold the system clipboard with our published file
+    /// targets, this flag reads `true`; the serving thread flips it
+    /// `false` (poking a redraw) once another app takes the clipboard, at
+    /// which point [`clipboard`](Self::clipboard) is stale. `None` when we
+    /// never published (off Wayland, or `wlr-data-control` is missing) —
+    /// the internal clipboard is then authoritative.
+    clipboard_owned: Option<Arc<AtomicBool>>,
+    /// A file selection copied in another application, read off the
+    /// system clipboard when the window gains focus. Drives the paste
+    /// fallback and the menu's Paste item when our own clipboard isn't
+    /// the live selection.
+    system_clipboard: Option<sysclip::FileList>,
     /// The copy / move in flight, if any. Holds the shared progress
     /// snapshot and the cancel handle; survives navigation like the
     /// metadata ops. One at a time for now.
@@ -503,6 +519,8 @@ impl ExplorerApp {
             confirm_delete: None,
             op_error: None,
             clipboard: None,
+            clipboard_owned: None,
+            system_clipboard: None,
             active_transfer: None,
             pending_conflict: None,
         };
@@ -1033,11 +1051,70 @@ impl ExplorerApp {
     // ---- copy / cut / paste ----------------------------------------------
 
     /// Put `ids` on the file clipboard for a later paste. `Copy` leaves
-    /// them in place; `Move` (cut) removes them once pasted.
+    /// them in place; `Move` (cut) removes them once pasted. On Wayland
+    /// the selection is also published to the system clipboard so other
+    /// file managers can paste it.
     fn set_clipboard(&mut self, ids: Vec<EntryId>, mode: TransferMode) {
         let paths = self.entry_paths(&ids);
         if !paths.is_empty() {
+            let cut = mode == TransferMode::Move;
+            self.clipboard_owned = sysclip::publish(&paths, cut, self.notifier.clone());
             self.clipboard = Some(FileClipboard { paths, mode });
+            // Our own fresh copy supersedes any cached external selection.
+            self.system_clipboard = None;
+        }
+    }
+
+    /// Whether we currently hold the system clipboard with our published
+    /// file targets (always `false` when we never published).
+    fn owns_system_selection(&self) -> bool {
+        self.clipboard_owned
+            .as_ref()
+            .is_some_and(|o| o.load(Ordering::SeqCst))
+    }
+
+    /// Whether the internal clipboard is the live selection: we copied
+    /// something and either still own the system selection or can't track
+    /// ownership at all (off Wayland / publish failed — `clipboard_owned`
+    /// is `None`). When this is false an external app has copied more
+    /// recently and [`system_clipboard`](Self::system_clipboard) wins.
+    fn holds_live_clipboard(&self) -> bool {
+        self.clipboard.is_some()
+            && self
+                .clipboard_owned
+                .as_ref()
+                .is_none_or(|o| o.load(Ordering::SeqCst))
+    }
+
+    /// Drop the internal clipboard once another app has taken the system
+    /// selection out from under us — called each build. Clears the
+    /// cut-dimming too, so a paste then reads the system clipboard.
+    fn sync_clipboard_ownership(&mut self) {
+        if self.clipboard_owned.is_some() && !self.owns_system_selection() {
+            self.clipboard = None;
+            self.clipboard_owned = None;
+        }
+    }
+
+    /// The window gained focus: re-read the system clipboard so a file
+    /// selection copied in another app becomes pasteable here. Skipped
+    /// while we own the selection (we'd only read back our own files).
+    /// The blocking read runs on a worker thread.
+    pub(crate) fn refresh_system_clipboard(&mut self) {
+        if self.owns_system_selection() {
+            return;
+        }
+        let tx = self.tx.clone();
+        let notify = self.notifier.clone();
+        let spawned = std::thread::Builder::new()
+            .name("sysclip-read".into())
+            .spawn(move || {
+                let files = sysclip::read();
+                let _ = tx.send(Msg::SystemClipboard(files));
+                notify();
+            });
+        if let Err(e) = spawned {
+            tracing::warn!(error = %e, "sysclip read thread failed to spawn");
         }
     }
 
@@ -1056,27 +1133,39 @@ impl ExplorerApp {
         }
     }
 
-    /// Paste the clipboard into `dest`. Filters out sources that can't go
-    /// there (an item into itself or its own subtree, or a no-op move
-    /// into the directory it already lives in), then spawns the transfer.
-    /// One transfer at a time — a paste while one runs is ignored.
+    /// Paste into `dest`. Prefers our internal clipboard while it's the
+    /// live selection; otherwise pastes a file selection copied in
+    /// another app (read off the system clipboard on focus). Filters out
+    /// sources that can't go there (an item into itself or its own
+    /// subtree, or a no-op move into the directory it already lives in),
+    /// then spawns the transfer. One transfer at a time — a paste while
+    /// one runs is ignored.
     fn paste_into(&mut self, dest: PathBuf) {
-        let Some(clip) = self.clipboard.clone() else {
-            return;
-        };
         if self.active_transfer.is_some() || self.pending_conflict.is_some() {
             return;
         }
-        let sources: Vec<PathBuf> = clip
-            .paths
+        let (paths, mode) = if self.holds_live_clipboard() {
+            let clip = self.clipboard.clone().unwrap();
+            (clip.paths, clip.mode)
+        } else if let Some(list) = &self.system_clipboard {
+            let mode = if list.cut {
+                TransferMode::Move
+            } else {
+                TransferMode::Copy
+            };
+            (list.paths.clone(), mode)
+        } else {
+            return;
+        };
+        let sources: Vec<PathBuf> = paths
             .iter()
-            .filter(|src| paste_source_ok(src, &dest, clip.mode))
+            .filter(|src| paste_source_ok(src, &dest, mode))
             .cloned()
             .collect();
         if sources.is_empty() {
             return;
         }
-        self.start_paste(sources, dest, clip.mode);
+        self.start_paste(sources, dest, mode);
     }
 
     /// Begin a paste: scan the sources off-thread (the progress
@@ -1176,7 +1265,12 @@ impl ExplorerApp {
         // cancelled before moving anything).
         let did_something = !(outcome.report.cancelled && outcome.report.copied == 0);
         if outcome.mode == TransferMode::Move && did_something {
+            // The moved sources are gone — drop both clipboards that
+            // referenced them (the serve thread releases the system
+            // selection on its own once another app copies).
             self.clipboard = None;
+            self.clipboard_owned = None;
+            self.system_clipboard = None;
         }
         if let Some((path, msg)) = outcome.report.failed.first() {
             let n = outcome.report.failed.len();
@@ -2158,8 +2252,7 @@ impl ExplorerApp {
     /// Items for the directory-background right-click menu (empty space).
     fn background_menu_items(&self) -> Vec<El> {
         let mut items = vec![menu_item("New folder").key("ctx:new-folder")];
-        if let Some(clip) = &self.clipboard {
-            let n = clip.paths.len();
+        if let Some(n) = self.paste_count() {
             let label = if n > 1 {
                 format!("Paste {n} items")
             } else {
@@ -2169,6 +2262,17 @@ impl ExplorerApp {
         }
         items.push(menu_item("Open terminal here").key("ctx:terminal"));
         items
+    }
+
+    /// How many entries a paste would bring in, for the menu label — the
+    /// live internal clipboard if we hold it, otherwise a file selection
+    /// copied in another app. `None` hides the Paste item.
+    fn paste_count(&self) -> Option<usize> {
+        if self.holds_live_clipboard() {
+            self.clipboard.as_ref().map(|c| c.paths.len())
+        } else {
+            self.system_clipboard.as_ref().map(|l| l.paths.len())
+        }
     }
 
     /// Modal details dialog for entry `id`. `None` if the entry has
@@ -3015,9 +3119,13 @@ impl App for ExplorerApp {
                     self.pending_conflict = Some(pending);
                 }
                 Msg::TransferDone(outcome) => self.apply_transfer_outcome(outcome),
+                Msg::SystemClipboard(files) => self.system_clipboard = files,
                 Msg::OpenLocation { dir, select } => self.navigate(dir, select),
             }
         }
+        // Drop a stale internal clipboard once another app has taken the
+        // system selection out from under us.
+        self.sync_clipboard_ownership();
         self.request_missing_stats_for_sort();
     }
 
@@ -3487,6 +3595,12 @@ impl crate::host::HostApp for ExplorerApp {
 
     fn drain_clipboard_writes(&mut self) -> Vec<String> {
         std::mem::take(&mut self.clipboard_writes)
+    }
+
+    fn window_focused(&mut self, focused: bool) {
+        if focused {
+            self.refresh_system_clipboard();
+        }
     }
 }
 
@@ -4632,6 +4746,60 @@ mod tests {
         app.open_context_menu(notes, (0.0, 0.0));
         app.on_event(UiEvent::synthetic_click("ctx:cut"), &cx);
         assert_eq!(app.clipboard.as_ref().unwrap().mode, TransferMode::Move);
+    }
+
+    /// With no ownership tracking (off Wayland / publish failed,
+    /// `clipboard_owned` is `None`) the internal clipboard is the live
+    /// selection and wins over any cached external one.
+    #[test]
+    fn internal_clipboard_wins_when_ownership_untracked() {
+        let mut app = browse();
+        app.clipboard = Some(FileClipboard {
+            paths: vec![app.cwd.join("notes.txt")],
+            mode: TransferMode::Copy,
+        });
+        app.system_clipboard = Some(sysclip::FileList {
+            paths: vec![PathBuf::from("/elsewhere/a"), PathBuf::from("/elsewhere/b")],
+            cut: false,
+        });
+        assert!(app.holds_live_clipboard());
+        assert_eq!(app.paste_count(), Some(1), "the internal clipboard wins");
+    }
+
+    /// Once another app takes the system selection (the serve thread
+    /// flips the flag), the internal clipboard is stale: a sync drops it,
+    /// and paste/menu fall back to the external selection.
+    #[test]
+    fn lost_ownership_falls_back_to_system_clipboard() {
+        let mut app = browse();
+        let owned = Arc::new(AtomicBool::new(true));
+        app.clipboard = Some(FileClipboard {
+            paths: vec![app.cwd.join("notes.txt")],
+            mode: TransferMode::Move,
+        });
+        app.clipboard_owned = Some(owned.clone());
+        app.system_clipboard = Some(sysclip::FileList {
+            paths: vec![PathBuf::from("/elsewhere/a"), PathBuf::from("/elsewhere/b")],
+            cut: false,
+        });
+
+        // While we own it the internal cut wins (and dims).
+        assert!(app.holds_live_clipboard());
+        assert_eq!(app.paste_count(), Some(1));
+        assert!(!app.cut_names().is_empty());
+
+        // Another app copies: ownership lost.
+        owned.store(false, Ordering::SeqCst);
+        app.sync_clipboard_ownership();
+        assert!(app.clipboard.is_none(), "stale internal clipboard dropped");
+        assert!(app.clipboard_owned.is_none());
+        assert!(app.cut_names().is_empty(), "dimming cleared");
+        assert!(!app.holds_live_clipboard());
+        assert_eq!(
+            app.paste_count(),
+            Some(2),
+            "the external selection now drives the menu"
+        );
     }
 
     /// Cut (not copy) clipboard entries in the current directory are

@@ -103,6 +103,11 @@ pub trait HostApp: App {
     fn drain_clipboard_writes(&mut self) -> Vec<String> {
         Vec::new()
     }
+
+    /// The window gained (or lost) keyboard focus. The browser uses the
+    /// focus-gained edge to re-read the system clipboard, so a file
+    /// selection copied in another app becomes pasteable here.
+    fn window_focused(&mut self, _focused: bool) {}
 }
 
 /// Run the host loop with one initial window. Returns when the last
@@ -705,6 +710,13 @@ impl ApplicationHandler<HostCommand> for Host {
             WindowEvent::ModifiersChanged(modifiers) => {
                 win.modifiers = key_modifiers(modifiers.state());
                 win.gfx.renderer.set_modifiers(win.modifiers);
+            }
+
+            WindowEvent::Focused(focused) => {
+                // The browser re-reads the system clipboard on focus gain;
+                // the worker's notifier pokes the redraw once it lands, so
+                // no frame is forced here.
+                win.app.window_focused(focused);
             }
 
             WindowEvent::KeyboardInput {

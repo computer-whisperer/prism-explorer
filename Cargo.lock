@@ -3040,12 +3040,14 @@ dependencies = [
  "freedesktop-desktop-entry",
  "lru",
  "mime_guess",
+ "percent-encoding",
  "pollster",
  "tracing",
  "tracing-subscriber",
  "trash",
  "wgpu",
  "winit",
+ "wl-clipboard-rs",
  "zbus",
 ]
 

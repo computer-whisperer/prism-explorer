@@ -36,6 +36,14 @@ wgpu = "29"
 arboard = { version = "3", features = ["wayland-data-control"] }
 pollster = "0.4"
 
+# System-clipboard file interop (copy/paste files to and from other file
+# managers). arboard only handles text/image, so the file targets
+# (`x-special/gnome-copied-files`, `text/uri-list`) go through
+# wl-clipboard-rs directly — Wayland only; X11 falls back to the
+# internal clipboard. `percent-encoding` builds/parses `file://` URIs.
+wl-clipboard-rs = "0.9"
+percent-encoding = "2"
+
 achromat.workspace = true
 explorer-io.workspace = true
 explorer-previews.workspace = true

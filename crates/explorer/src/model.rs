@@ -361,6 +361,9 @@ pub enum Msg {
     /// A copy / move finished on its worker thread. Carries the
     /// directories to refresh and a summary of what landed or failed.
     TransferDone(crate::ops::TransferOutcome),
+    /// The system clipboard was re-read on window focus: a file selection
+    /// copied in another app (`Some`) or nothing pasteable (`None`).
+    SystemClipboard(Option<crate::sysclip::FileList>),
     /// External command (D-Bus): navigate to `dir`, then select
     /// `select` once it streams in. Not generation-tagged — it isn't a
     /// stale result, it's a fresh instruction.
