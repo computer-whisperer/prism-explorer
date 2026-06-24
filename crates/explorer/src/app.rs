@@ -2009,11 +2009,7 @@ impl ExplorerApp {
                     cell.ghost()
                 };
                 // Cut tiles fade until the paste lands.
-                cells.push(if is_cut {
-                    cell.opacity(CUT_DIM)
-                } else {
-                    cell
-                });
+                cells.push(if is_cut { cell.opacity(CUT_DIM) } else { cell });
             }
             row(cells).gap(TILE_GAP)
         })
