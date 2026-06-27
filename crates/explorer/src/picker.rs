@@ -55,8 +55,17 @@ pub struct PickerRequest {
     pub current_filter: usize,
 }
 
-/// Called exactly once with the chosen paths; `None` is cancel.
-pub type PickerReply = Box<dyn FnOnce(Option<Vec<PathBuf>>) + Send>;
+/// The result of an accepted picker: the chosen paths plus the filter
+/// that was active at accept time (so the FileChooser service can both
+/// remember it per-app and, later, report it back to the caller). Empty
+/// `filter` when the picker had no filters.
+pub struct PickerOutcome {
+    pub paths: Vec<PathBuf>,
+    pub filter: Option<FileFilter>,
+}
+
+/// Called exactly once with the outcome; `None` is cancel.
+pub type PickerReply = Box<dyn FnOnce(Option<PickerOutcome>) + Send>;
 
 pub struct PickerApp {
     explorer: ExplorerApp,
@@ -159,9 +168,19 @@ impl PickerApp {
         }
     }
 
-    fn finish(&mut self, result: Option<Vec<PathBuf>>) {
+    /// The filter active at accept, used to tag the outcome. `None` when
+    /// the picker has no filters.
+    fn active_filter(&self) -> Option<FileFilter> {
+        self.filters.get(self.filter_idx).cloned()
+    }
+
+    fn finish(&mut self, paths: Option<Vec<PathBuf>>) {
         if let Some(reply) = self.reply.take() {
-            reply(result);
+            let outcome = paths.map(|paths| PickerOutcome {
+                paths,
+                filter: self.active_filter(),
+            });
+            reply(outcome);
         }
         (self.close)();
     }
@@ -440,8 +459,27 @@ mod tests {
     // scenes alongside the browser ones).
 
     /// Captures the picker's single reply: outer `Option` = answered?,
-    /// inner = the chosen paths (`None` = cancelled).
-    type ReplySink = Arc<std::sync::Mutex<Option<Option<Vec<PathBuf>>>>>;
+    /// inner = the outcome (`None` = cancelled).
+    type ReplySink = Arc<std::sync::Mutex<Option<Option<PickerOutcome>>>>;
+
+    /// The paths the picker answered with, flattened for assertions:
+    /// outer `None` = not answered yet, inner `None` = cancelled.
+    fn answered_paths(sink: &ReplySink) -> Option<Option<Vec<PathBuf>>> {
+        sink.lock()
+            .unwrap()
+            .as_ref()
+            .map(|answer| answer.as_ref().map(|o| o.paths.clone()))
+    }
+
+    /// The name of the filter the picker answered with, if any.
+    fn answered_filter(sink: &ReplySink) -> Option<String> {
+        sink.lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|answer| answer.as_ref())
+            .and_then(|o| o.filter.as_ref())
+            .map(|f| f.name.clone())
+    }
 
     /// Trigger click opens the menu; picking an option closes it and
     /// refilters the wrapped explorer's listing (dirs always stay).
@@ -547,6 +585,54 @@ mod tests {
         );
     }
 
+    /// On accept, the outcome carries the filter that was active — the
+    /// signal the FileChooser service records per-app.
+    #[test]
+    fn accept_reports_active_filter() {
+        let mut explorer = crate::app::fixtures::browse();
+        crate::app::fixtures::mark(&mut explorer, "photo.jxr");
+        let picked: ReplySink = Default::default();
+        let sink = picked.clone();
+        let mut picker = PickerApp::new(
+            PickerRequest {
+                kind: PickerKind::Open {
+                    directory: false,
+                    multiple: true,
+                },
+                accept_label: "Open".into(),
+                start_dir: PathBuf::from("/test/somewhere"),
+                current_name: String::new(),
+                filters: vec![
+                    FileFilter {
+                        name: "Images".into(),
+                        globs: vec!["*.jxr".into()],
+                        mimes: vec![],
+                    },
+                    FileFilter {
+                        name: "All files".into(),
+                        globs: vec!["*".into()],
+                        mimes: vec![],
+                    },
+                ],
+                current_filter: 0,
+            },
+            explorer,
+            None,
+            Box::new(move |r| *sink.lock().unwrap() = Some(r)),
+            Arc::new(|| {}),
+        );
+        let cx = EventCx::new();
+        // Switch to the second filter, then accept the marked file.
+        picker.on_event(UiEvent::synthetic_click("picker-filter"), &cx);
+        picker.on_event(UiEvent::synthetic_click("picker-filter:option:1"), &cx);
+        picker.on_event(UiEvent::synthetic_click("picker-accept"), &cx);
+        assert_eq!(
+            answered_paths(&picked),
+            Some(Some(vec![PathBuf::from("/test/somewhere/photo.jxr")]))
+        );
+        assert_eq!(answered_filter(&picked), Some("All files".to_string()));
+    }
+
     #[test]
     fn save_over_existing_file_confirms_then_replaces() {
         let (mut picker, picked) = save_picker("notes.txt");
@@ -558,7 +644,7 @@ mod tests {
         // Replace confirms with the parked path.
         picker.on_event(UiEvent::synthetic_click("overwrite:replace"), &cx);
         assert_eq!(
-            picked.lock().unwrap().clone(),
+            answered_paths(&picked),
             Some(Some(vec![PathBuf::from("/test/somewhere/notes.txt")]))
         );
     }
@@ -583,7 +669,7 @@ mod tests {
         picker.on_event(UiEvent::synthetic_click("picker-accept"), &EventCx::new());
         assert!(picker.pending_overwrite.is_none());
         assert_eq!(
-            picked.lock().unwrap().clone(),
+            answered_paths(&picked),
             Some(Some(vec![PathBuf::from("/test/somewhere/brand-new.txt")]))
         );
     }
@@ -591,7 +677,7 @@ mod tests {
     #[test]
     fn save_accept_paths() {
         let explorer = crate::app::fixtures::browse();
-        let picked: Arc<std::sync::Mutex<Option<Option<Vec<PathBuf>>>>> = Default::default();
+        let picked: ReplySink = Default::default();
         let picked2 = picked.clone();
         let mut picker = PickerApp::new(
             PickerRequest {
@@ -618,14 +704,14 @@ mod tests {
         picker.filename = "fine.txt".into();
         picker.accept();
         assert_eq!(
-            picked.lock().unwrap().clone(),
+            answered_paths(&picked),
             Some(Some(vec![PathBuf::from("/test/somewhere/fine.txt")]))
         );
         // Dropping after an answer must not answer again (the reply
         // was consumed).
         drop(picker);
         assert_eq!(
-            picked.lock().unwrap().clone(),
+            answered_paths(&picked),
             Some(Some(vec![PathBuf::from("/test/somewhere/fine.txt")]))
         );
     }

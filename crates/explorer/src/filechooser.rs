@@ -35,7 +35,7 @@ use explorer_thumbs::ThumbCache;
 use crate::app::ExplorerApp;
 use crate::host::{HostCommand, WindowSpec};
 use crate::model::FileFilter;
-use crate::picker::{PickerApp, PickerKind, PickerRequest};
+use crate::picker::{PickerApp, PickerKind, PickerOutcome, PickerRequest};
 
 /// Portal response codes (`org.freedesktop.portal.Request`).
 const RESPONSE_OK: u32 = 0;
@@ -67,8 +67,9 @@ struct FileChooser {
     next_token: AtomicU64,
 }
 
-/// The picker's eventual answer, plus how the dialog ended.
-type Answer = Option<Vec<PathBuf>>;
+/// The picker's eventual answer: the accepted outcome, or `None` for a
+/// cancel / closed window.
+type Answer = Option<PickerOutcome>;
 
 impl FileChooser {
     /// Open a picker window and await its answer. Registers a
@@ -163,20 +164,22 @@ impl FileChooser {
         (response, answer)
     }
 
-    /// Record where `app_id` accepted, so its next dialog reopens there.
-    /// The chosen path's *parent* is the directory the picker was
-    /// browsing (for a save it's the target folder; for folder-select
-    /// it's the parent of the chosen folder). A no-op on cancel, an
-    /// empty `app_id`, or a path with no parent.
-    fn record_app_choice(&self, app_id: &str, answer: &Answer) {
-        let Some(dir) = answer
-            .as_ref()
-            .and_then(|paths| paths.first())
-            .and_then(|path| path.parent())
-        else {
+    /// Record what `app_id` accepted, so its next dialog reopens there
+    /// with the same filter. The chosen path's *parent* is the directory
+    /// the picker was browsing (for a save it's the target folder; for
+    /// folder-select it's the parent of the chosen folder). A no-op on
+    /// cancel; the store's own guards drop an empty `app_id`, a path with
+    /// no parent, and a filterless picker.
+    fn record_app(&self, app_id: &str, outcome: &Answer) {
+        let Some(outcome) = outcome else {
             return;
         };
-        self.deps.store.record_app_dir(app_id, dir);
+        if let Some(dir) = outcome.paths.first().and_then(|path| path.parent()) {
+            self.deps.store.record_app_dir(app_id, dir);
+        }
+        if let Some(filter) = &outcome.filter {
+            self.deps.store.record_app_filter(app_id, &filter.name);
+        }
     }
 }
 
@@ -193,7 +196,7 @@ impl FileChooser {
     ) -> (u32, HashMap<String, OwnedValue>) {
         let directory = bool_option(&options, "directory");
         let multiple = bool_option(&options, "multiple");
-        let (filters, current_filter) = filter_options(&options);
+        let (filters, current_filter) = filter_options(&options, &app_id, &self.deps.store);
         let request = PickerRequest {
             kind: PickerKind::Open {
                 directory,
@@ -207,8 +210,8 @@ impl FileChooser {
         };
         tracing::info!(%title, directory, multiple, "portal OpenFile");
         let (response, answer) = self.run_picker(connection, handle, &title, request).await;
-        self.record_app_choice(&app_id, &answer);
-        (response, uris_result(answer))
+        self.record_app(&app_id, &answer);
+        (response, uris_result(answer.map(|o| o.paths)))
     }
 
     async fn save_file(
@@ -234,7 +237,7 @@ impl FileChooser {
                 string_option(&options, "current_name").unwrap_or_default(),
             ),
         };
-        let (filters, current_filter) = filter_options(&options);
+        let (filters, current_filter) = filter_options(&options, &app_id, &self.deps.store);
         let request = PickerRequest {
             kind: PickerKind::Save,
             accept_label: accept_label(&options, "Save"),
@@ -245,8 +248,8 @@ impl FileChooser {
         };
         tracing::info!(%title, "portal SaveFile");
         let (response, answer) = self.run_picker(connection, handle, &title, request).await;
-        self.record_app_choice(&app_id, &answer);
-        (response, uris_result(answer))
+        self.record_app(&app_id, &answer);
+        (response, uris_result(answer.map(|o| o.paths)))
     }
 
     /// Batch save: the caller supplies the file *names*; the user
@@ -280,16 +283,16 @@ impl FileChooser {
         };
         tracing::info!(%title, files = names.len(), "portal SaveFiles");
         let (response, answer) = self.run_picker(connection, handle, &title, request).await;
-        // Record before the names are joined on: here `answer` is the
-        // chosen directory, so record_app_choice's parent-of-path yields
-        // its parent — the browsing location — matching the other modes.
+        // Record before the names are joined on: here the outcome holds
+        // the chosen directory, so record_app's parent-of-path yields its
+        // parent — the browsing location — matching the other modes.
         // (After the join it would be `dir/name`, recording `dir` itself.)
-        self.record_app_choice(&app_id, &answer);
-        let answer = answer.map(|dirs| {
-            let dir = dirs.into_iter().next().unwrap_or_else(home_dir);
+        self.record_app(&app_id, &answer);
+        let paths = answer.map(|outcome| {
+            let dir = outcome.paths.into_iter().next().unwrap_or_else(home_dir);
             names.iter().map(|n| dir.join(n)).collect()
         });
-        (response, uris_result(answer))
+        (response, uris_result(paths))
     }
 }
 
@@ -437,8 +440,15 @@ fn parse_filter((name, patterns): RawFilter) -> FileFilter {
 /// Parse `filters` + `current_filter` into the list the picker shows
 /// and the index to start on. A `current_filter` that isn't in the
 /// list (compared by name) is appended — per the spec it should match,
-/// but GTK callers occasionally send a detached one.
-fn filter_options(options: &HashMap<String, OwnedValue>) -> (Vec<FileFilter>, usize) {
+/// but GTK callers occasionally send a detached one. When the caller
+/// gives no `current_filter`, fall back to the filter this app last
+/// accepted with (matched by name); the caller's explicit choice always
+/// wins, mirroring how `current_folder` beats the remembered directory.
+fn filter_options(
+    options: &HashMap<String, OwnedValue>,
+    app_id: &str,
+    store: &crate::state::Store,
+) -> (Vec<FileFilter>, usize) {
     let mut filters: Vec<FileFilter> = options
         .get("filters")
         .and_then(|v| <Vec<RawFilter>>::try_from(v.try_clone().ok()?).ok())
@@ -456,7 +466,12 @@ fn filter_options(options: &HashMap<String, OwnedValue>) -> (Vec<FileFilter>, us
                 filters.len() - 1
             }
         },
-        None => 0,
+        // No explicit choice: pre-select the app's remembered filter if
+        // it's still offered, else the first.
+        None => store
+            .app_last_filter(app_id)
+            .and_then(|name| filters.iter().position(|f| f.name == name))
+            .unwrap_or(0),
     };
     (filters, idx)
 }
@@ -504,9 +519,9 @@ fn path_to_file_uri(path: &std::path::Path) -> String {
     uri
 }
 
-fn uris_result(answer: Answer) -> HashMap<String, OwnedValue> {
+fn uris_result(paths: Option<Vec<PathBuf>>) -> HashMap<String, OwnedValue> {
     let mut results = HashMap::new();
-    if let Some(paths) = answer {
+    if let Some(paths) = paths {
         let uris: Vec<String> = paths.iter().map(|p| path_to_file_uri(p)).collect();
         if let Ok(value) = OwnedValue::try_from(Value::from(uris)) {
             results.insert("uris".to_string(), value);
@@ -579,8 +594,10 @@ mod tests {
 
     #[test]
     fn filter_option_parsing() {
+        // No store memory for these cases: empty app_id never matches.
+        let store = crate::state::Store::ephemeral();
         // No options at all → no filters, index 0.
-        assert_eq!(filter_options(&HashMap::new()), (Vec::new(), 0));
+        assert_eq!(filter_options(&HashMap::new(), "", &store), (Vec::new(), 0));
 
         let raw: Vec<RawFilter> = vec![
             (
@@ -595,7 +612,7 @@ mod tests {
             "filters".to_string(),
             OwnedValue::try_from(Value::from(raw.clone())).unwrap(),
         );
-        let (filters, idx) = filter_options(&options);
+        let (filters, idx) = filter_options(&options, "", &store);
         assert_eq!(idx, 0);
         assert_eq!(filters.len(), 3);
         // Globs lowered; mimetypes kept; unknown kinds dropped.
@@ -609,7 +626,7 @@ mod tests {
             "current_filter".to_string(),
             OwnedValue::try_from(Value::from(all)).unwrap(),
         );
-        assert_eq!(filter_options(&options).1, 1);
+        assert_eq!(filter_options(&options, "", &store).1, 1);
 
         // …and a detached one is appended and selected.
         let detached: RawFilter = ("Detached".into(), vec![(0, "*.x".into())]);
@@ -617,9 +634,44 @@ mod tests {
             "current_filter".to_string(),
             OwnedValue::try_from(Value::from(detached)).unwrap(),
         );
-        let (filters, idx) = filter_options(&options);
+        let (filters, idx) = filter_options(&options, "", &store);
         assert_eq!((filters.len(), idx), (4, 3));
         assert_eq!(filters[3].name, "Detached");
+    }
+
+    #[test]
+    fn filter_memory_fills_in_only_without_explicit_current() {
+        let store = crate::state::Store::ephemeral();
+        let raw: Vec<RawFilter> = vec![
+            ("Images".into(), vec![(0, "*.png".into())]),
+            ("All files".into(), vec![(0, "*".into())]),
+        ];
+        let mut options = HashMap::new();
+        options.insert(
+            "filters".to_string(),
+            OwnedValue::try_from(Value::from(raw)).unwrap(),
+        );
+
+        // No memory yet → first filter.
+        assert_eq!(filter_options(&options, "org.app", &store).1, 0);
+
+        // Remembered filter pre-selects by name when no current_filter.
+        store.record_app_filter("org.app", "All files");
+        assert_eq!(filter_options(&options, "org.app", &store).1, 1);
+        // A different app is unaffected.
+        assert_eq!(filter_options(&options, "org.other", &store).1, 0);
+        // A remembered filter no longer offered falls back to the first.
+        store.record_app_filter("org.app", "Vanished");
+        assert_eq!(filter_options(&options, "org.app", &store).1, 0);
+
+        // An explicit current_filter always wins over memory.
+        store.record_app_filter("org.app", "All files");
+        let images: RawFilter = ("Images".into(), vec![(0, "*.png".into())]);
+        options.insert(
+            "current_filter".to_string(),
+            OwnedValue::try_from(Value::from(images)).unwrap(),
+        );
+        assert_eq!(filter_options(&options, "org.app", &store).1, 0);
     }
 
     #[test]

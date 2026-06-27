@@ -46,6 +46,11 @@ struct AppState {
     /// The directory this app last *accepted* a file/folder from.
     #[serde(default)]
     last_dir: Option<PathBuf>,
+    /// Display name of the file-type filter this app last accepted with.
+    /// Matched by name against a later request's filter list (indices
+    /// are meaningless across requests with different filter sets).
+    #[serde(default)]
+    last_filter: Option<String>,
 }
 
 /// Shared, cheap-to-clone handle to the persisted state. Reads are an
@@ -141,6 +146,36 @@ impl Store {
                 return;
             }
             entry.last_dir = Some(dir.to_path_buf());
+        }
+        self.persist(&state);
+    }
+
+    /// The display name of the filter `app_id` last accepted with, if
+    /// remembered. Used to pre-select a filter in this app's next dialog
+    /// when the caller doesn't specify a `current_filter`.
+    pub fn app_last_filter(&self, app_id: &str) -> Option<String> {
+        self.state
+            .lock()
+            .unwrap()
+            .per_app
+            .get(app_id)?
+            .last_filter
+            .clone()
+    }
+
+    /// Remember the filter (by display name) `app_id` last accepted with.
+    /// A no-op for an empty `app_id` or `filter`, and when unchanged.
+    pub fn record_app_filter(&self, app_id: &str, filter: &str) {
+        if app_id.is_empty() || filter.is_empty() {
+            return;
+        }
+        let mut state = self.state.lock().unwrap();
+        {
+            let entry = state.per_app.entry(app_id.to_string()).or_default();
+            if entry.last_filter.as_deref() == Some(filter) {
+                return;
+            }
+            entry.last_filter = Some(filter.to_string());
         }
         self.persist(&state);
     }
@@ -255,6 +290,28 @@ mod tests {
         store.record_app_dir("org.x", Path::new("relative"));
         assert_eq!(store.app_last_dir(""), None);
         assert_eq!(store.app_last_dir("org.x"), None);
+    }
+
+    #[test]
+    fn per_app_filter_records_isolated_with_guards() {
+        let store = Store::ephemeral();
+        store.record_app_filter("org.x", "Images");
+        store.record_app_filter("org.y", "Documents");
+        assert_eq!(store.app_last_filter("org.x"), Some("Images".to_string()));
+        assert_eq!(
+            store.app_last_filter("org.y"),
+            Some("Documents".to_string())
+        );
+        assert_eq!(store.app_last_filter("org.z"), None);
+        // Empty app_id or empty filter name are ignored; dir and filter
+        // are independent slots on the same app entry.
+        store.record_app_filter("", "Images");
+        store.record_app_filter("org.x", "");
+        assert_eq!(store.app_last_filter(""), None);
+        assert_eq!(store.app_last_filter("org.x"), Some("Images".to_string()));
+        store.record_app_dir("org.x", Path::new("/ceph/x"));
+        assert_eq!(store.app_last_dir("org.x"), Some(PathBuf::from("/ceph/x")));
+        assert_eq!(store.app_last_filter("org.x"), Some("Images".to_string()));
     }
 
     #[test]
