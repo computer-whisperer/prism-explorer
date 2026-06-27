@@ -56,6 +56,8 @@ const CUT_DIM: f32 = 0.45;
 /// Idle gap after which a type-ahead query resets to empty, so a fresh
 /// keystroke starts a new search rather than extending a stale one.
 const TYPEAHEAD_RESET: Duration = Duration::from_millis(1000);
+/// How many recent directories the sidebar's "Recent" group shows.
+const RECENTS_SHOWN: usize = 8;
 const SIDEBAR_MIN: f32 = 160.0;
 const SIDEBAR_MAX: f32 = 420.0;
 const PREVIEW_MIN: f32 = 260.0;
@@ -286,14 +288,20 @@ pub struct ExplorerApp {
     rx: Receiver<Msg>,
     notifier: Notifier,
     registry: Arc<Registry>,
-    /// Persisted last-used location (and the heuristic store growing on
-    /// top). Updated on every `navigate`; read at startup to seed the
-    /// initial directory.
+    /// Persisted history log (see [`crate::state`]). Read for the
+    /// "Recent" sidebar group; appended to on navigation only when
+    /// `record_visits` is set.
     store: Arc<Store>,
+    /// Whether this window's navigations are logged as browser visits.
+    /// True for the standalone browser, false for picker windows (their
+    /// browsing must not move the global history — they still *read* it).
+    record_visits: bool,
 
     cwd: PathBuf,
     listing: Listing,
     places: Vec<Place>,
+    /// Recently-used directories from the store, refreshed on navigate.
+    recents: Vec<PathBuf>,
     show_hidden: bool,
     /// Picker-imposed type filter (portal `filters`); the browser
     /// window never sets one. Applies to files only, in
@@ -494,6 +502,7 @@ impl ExplorerApp {
         registry: Arc<Registry>,
         thumbs: Arc<ThumbCache>,
         store: Arc<Store>,
+        record_visits: bool,
     ) -> Self {
         let (tx, rx) = channel();
         let mut app = ExplorerApp {
@@ -505,6 +514,8 @@ impl ExplorerApp {
             notifier,
             registry,
             store,
+            record_visits,
+            recents: Vec::new(),
             places: Vec::new(),
             show_hidden: false,
             file_filter: None,
@@ -626,10 +637,13 @@ impl ExplorerApp {
     fn navigate(&mut self, dir: PathBuf, select: Option<OsString>) {
         let generation = self.pool.bump_generation();
         tracing::info!(dir = %dir.display(), generation, "navigate");
-        // Remember where we are so the next no-hint dialog (and the
-        // standalone browser) reopens here. Cheap: memory write plus an
-        // off-thread disk write.
-        self.store.record_dir(&dir);
+        // Log the visit (browser only — a picker's browsing must not move
+        // the history), then refresh the "Recent" sidebar from the store.
+        // Cheap: memory append plus an off-thread disk write.
+        if self.record_visits {
+            self.store.record_visit(&dir);
+        }
+        self.recents = self.store.recent_dirs(RECENTS_SHOWN);
         self.cwd = dir.clone();
         self.listing = Listing::new(dir.clone(), generation);
         self.selected = None;
@@ -1767,6 +1781,33 @@ impl ExplorerApp {
             groups.push(sidebar_group([
                 sidebar_group_label("Bookmarks"),
                 sidebar_menu(bookmarks),
+            ]));
+        }
+
+        // Recent directories from the history log, keyed by index into
+        // `self.recents`. The current directory is skipped (it's already
+        // the breadcrumb) so the slots show somewhere else to jump to.
+        let recents: Vec<El> = self
+            .recents
+            .iter()
+            .enumerate()
+            .filter(|(_, dir)| **dir != self.cwd)
+            .map(|(i, dir)| {
+                let label = dir
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| dir.display().to_string());
+                sidebar_menu_item(
+                    sidebar_menu_button_with_icon("folder", label, false)
+                        .key(format!("recent:{i}"))
+                        .tooltip(dir.display().to_string()),
+                )
+            })
+            .collect();
+        if !recents.is_empty() {
+            groups.push(sidebar_group([
+                sidebar_group_label("Recent"),
+                sidebar_menu(recents),
             ]));
         }
 
@@ -3852,6 +3893,17 @@ impl App for ExplorerApp {
                     return;
                 }
             }
+            if let Some(i) = key
+                .strip_prefix("recent:")
+                .and_then(|s| s.parse::<usize>().ok())
+            {
+                if event.is_click_or_activate(key) {
+                    if let Some(dir) = self.recents.get(i).cloned() {
+                        self.navigate(dir, None);
+                    }
+                    return;
+                }
+            }
             if key == "up" && event.is_click_or_activate(key) {
                 self.navigate_parent();
                 return;
@@ -4140,6 +4192,7 @@ pub(crate) mod fixtures {
             Arc::new(Registry::standard()),
             Arc::new(thumbs),
             crate::state::Store::ephemeral(),
+            false,
         );
         app.places = vec![
             Place {
@@ -5643,5 +5696,26 @@ mod tests {
         // Navigating by a place / crumb / parent button closes the bar.
         app.navigate(PathBuf::from("/test/elsewhere"), None);
         assert!(app.location_edit.is_none());
+    }
+
+    #[test]
+    fn navigate_refreshes_recents_and_browse_does_not_record() {
+        let mut app = browse();
+        // Seed the shared history directly.
+        app.store.record_visit(&PathBuf::from("/ceph/one"));
+        app.store.record_visit(&PathBuf::from("/ceph/two"));
+
+        // Navigating refreshes the sidebar's recents from the store.
+        app.navigate(PathBuf::from("/test/elsewhere"), None);
+        assert_eq!(
+            app.recents,
+            vec![PathBuf::from("/ceph/two"), PathBuf::from("/ceph/one")]
+        );
+        // The fixture window has record_visits == false (like a picker),
+        // so its own navigation did not append /test/elsewhere.
+        assert_eq!(
+            app.store.recent_dirs(RECENTS_SHOWN),
+            vec![PathBuf::from("/ceph/two"), PathBuf::from("/ceph/one")]
+        );
     }
 }

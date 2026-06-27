@@ -108,6 +108,9 @@ fn main() -> Result<()> {
         registry.clone(),
         thumbs.clone(),
         store.clone(),
+        // The standalone browser owns the global history; its
+        // navigations are logged as visits.
+        true,
     );
 
     // "Show this in the file manager" service — browsers' Open

@@ -35,6 +35,7 @@ use crate::app::ExplorerApp;
 use crate::host::{HostCommand, WindowSpec};
 use crate::model::FileFilter;
 use crate::picker::{PickerApp, PickerKind, PickerOutcome, PickerRequest};
+use crate::state::{Chosen, RequestKind};
 
 /// Portal response codes (`org.freedesktop.portal.Request`).
 const RESPONSE_OK: u32 = 0;
@@ -92,11 +93,12 @@ impl FileChooser {
             self.deps.notifier.clone(),
             self.deps.registry.clone(),
             self.deps.thumbs.clone(),
-            // Ephemeral store: a picker's browsing must not move the
-            // global last_dir (only the standalone browser owns that).
-            // The dialog's persistent contribution is the per-app record
-            // made on accept, in the handlers below.
-            crate::state::Store::ephemeral(),
+            // The real history store — the picker *reads* it (the "Recent"
+            // sidebar, the start-dir/filter seeding) but `record_visits:
+            // false` keeps its browsing out of the log. The dialog's only
+            // contribution is the request event recorded on completion.
+            self.deps.store.clone(),
+            false,
         );
         let app = PickerApp::new(
             request,
@@ -163,22 +165,31 @@ impl FileChooser {
         (response, answer)
     }
 
-    /// Record what `app_id` accepted, so its next dialog reopens there
-    /// with the same filter. The chosen path's *parent* is the directory
-    /// the picker was browsing (for a save it's the target folder; for
-    /// folder-select it's the parent of the chosen folder). A no-op on
-    /// cancel; the store's own guards drop an empty `app_id`, a path with
-    /// no parent, and a filterless picker.
-    fn record_app(&self, app_id: &str, outcome: &Answer) {
-        let Some(outcome) = outcome else {
-            return;
-        };
-        if let Some(dir) = outcome.paths.first().and_then(|path| path.parent()) {
-            self.deps.store.record_app_dir(app_id, dir);
-        }
-        if let Some(filter) = &outcome.filter {
-            self.deps.store.record_app_filter(app_id, &filter.name);
-        }
+    /// Log one completed request to the history. `paths` are the final
+    /// returned paths (already name-joined for SaveFiles); `filter` is the
+    /// active one, if any. The directory context is the parent of the
+    /// first path — for a file that's its folder, for a chosen directory
+    /// (SaveFiles) that's the directory itself. Cancels (`paths` `None`)
+    /// are recorded too, with their request context.
+    fn log_request(
+        &self,
+        app_id: &str,
+        kind: RequestKind,
+        filters: Vec<String>,
+        paths: Option<&[PathBuf]>,
+        filter: Option<&FileFilter>,
+    ) {
+        let chosen = paths.map(|paths| Chosen {
+            dir: paths
+                .first()
+                .and_then(|p| p.parent())
+                .map(|d| d.to_path_buf()),
+            paths: paths.to_vec(),
+            filter: filter.map(|f| f.name.clone()),
+        });
+        self.deps
+            .store
+            .record_request(app_id, kind, filters, chosen);
     }
 }
 
@@ -196,6 +207,12 @@ impl FileChooser {
         let directory = bool_option(&options, "directory");
         let multiple = bool_option(&options, "multiple");
         let (filters, current_filter) = filter_options(&options, &app_id, &self.deps.store);
+        let filter_names: Vec<String> = filters.iter().map(|f| f.name.clone()).collect();
+        let kind = if directory {
+            RequestKind::OpenDir
+        } else {
+            RequestKind::OpenFile
+        };
         let request = PickerRequest {
             kind: PickerKind::Open {
                 directory,
@@ -209,8 +226,15 @@ impl FileChooser {
         };
         tracing::info!(%title, directory, multiple, "portal OpenFile");
         let (response, answer) = self.run_picker(connection, handle, &title, request).await;
-        self.record_app(&app_id, &answer);
-        let (paths, filter) = split_outcome(answer);
+        let filter = answer.as_ref().and_then(|o| o.filter.clone());
+        let paths = answer.map(|o| o.paths);
+        self.log_request(
+            &app_id,
+            kind,
+            filter_names,
+            paths.as_deref(),
+            filter.as_ref(),
+        );
         (response, result_map(paths, filter))
     }
 
@@ -238,6 +262,7 @@ impl FileChooser {
             ),
         };
         let (filters, current_filter) = filter_options(&options, &app_id, &self.deps.store);
+        let filter_names: Vec<String> = filters.iter().map(|f| f.name.clone()).collect();
         let request = PickerRequest {
             kind: PickerKind::Save,
             accept_label: accept_label(&options, "Save"),
@@ -248,8 +273,15 @@ impl FileChooser {
         };
         tracing::info!(%title, "portal SaveFile");
         let (response, answer) = self.run_picker(connection, handle, &title, request).await;
-        self.record_app(&app_id, &answer);
-        let (paths, filter) = split_outcome(answer);
+        let filter = answer.as_ref().and_then(|o| o.filter.clone());
+        let paths = answer.map(|o| o.paths);
+        self.log_request(
+            &app_id,
+            RequestKind::SaveFile,
+            filter_names,
+            paths.as_deref(),
+            filter.as_ref(),
+        );
         (response, result_map(paths, filter))
     }
 
@@ -284,16 +316,20 @@ impl FileChooser {
         };
         tracing::info!(%title, files = names.len(), "portal SaveFiles");
         let (response, answer) = self.run_picker(connection, handle, &title, request).await;
-        // Record before the names are joined on: here the outcome holds
-        // the chosen directory, so record_app's parent-of-path yields its
-        // parent — the browsing location — matching the other modes.
-        // (After the join it would be `dir/name`, recording `dir` itself.)
-        self.record_app(&app_id, &answer);
-        let paths = answer.map(|outcome| {
+        // Join the caller's names onto the chosen directory, then log the
+        // resulting file paths (their shared parent — the chosen dir — is
+        // the directory context). SaveFiles has no filters.
+        let paths: Option<Vec<PathBuf>> = answer.map(|outcome| {
             let dir = outcome.paths.into_iter().next().unwrap_or_else(home_dir);
             names.iter().map(|n| dir.join(n)).collect()
         });
-        // SaveFiles has no filters, so no current_filter to report back.
+        self.log_request(
+            &app_id,
+            RequestKind::SaveFiles,
+            Vec::new(),
+            paths.as_deref(),
+            None,
+        );
         (response, result_map(paths, None))
     }
 }
@@ -521,15 +557,6 @@ fn path_to_file_uri(path: &std::path::Path) -> String {
     uri
 }
 
-/// Split an accepted outcome into its paths and active filter; a cancel
-/// (`None`) yields no paths and no filter.
-fn split_outcome(answer: Answer) -> (Option<Vec<PathBuf>>, Option<FileFilter>) {
-    match answer {
-        Some(outcome) => (Some(outcome.paths), outcome.filter),
-        None => (None, None),
-    }
-}
-
 /// Serialize a [`FileFilter`] back to the portal `(sa(us))` wire shape —
 /// the inverse of [`parse_filter`]. Globs come back lowercased (we
 /// lowered them on the way in for case-insensitive matching); the name,
@@ -567,6 +594,21 @@ fn result_map(
 mod tests {
     use super::*;
 
+    /// Record an accepted request for `app` choosing from `dir` with
+    /// `filter` active — the seam the resolution queries read from.
+    fn accept(store: &crate::state::Store, app: &str, dir: Option<&str>, filter: Option<&str>) {
+        store.record_request(
+            app,
+            RequestKind::OpenFile,
+            Vec::new(),
+            Some(Chosen {
+                dir: dir.map(PathBuf::from),
+                paths: Vec::new(),
+                filter: filter.map(String::from),
+            }),
+        );
+    }
+
     #[test]
     fn uri_encoding() {
         assert_eq!(
@@ -593,15 +635,15 @@ mod tests {
         // Nothing remembered → home.
         assert_eq!(start_dir(&opts, "org.app", &store), home_dir());
 
-        // Global last_dir is the cross-app fallback.
-        store.record_dir(std::path::Path::new("/ceph/global"));
+        // A browser visit is the cross-app fallback (global last_dir).
+        store.record_visit(std::path::Path::new("/ceph/global"));
         assert_eq!(
             start_dir(&opts, "org.app", &store),
             PathBuf::from("/ceph/global")
         );
 
-        // A per-app record overrides the global for that app only.
-        store.record_app_dir("org.app", std::path::Path::new("/ceph/app"));
+        // A per-app accept overrides the global for that app only.
+        accept(&store, "org.app", Some("/ceph/app"), None);
         assert_eq!(
             start_dir(&opts, "org.app", &store),
             PathBuf::from("/ceph/app")
@@ -737,16 +779,16 @@ mod tests {
         assert_eq!(filter_options(&options, "org.app", &store).1, 0);
 
         // Remembered filter pre-selects by name when no current_filter.
-        store.record_app_filter("org.app", "All files");
+        accept(&store, "org.app", None, Some("All files"));
         assert_eq!(filter_options(&options, "org.app", &store).1, 1);
         // A different app is unaffected.
         assert_eq!(filter_options(&options, "org.other", &store).1, 0);
         // A remembered filter no longer offered falls back to the first.
-        store.record_app_filter("org.app", "Vanished");
+        accept(&store, "org.app", None, Some("Vanished"));
         assert_eq!(filter_options(&options, "org.app", &store).1, 0);
 
         // An explicit current_filter always wins over memory.
-        store.record_app_filter("org.app", "All files");
+        accept(&store, "org.app", None, Some("All files"));
         let images: RawFilter = ("Images".into(), vec![(0, "*.png".into())]);
         options.insert(
             "current_filter".to_string(),
