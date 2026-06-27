@@ -305,6 +305,9 @@ pub struct ExplorerApp {
     search: String,
     selection: Selection,
     show_search: bool,
+    /// Open location bar (Ctrl+L): `Some(path_text)` replaces the
+    /// breadcrumb with an editable path field. `None` shows crumbs.
+    location_edit: Option<String>,
     sort: SortMode,
     sort_open: bool,
     focus_requests: Vec<String>,
@@ -508,6 +511,7 @@ impl ExplorerApp {
             search: String::new(),
             selection: Selection::default(),
             show_search: true,
+            location_edit: None,
             sort: SortMode::default(),
             sort_open: false,
             focus_requests: Vec::new(),
@@ -644,6 +648,9 @@ impl ExplorerApp {
         self.pending_select = select;
         self.typeahead.clear();
         self.typeahead_at = None;
+        // Navigating by any means (a place, a crumb, the parent button)
+        // closes an open location bar.
+        self.location_edit = None;
         self.preview = PreviewState::Empty;
         self.preview_inflight = None;
         self.preview_wanted = None;
@@ -1591,6 +1598,68 @@ impl ExplorerApp {
         self.focus_requests.push("browser-search".into());
     }
 
+    /// Open the location bar (Ctrl+L), pre-filled with the current path
+    /// and fully selected so typing replaces it.
+    fn open_location(&mut self) {
+        let value = self.cwd.to_string_lossy().into_owned();
+        self.selection.range = Some(SelectionRange {
+            anchor: SelectionPoint::new("browser-location", 0),
+            head: SelectionPoint::new("browser-location", value.len()),
+        });
+        self.location_edit = Some(value);
+        self.focus_requests.push("browser-location".into());
+    }
+
+    fn close_location(&mut self) {
+        self.location_edit = None;
+        self.selection = Selection::default();
+    }
+
+    /// Close the location bar if it's open, reporting whether it was.
+    /// Lets the picker route Escape to the bar before its own cancel.
+    pub(crate) fn dismiss_location(&mut self) -> bool {
+        let open = self.location_edit.is_some();
+        if open {
+            self.close_location();
+        }
+        open
+    }
+
+    /// Navigate to the typed path. `~` expands to home; a relative path
+    /// resolves against the current directory. A path to a file (not a
+    /// directory) just surfaces a listing error — fine for now.
+    fn commit_location(&mut self) {
+        let Some(raw) = self.location_edit.take() else {
+            return;
+        };
+        self.selection = Selection::default();
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return;
+        }
+        let path = if let Some(rest) = trimmed.strip_prefix('~') {
+            // ~ or ~/sub — anything else (e.g. ~user) is left literal.
+            if rest.is_empty() || rest.starts_with('/') {
+                let home = std::env::var_os("HOME").map(PathBuf::from);
+                match (home, rest.strip_prefix('/')) {
+                    (Some(home), Some(sub)) => home.join(sub),
+                    (Some(home), None) => home,
+                    (None, _) => PathBuf::from(trimmed),
+                }
+            } else {
+                PathBuf::from(trimmed)
+            }
+        } else {
+            let p = PathBuf::from(trimmed);
+            if p.is_absolute() {
+                p
+            } else {
+                self.cwd.join(p)
+            }
+        };
+        self.navigate(path, None);
+    }
+
     fn toggle_view(&mut self) {
         self.view = match self.view {
             ViewMode::List => ViewMode::Grid,
@@ -1720,17 +1789,22 @@ impl ExplorerApp {
         }
 
         let (view_icon, view_tip) = match self.view {
-            ViewMode::List => ("layout-dashboard", "grid view (g)"),
-            ViewMode::Grid => ("menu", "list view (g)"),
+            ViewMode::List => ("layout-dashboard", "grid view"),
+            ViewMode::Grid => ("menu", "list view"),
         };
         // Half-width browsers (tiling WMs) crowd the toolbar; shrink the
         // search box there so the action buttons still fit on one row.
         let narrow = cx.viewport_width().unwrap_or(1280.0) < 900.0;
+        // The location bar (Ctrl+L) takes the breadcrumb's slot while open.
+        let nav: El = match &self.location_edit {
+            Some(value) => self.location_el(value),
+            None => breadcrumb([breadcrumb_list(items)]),
+        };
         let mut tools = vec![
             icon_button("chevron-up")
                 .key("up")
                 .tooltip("parent directory (Backspace)"),
-            breadcrumb([breadcrumb_list(items)]),
+            nav,
             spacer(),
         ];
         if self.show_search {
@@ -1747,6 +1821,31 @@ impl ExplorerApp {
             color_mode_badge(cx),
         ]);
         toolbar(tools)
+    }
+
+    /// The editable path field shown in the breadcrumb's place while the
+    /// location bar is open. Fills the available width so it spans the
+    /// toolbar like the crumbs it replaces.
+    fn location_el(&self, value: &str) -> El {
+        let input = text_input::text_input_with(
+            "browser-location",
+            value,
+            &self.selection,
+            TextInputOpts {
+                placeholder: Some("Go to path"),
+                ..TextInputOpts::default()
+            },
+        )
+        .width(Size::Fill(1.0));
+        row([
+            icon("folder")
+                .icon_size(tokens::ICON_SM)
+                .color(tokens::MUTED_FOREGROUND),
+            input,
+        ])
+        .gap(tokens::SPACE_2)
+        .align(Align::Center)
+        .width(Size::Fill(1.0))
     }
 
     fn search_el(&self, narrow: bool) -> El {
@@ -3410,11 +3509,11 @@ impl App for ExplorerApp {
     }
 
     fn hotkeys(&self) -> Vec<(KeyChord, String)> {
-        // While the New Folder / Rename prompt is open, register nothing
-        // so every key (Enter, Backspace, Delete, arrows, letters) is
-        // delivered to the focused name field instead of firing a
-        // browser action — hotkeys otherwise win over text-field capture.
-        if self.prompt.is_some() {
+        // While a name-entry prompt or the location bar is open, register
+        // nothing so every key (Enter, Backspace, Delete, arrows, letters)
+        // is delivered to the focused field instead of firing a browser
+        // action — hotkeys otherwise win over text-field capture.
+        if self.prompt.is_some() || self.location_edit.is_some() {
             return Vec::new();
         }
         let shift_delete = KeyChord::named(UiKey::Delete).with_modifiers(KeyModifiers {
@@ -3435,6 +3534,7 @@ impl App for ExplorerApp {
             // former vim-letter commands move to modifier/function-key
             // chords so they don't swallow typed characters.
             (KeyChord::ctrl('f'), "search".into()),
+            (KeyChord::ctrl('l'), "location".into()),
             (KeyChord::ctrl('c'), "copy-files".into()),
             (KeyChord::ctrl('x'), "cut-files".into()),
             (KeyChord::ctrl('v'), "paste-files".into()),
@@ -3592,6 +3692,29 @@ impl App for ExplorerApp {
                 }
                 _ => {}
             }
+        }
+        // The location bar: type a path, Enter to go, Escape to dismiss.
+        // `hotkeys()` is empty while it's open, so editing keys reach the
+        // focused field here as raw KeyDowns. Only its own events are
+        // intercepted; clicks elsewhere flow normally.
+        if self.location_edit.is_some() && event.target_key() == Some("browser-location") {
+            let key = event.key_press.as_ref().map(|kp| kp.key.clone());
+            if event.kind == UiEventKind::KeyDown && key.as_ref() == Some(&UiKey::Enter) {
+                self.commit_location();
+                return;
+            }
+            if event.kind == UiEventKind::Escape
+                || (event.kind == UiEventKind::KeyDown && key.as_ref() == Some(&UiKey::Escape))
+            {
+                self.close_location();
+                return;
+            }
+            let mut value = self.location_edit.clone().unwrap_or_default();
+            if text_input::apply_event(&mut value, &mut self.selection, &event, "browser-location")
+            {
+                self.location_edit = Some(value);
+            }
+            return;
         }
         if event.target_key() == Some("browser-search") {
             let mut search = self.search.clone();
@@ -3785,6 +3908,8 @@ impl App for ExplorerApp {
             self.refresh();
         } else if event.is_hotkey("search") {
             self.focus_search();
+        } else if event.is_hotkey("location") {
+            self.open_location();
         } else if event.is_hotkey("first") {
             self.select_pos(0);
         } else if event.is_hotkey("last") {
@@ -5445,5 +5570,58 @@ mod tests {
         app.navigate(PathBuf::from("/test/elsewhere"), None);
         assert!(app.prompt.is_none());
         assert!(app.confirm_delete.is_none());
+    }
+
+    #[test]
+    fn location_bar_opens_prefilled_and_focused() {
+        let mut app = browse();
+        app.open_location();
+        assert_eq!(app.location_edit.as_deref(), Some("/test/somewhere"));
+        assert!(app.focus_requests.iter().any(|k| k == "browser-location"));
+    }
+
+    #[test]
+    fn location_commit_resolves_absolute_relative_and_tilde() {
+        // Absolute path: navigate straight there.
+        let mut app = browse();
+        app.location_edit = Some("/ceph/photos".into());
+        app.commit_location();
+        assert_eq!(app.cwd, PathBuf::from("/ceph/photos"));
+        assert!(app.location_edit.is_none());
+
+        // Relative path: resolve against the current directory.
+        let mut app = browse();
+        app.location_edit = Some("sub/dir".into());
+        app.commit_location();
+        assert_eq!(app.cwd, PathBuf::from("/test/somewhere/sub/dir"));
+
+        // ~ expands to $HOME.
+        let mut app = browse();
+        let home = std::env::var_os("HOME").map(PathBuf::from);
+        app.location_edit = Some("~/work".into());
+        app.commit_location();
+        if let Some(home) = home {
+            assert_eq!(app.cwd, home.join("work"));
+        }
+    }
+
+    #[test]
+    fn location_commit_empty_closes_without_navigating() {
+        let mut app = browse();
+        let before = app.cwd.clone();
+        app.location_edit = Some("   ".into());
+        app.commit_location();
+        assert!(app.location_edit.is_none());
+        assert_eq!(app.cwd, before);
+    }
+
+    #[test]
+    fn navigation_closes_location_bar() {
+        let mut app = browse();
+        app.open_location();
+        assert!(app.location_edit.is_some());
+        // Navigating by a place / crumb / parent button closes the bar.
+        app.navigate(PathBuf::from("/test/elsewhere"), None);
+        assert!(app.location_edit.is_none());
     }
 }

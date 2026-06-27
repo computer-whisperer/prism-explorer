@@ -358,10 +358,14 @@ impl App for PickerApp {
             return;
         }
         if event.is_click_or_activate("picker-cancel") || event.is_hotkey("picker-cancel") {
-            // Escape with the filter menu open closes the menu, not
-            // the dialog.
+            // Escape dismisses an open overlay before the dialog: the
+            // filter menu first, then the explorer's location bar (the
+            // Cancel button, not being Escape, always cancels outright).
             if self.filter_open {
                 self.filter_open = false;
+                return;
+            }
+            if event.is_hotkey("picker-cancel") && self.explorer.dismiss_location() {
                 return;
             }
             self.finish(None);
