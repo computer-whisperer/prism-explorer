@@ -13,11 +13,10 @@
 //! closure; accept/cancel/window-close all funnel into that closure
 //! exactly once (dropping the app unanswered counts as cancel).
 //!
-//! Deliberately unimplemented for now: `choices` (ignored),
+//! Deliberately unimplemented for now: `choices` (ignored) and
 //! modal-to-parent (`parent_window` is ignored — the dialog is a plain
-//! toplevel), and the `current_filter` result key (the filter active at
-//! accept time is not reported back). `multiple` is honored — accept
-//! returns every marked file.
+//! toplevel). `multiple` is honored — accept returns every marked file —
+//! and the filter active at accept is reported back in `current_filter`.
 
 use std::collections::HashMap;
 use std::ffi::OsString;
@@ -211,7 +210,8 @@ impl FileChooser {
         tracing::info!(%title, directory, multiple, "portal OpenFile");
         let (response, answer) = self.run_picker(connection, handle, &title, request).await;
         self.record_app(&app_id, &answer);
-        (response, uris_result(answer.map(|o| o.paths)))
+        let (paths, filter) = split_outcome(answer);
+        (response, result_map(paths, filter))
     }
 
     async fn save_file(
@@ -249,7 +249,8 @@ impl FileChooser {
         tracing::info!(%title, "portal SaveFile");
         let (response, answer) = self.run_picker(connection, handle, &title, request).await;
         self.record_app(&app_id, &answer);
-        (response, uris_result(answer.map(|o| o.paths)))
+        let (paths, filter) = split_outcome(answer);
+        (response, result_map(paths, filter))
     }
 
     /// Batch save: the caller supplies the file *names*; the user
@@ -292,7 +293,8 @@ impl FileChooser {
             let dir = outcome.paths.into_iter().next().unwrap_or_else(home_dir);
             names.iter().map(|n| dir.join(n)).collect()
         });
-        (response, uris_result(paths))
+        // SaveFiles has no filters, so no current_filter to report back.
+        (response, result_map(paths, None))
     }
 }
 
@@ -519,12 +521,43 @@ fn path_to_file_uri(path: &std::path::Path) -> String {
     uri
 }
 
-fn uris_result(paths: Option<Vec<PathBuf>>) -> HashMap<String, OwnedValue> {
+/// Split an accepted outcome into its paths and active filter; a cancel
+/// (`None`) yields no paths and no filter.
+fn split_outcome(answer: Answer) -> (Option<Vec<PathBuf>>, Option<FileFilter>) {
+    match answer {
+        Some(outcome) => (Some(outcome.paths), outcome.filter),
+        None => (None, None),
+    }
+}
+
+/// Serialize a [`FileFilter`] back to the portal `(sa(us))` wire shape —
+/// the inverse of [`parse_filter`]. Globs come back lowercased (we
+/// lowered them on the way in for case-insensitive matching); the name,
+/// which is the filter's identity to the caller, round-trips exactly.
+fn filter_to_raw(filter: &FileFilter) -> RawFilter {
+    let mut patterns = Vec::with_capacity(filter.globs.len() + filter.mimes.len());
+    patterns.extend(filter.globs.iter().map(|g| (0u32, g.clone())));
+    patterns.extend(filter.mimes.iter().map(|m| (1u32, m.clone())));
+    (filter.name.clone(), patterns)
+}
+
+/// Build the portal result: the chosen `uris`, plus the `current_filter`
+/// that was active at accept so the caller learns which of its filters
+/// the user ended on. Either is omitted when absent.
+fn result_map(
+    paths: Option<Vec<PathBuf>>,
+    filter: Option<FileFilter>,
+) -> HashMap<String, OwnedValue> {
     let mut results = HashMap::new();
     if let Some(paths) = paths {
         let uris: Vec<String> = paths.iter().map(|p| path_to_file_uri(p)).collect();
         if let Ok(value) = OwnedValue::try_from(Value::from(uris)) {
             results.insert("uris".to_string(), value);
+        }
+    }
+    if let Some(filter) = filter {
+        if let Ok(value) = OwnedValue::try_from(Value::from(filter_to_raw(&filter))) {
+            results.insert("current_filter".to_string(), value);
         }
     }
     results
@@ -637,6 +670,54 @@ mod tests {
         let (filters, idx) = filter_options(&options, "", &store);
         assert_eq!((filters.len(), idx), (4, 3));
         assert_eq!(filters[3].name, "Detached");
+    }
+
+    #[test]
+    fn filter_to_raw_is_the_inverse_of_parse() {
+        let filter = FileFilter {
+            name: "Images".into(),
+            globs: vec!["*.png".into(), "*.jpg".into()],
+            mimes: vec!["image/webp".into()],
+        };
+        let raw = filter_to_raw(&filter);
+        assert_eq!(raw.0, "Images");
+        assert_eq!(
+            raw.1,
+            vec![
+                (0u32, "*.png".to_string()),
+                (0, "*.jpg".to_string()),
+                (1, "image/webp".to_string()),
+            ]
+        );
+        // Round-trips: parse_filter reconstructs the same FileFilter
+        // (globs are already lowercase here).
+        assert_eq!(parse_filter(raw), filter);
+    }
+
+    #[test]
+    fn result_map_reports_uris_and_current_filter() {
+        let paths = Some(vec![PathBuf::from("/ceph/a.png")]);
+        let filter = FileFilter {
+            name: "Images".into(),
+            globs: vec!["*.png".into()],
+            mimes: vec![],
+        };
+        let result = result_map(paths.clone(), Some(filter));
+        assert!(result.contains_key("uris"));
+        // current_filter round-trips back to the same wire filter.
+        let raw = RawFilter::try_from(result["current_filter"].try_clone().unwrap()).unwrap();
+        assert_eq!(
+            raw,
+            ("Images".to_string(), vec![(0u32, "*.png".to_string())])
+        );
+
+        // No filter → no current_filter key (e.g. SaveFiles).
+        let result = result_map(paths, None);
+        assert!(result.contains_key("uris"));
+        assert!(!result.contains_key("current_filter"));
+
+        // Cancel → empty result.
+        assert!(result_map(None, None).is_empty());
     }
 
     #[test]
