@@ -107,7 +107,8 @@ fn serve(tx: Sender<Msg>, notify: Notifier) -> zbus::Result<zbus::blocking::Conn
 
 /// `file://` URI → local path: reject other schemes and non-local
 /// authorities, percent-decode into raw bytes (paths aren't UTF-8).
-fn file_uri_to_path(uri: &str) -> Option<PathBuf> {
+/// Shared with the places sidebar's GTK-bookmarks reader.
+pub(crate) fn file_uri_to_path(uri: &str) -> Option<PathBuf> {
     use std::os::unix::ffi::OsStringExt as _;
 
     let rest = uri.strip_prefix("file://")?;

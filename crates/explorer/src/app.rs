@@ -1661,24 +1661,44 @@ impl ExplorerApp {
     // ---- build helpers -------------------------------------------------
 
     fn sidebar_el(&self, sidebar_w: f32) -> El {
-        let buttons: Vec<El> = self
-            .places
-            .iter()
-            .enumerate()
-            .map(|(i, p)| {
-                sidebar_menu_item(
-                    sidebar_menu_button_with_icon(p.icon, p.label.clone(), p.path == self.cwd)
-                        .key(format!("place:{i}"))
-                        .tooltip(p.path.display().to_string()),
-                )
-            })
-            .collect();
-        let menu: El = if buttons.is_empty() {
+        // One button per place, keyed by its flat index in `self.places`
+        // (the event handler looks them up by that index). Built-in
+        // places and user bookmarks render in separate groups, but the
+        // index stays global so the keys don't shift.
+        let button_for = |i: usize, p: &Place| {
+            sidebar_menu_item(
+                sidebar_menu_button_with_icon(p.icon, p.label.clone(), p.path == self.cwd)
+                    .key(format!("place:{i}"))
+                    .tooltip(p.path.display().to_string()),
+            )
+        };
+        let group_of = |bookmark: bool| -> Vec<El> {
+            self.places
+                .iter()
+                .enumerate()
+                .filter(|(_, p)| p.bookmark == bookmark)
+                .map(|(i, p)| button_for(i, p))
+                .collect()
+        };
+
+        let mut groups: Vec<El> = Vec::new();
+        let places = group_of(false);
+        let places_menu: El = if places.is_empty() {
             text("probing…").caption().muted()
         } else {
-            sidebar_menu(buttons)
+            sidebar_menu(places)
         };
-        sidebar([sidebar_group([sidebar_group_label("Places"), menu])])
+        groups.push(sidebar_group([sidebar_group_label("Places"), places_menu]));
+
+        let bookmarks = group_of(true);
+        if !bookmarks.is_empty() {
+            groups.push(sidebar_group([
+                sidebar_group_label("Bookmarks"),
+                sidebar_menu(bookmarks),
+            ]));
+        }
+
+        sidebar(groups)
             .width(Size::Fixed(sidebar_w))
             .height(Size::Fill(1.0))
     }
@@ -3981,11 +4001,13 @@ pub(crate) mod fixtures {
                 label: "Home".into(),
                 path: "/home/test".into(),
                 icon: "folder",
+                bookmark: false,
             },
             Place {
                 label: "/ceph".into(),
                 path: "/ceph".into(),
                 icon: "activity",
+                bookmark: false,
             },
         ];
         let batch = vec![
