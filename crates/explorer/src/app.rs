@@ -708,16 +708,18 @@ impl ExplorerApp {
         }
     }
 
+    /// Move the cursor to `id` and refresh the preview. Does *not*
+    /// scroll the row into view — that's a keyboard-navigation concern
+    /// (the caller can't see where the cursor went), so the keyboard
+    /// paths call `keep_selection_visible` explicitly. Pointer clicks
+    /// land on a row that's already under the cursor, so forcing a
+    /// scroll there just yanks a partially-clipped row out from under
+    /// the pointer (and, on right-click, out from under the menu).
     fn select_id(&mut self, id: EntryId) {
         let Some(pos) = self.listing.pos_of(id) else {
             return;
         };
         self.selected = Some((id, pos));
-        self.scroll_requests.borrow_mut().push(ScrollRequest::new(
-            self.scroll_key(),
-            self.scroll_line_of(pos),
-            ScrollAlignment::Visible,
-        ));
 
         let entries = self.listing.entries.lock().unwrap();
         let kind = entries[id as usize].kind;
@@ -735,6 +737,7 @@ impl ExplorerApp {
     fn select_pos(&mut self, pos: usize) {
         if let Some(&id) = self.listing.order.get(pos) {
             self.select_only(id);
+            self.keep_selection_visible();
         }
     }
 
@@ -3194,6 +3197,7 @@ impl App for ExplorerApp {
                         if let Some(id) = self.listing.id_by_name(&name) {
                             self.pending_select = None;
                             self.select_id(id);
+                            self.keep_selection_visible();
                         } else if self.listing.complete {
                             self.pending_select = None;
                         }
@@ -3680,6 +3684,7 @@ impl App for ExplorerApp {
         } else if event.is_hotkey("mark") {
             if let Some(id) = self.selected_id() {
                 self.toggle_mark(id);
+                self.keep_selection_visible();
             }
         } else if event.is_hotkey("new-folder") {
             self.begin_new_folder();
@@ -4467,6 +4472,40 @@ mod tests {
                 PathBuf::from("/test/somewhere/notes.txt"),
                 PathBuf::from("/test/somewhere/photo.jxr"),
             ]
+        );
+    }
+
+    /// Pointer-driven selection must not queue a scroll-into-view:
+    /// the clicked row is already under the cursor, and forcing a
+    /// scroll yanks a row clipped at the viewport edge away (on
+    /// right-click, out from under the just-opened menu). Keyboard
+    /// navigation still scrolls the cursor into view.
+    #[test]
+    fn pointer_selection_does_not_scroll() {
+        let mut app = browse(); // docs(dir), notes.txt, photo.jxr
+        let photo = id_of(&app, "photo.jxr");
+        // Drop the scroll-to-top the fixture's navigate queued.
+        app.scroll_requests.borrow_mut().clear();
+
+        // Left-click selection.
+        app.select_only(photo);
+        assert!(
+            app.scroll_requests.borrow().is_empty(),
+            "left-click select_only should not queue a scroll request",
+        );
+
+        // Right-click (collapses selection to the row, then opens menu).
+        app.open_context_menu(photo, (0.0, 0.0));
+        assert!(
+            app.scroll_requests.borrow().is_empty(),
+            "right-click should not queue a scroll request",
+        );
+
+        // Keyboard navigation keeps the cursor on screen.
+        app.select_pos(0);
+        assert!(
+            !app.scroll_requests.borrow().is_empty(),
+            "keyboard select_pos should queue a scroll request",
         );
     }
 
