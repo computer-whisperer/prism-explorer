@@ -47,6 +47,7 @@ use crate::model::{
 };
 use crate::places::Place;
 use crate::preview_policy::{grid_thumbnail_policy, GridThumbPolicy};
+use crate::state::Store;
 use crate::sysclip;
 
 const ROW_H: f32 = 34.0;
@@ -285,6 +286,10 @@ pub struct ExplorerApp {
     rx: Receiver<Msg>,
     notifier: Notifier,
     registry: Arc<Registry>,
+    /// Persisted last-used location (and the heuristic store growing on
+    /// top). Updated on every `navigate`; read at startup to seed the
+    /// initial directory.
+    store: Arc<Store>,
 
     cwd: PathBuf,
     listing: Listing,
@@ -485,6 +490,7 @@ impl ExplorerApp {
         notifier: Notifier,
         registry: Arc<Registry>,
         thumbs: Arc<ThumbCache>,
+        store: Arc<Store>,
     ) -> Self {
         let (tx, rx) = channel();
         let mut app = ExplorerApp {
@@ -495,6 +501,7 @@ impl ExplorerApp {
             rx,
             notifier,
             registry,
+            store,
             places: Vec::new(),
             show_hidden: false,
             file_filter: None,
@@ -615,6 +622,10 @@ impl ExplorerApp {
     fn navigate(&mut self, dir: PathBuf, select: Option<OsString>) {
         let generation = self.pool.bump_generation();
         tracing::info!(dir = %dir.display(), generation, "navigate");
+        // Remember where we are so the next no-hint dialog (and the
+        // standalone browser) reopens here. Cheap: memory write plus an
+        // off-thread disk write.
+        self.store.record_dir(&dir);
         self.cwd = dir.clone();
         self.listing = Listing::new(dir.clone(), generation);
         self.selected = None;
@@ -3963,6 +3974,7 @@ pub(crate) mod fixtures {
             notifier,
             Arc::new(Registry::standard()),
             Arc::new(thumbs),
+            crate::state::Store::ephemeral(),
         );
         app.places = vec![
             Place {

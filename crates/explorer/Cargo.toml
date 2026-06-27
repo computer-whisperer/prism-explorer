@@ -55,6 +55,11 @@ lru = "0.18"
 # mtime column formatting.
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 
+# Persisted picker/browser state (last-used location, and the heuristic
+# data growing on top): a small JSON file under $XDG_STATE_HOME.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
 # Portal filters carry mimetype patterns ("image/*"); matched against
 # the extension-guessed type.
 mime_guess = "2"

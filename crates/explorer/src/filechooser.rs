@@ -50,6 +50,10 @@ pub struct PickerDeps {
     pub notifier: Notifier,
     pub registry: Arc<Registry>,
     pub thumbs: Arc<ThumbCache>,
+    /// Shared last-used-location store, also held by the browser
+    /// window. Seeds `start_dir` when a caller sends no `current_folder`
+    /// and records the directory the user ends up in.
+    pub store: Arc<crate::state::Store>,
     pub proxy: EventLoopProxy<HostCommand>,
 }
 
@@ -88,6 +92,7 @@ impl FileChooser {
             self.deps.notifier.clone(),
             self.deps.registry.clone(),
             self.deps.thumbs.clone(),
+            self.deps.store.clone(),
         );
         let app = PickerApp::new(
             request,
@@ -175,7 +180,7 @@ impl FileChooser {
                 multiple,
             },
             accept_label: accept_label(&options, "Open"),
-            start_dir: start_dir(&options),
+            start_dir: start_dir(&options, &self.deps.store),
             current_name: String::new(),
             filters,
             current_filter,
@@ -204,7 +209,7 @@ impl FileChooser {
                     .unwrap_or_default(),
             ),
             None => (
-                start_dir(&options),
+                start_dir(&options, &self.deps.store),
                 string_option(&options, "current_name").unwrap_or_default(),
             ),
         };
@@ -246,7 +251,7 @@ impl FileChooser {
                 multiple: false,
             },
             accept_label: accept_label(&options, "Save"),
-            start_dir: start_dir(&options),
+            start_dir: start_dir(&options, &self.deps.store),
             current_name: String::new(),
             filters: Vec::new(),
             current_filter: 0,
@@ -435,10 +440,14 @@ fn home_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("/"))
 }
 
-fn start_dir(options: &HashMap<String, OwnedValue>) -> PathBuf {
+/// The directory a picker opens in: the caller's `current_folder` when
+/// given, else the last location the user browsed (any window), else
+/// home. The remembered path isn't stat'd — if it's since vanished the
+/// listing surfaces the error and the user navigates away.
+fn start_dir(options: &HashMap<String, OwnedValue>, store: &crate::state::Store) -> PathBuf {
     match path_option(options, "current_folder") {
         Some(dir) if dir.is_absolute() => dir,
-        _ => home_dir(),
+        _ => store.last_dir().unwrap_or_else(home_dir),
     }
 }
 

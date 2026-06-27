@@ -18,7 +18,7 @@ use explorer_previews::Registry;
 use explorer_thumbs::ThumbCache;
 use prism_explorer::app::ExplorerApp;
 use prism_explorer::host::{self, HostCommand, WindowSpec};
-use prism_explorer::{filechooser, filemanager1};
+use prism_explorer::{filechooser, filemanager1, state};
 
 /// Long edge of cached thumbnails: 2× the grid tile width, so tiles
 /// stay sharp on 2× displays.
@@ -36,6 +36,10 @@ fn main() -> Result<()> {
         )
         .init();
 
+    // Persisted last-used location, shared by the browser window and
+    // every portal picker. Loaded once here (a single small read).
+    let store = state::Store::load();
+
     let start = match std::env::args_os().nth(1) {
         Some(arg) => {
             let p = PathBuf::from(arg);
@@ -46,9 +50,12 @@ fn main() -> Result<()> {
                 std::env::current_dir()?.join(p)
             }
         }
-        None => std::env::var_os("HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("/")),
+        // No path given: reopen where we left off, else home.
+        None => store.last_dir().unwrap_or_else(|| {
+            std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("/"))
+        }),
     };
 
     // IO-bound (stat against a slow MDS) and CPU-bound (image decode)
@@ -100,6 +107,7 @@ fn main() -> Result<()> {
         notifier.clone(),
         registry.clone(),
         thumbs.clone(),
+        store.clone(),
     );
 
     // "Show this in the file manager" service — browsers' Open
@@ -115,6 +123,7 @@ fn main() -> Result<()> {
         notifier,
         registry,
         thumbs,
+        store,
         proxy: event_loop.create_proxy(),
     });
 
