@@ -51,8 +51,8 @@ pub struct PickerDeps {
     pub registry: Arc<Registry>,
     pub thumbs: Arc<ThumbCache>,
     /// Shared last-used-location store, also held by the browser
-    /// window. Seeds `start_dir` when a caller sends no `current_folder`
-    /// and records the directory the user ends up in.
+    /// window. Seeds `start_dir` (per-app memory, then the global
+    /// fallback) and, on accept, records where each app last chose.
     pub store: Arc<crate::state::Store>,
     pub proxy: EventLoopProxy<HostCommand>,
 }
@@ -92,7 +92,11 @@ impl FileChooser {
             self.deps.notifier.clone(),
             self.deps.registry.clone(),
             self.deps.thumbs.clone(),
-            self.deps.store.clone(),
+            // Ephemeral store: a picker's browsing must not move the
+            // global last_dir (only the standalone browser owns that).
+            // The dialog's persistent contribution is the per-app record
+            // made on accept, in the handlers below.
+            crate::state::Store::ephemeral(),
         );
         let app = PickerApp::new(
             request,
@@ -158,6 +162,22 @@ impl FileChooser {
         };
         (response, answer)
     }
+
+    /// Record where `app_id` accepted, so its next dialog reopens there.
+    /// The chosen path's *parent* is the directory the picker was
+    /// browsing (for a save it's the target folder; for folder-select
+    /// it's the parent of the chosen folder). A no-op on cancel, an
+    /// empty `app_id`, or a path with no parent.
+    fn record_app_choice(&self, app_id: &str, answer: &Answer) {
+        let Some(dir) = answer
+            .as_ref()
+            .and_then(|paths| paths.first())
+            .and_then(|path| path.parent())
+        else {
+            return;
+        };
+        self.deps.store.record_app_dir(app_id, dir);
+    }
 }
 
 #[zbus::interface(name = "org.freedesktop.impl.portal.FileChooser")]
@@ -166,7 +186,7 @@ impl FileChooser {
         &self,
         #[zbus(connection)] connection: &zbus::Connection,
         handle: ObjectPath<'_>,
-        _app_id: String,
+        app_id: String,
         _parent_window: String,
         title: String,
         options: HashMap<String, OwnedValue>,
@@ -180,13 +200,14 @@ impl FileChooser {
                 multiple,
             },
             accept_label: accept_label(&options, "Open"),
-            start_dir: start_dir(&options, &self.deps.store),
+            start_dir: start_dir(&options, &app_id, &self.deps.store),
             current_name: String::new(),
             filters,
             current_filter,
         };
         tracing::info!(%title, directory, multiple, "portal OpenFile");
         let (response, answer) = self.run_picker(connection, handle, &title, request).await;
+        self.record_app_choice(&app_id, &answer);
         (response, uris_result(answer))
     }
 
@@ -194,7 +215,7 @@ impl FileChooser {
         &self,
         #[zbus(connection)] connection: &zbus::Connection,
         handle: ObjectPath<'_>,
-        _app_id: String,
+        app_id: String,
         _parent_window: String,
         title: String,
         options: HashMap<String, OwnedValue>,
@@ -209,7 +230,7 @@ impl FileChooser {
                     .unwrap_or_default(),
             ),
             None => (
-                start_dir(&options, &self.deps.store),
+                start_dir(&options, &app_id, &self.deps.store),
                 string_option(&options, "current_name").unwrap_or_default(),
             ),
         };
@@ -224,6 +245,7 @@ impl FileChooser {
         };
         tracing::info!(%title, "portal SaveFile");
         let (response, answer) = self.run_picker(connection, handle, &title, request).await;
+        self.record_app_choice(&app_id, &answer);
         (response, uris_result(answer))
     }
 
@@ -233,7 +255,7 @@ impl FileChooser {
         &self,
         #[zbus(connection)] connection: &zbus::Connection,
         handle: ObjectPath<'_>,
-        _app_id: String,
+        app_id: String,
         _parent_window: String,
         title: String,
         options: HashMap<String, OwnedValue>,
@@ -251,13 +273,18 @@ impl FileChooser {
                 multiple: false,
             },
             accept_label: accept_label(&options, "Save"),
-            start_dir: start_dir(&options, &self.deps.store),
+            start_dir: start_dir(&options, &app_id, &self.deps.store),
             current_name: String::new(),
             filters: Vec::new(),
             current_filter: 0,
         };
         tracing::info!(%title, files = names.len(), "portal SaveFiles");
         let (response, answer) = self.run_picker(connection, handle, &title, request).await;
+        // Record before the names are joined on: here `answer` is the
+        // chosen directory, so record_app_choice's parent-of-path yields
+        // its parent — the browsing location — matching the other modes.
+        // (After the join it would be `dir/name`, recording `dir` itself.)
+        self.record_app_choice(&app_id, &answer);
         let answer = answer.map(|dirs| {
             let dir = dirs.into_iter().next().unwrap_or_else(home_dir);
             names.iter().map(|n| dir.join(n)).collect()
@@ -441,14 +468,22 @@ fn home_dir() -> PathBuf {
 }
 
 /// The directory a picker opens in: the caller's `current_folder` when
-/// given, else the last location the user browsed (any window), else
-/// home. The remembered path isn't stat'd — if it's since vanished the
-/// listing surfaces the error and the user navigates away.
-fn start_dir(options: &HashMap<String, OwnedValue>, store: &crate::state::Store) -> PathBuf {
-    match path_option(options, "current_folder") {
-        Some(dir) if dir.is_absolute() => dir,
-        _ => store.last_dir().unwrap_or_else(home_dir),
+/// given, else where this app (`app_id`) last accepted, else the global
+/// last-browsed location, else home. Remembered paths aren't stat'd — if
+/// one has since vanished the listing surfaces the error and the user
+/// navigates away.
+fn start_dir(
+    options: &HashMap<String, OwnedValue>,
+    app_id: &str,
+    store: &crate::state::Store,
+) -> PathBuf {
+    if let Some(dir) = path_option(options, "current_folder").filter(|d| d.is_absolute()) {
+        return dir;
     }
+    store
+        .app_last_dir(app_id)
+        .or_else(|| store.last_dir())
+        .unwrap_or_else(home_dir)
 }
 
 /// `file://` URI with sub-delim-safe percent-encoding (the inverse of
@@ -499,6 +534,46 @@ mod tests {
         assert_eq!(
             path_to_file_uri(std::path::Path::new(raw)),
             "file:///tmp/%FF"
+        );
+    }
+
+    #[test]
+    fn start_dir_resolution_order() {
+        let store = crate::state::Store::ephemeral();
+        let opts = HashMap::new();
+
+        // Nothing remembered → home.
+        assert_eq!(start_dir(&opts, "org.app", &store), home_dir());
+
+        // Global last_dir is the cross-app fallback.
+        store.record_dir(std::path::Path::new("/ceph/global"));
+        assert_eq!(
+            start_dir(&opts, "org.app", &store),
+            PathBuf::from("/ceph/global")
+        );
+
+        // A per-app record overrides the global for that app only.
+        store.record_app_dir("org.app", std::path::Path::new("/ceph/app"));
+        assert_eq!(
+            start_dir(&opts, "org.app", &store),
+            PathBuf::from("/ceph/app")
+        );
+        assert_eq!(
+            start_dir(&opts, "org.other", &store),
+            PathBuf::from("/ceph/global")
+        );
+        // Empty app_id never matches per-app → global.
+        assert_eq!(start_dir(&opts, "", &store), PathBuf::from("/ceph/global"));
+
+        // An explicit current_folder wins over everything remembered.
+        let mut explicit = HashMap::new();
+        explicit.insert(
+            "current_folder".to_string(),
+            OwnedValue::try_from(Value::from(b"/tmp/explicit\0".to_vec())).unwrap(),
+        );
+        assert_eq!(
+            start_dir(&explicit, "org.app", &store),
+            PathBuf::from("/tmp/explicit")
         );
     }
 

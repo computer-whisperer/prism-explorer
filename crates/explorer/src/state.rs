@@ -1,8 +1,9 @@
 //! Persisted picker/browser state — the small on-disk memory that lets
-//! windows reopen where you left off. Today it holds only the
-//! last-visited directory; it's the seed for the heuristic
-//! recommendations (recents, per-app, per-filter) planned on top, which
-//! is why it's a structured store and not a single line of text.
+//! windows reopen where you left off. Holds the global last-visited
+//! directory and per-app memory (where each requesting app last
+//! accepted); it's the seed for further heuristic recommendations
+//! (recents, per-filter) planned on top, which is why it's a structured
+//! store and not a single line of text.
 //!
 //! Stored as JSON at `$XDG_STATE_HOME/prism-explorer/state.json`
 //! (a last-used location is *state*, not config). The file is loaded
@@ -12,6 +13,7 @@
 //! mount, so a `record_dir` from the UI thread (or the portal-dispatch
 //! thread) must never block on disk.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{channel, Sender};
 use std::sync::{Arc, Mutex};
@@ -24,9 +26,24 @@ use serde::{Deserialize, Serialize};
 /// heuristic layer grows; never reuse a removed field's meaning.
 #[derive(Clone, Default, Serialize, Deserialize)]
 struct Persisted {
-    /// The last directory browsed in any window. Seeds open/save
-    /// dialogs that arrive without a `current_folder` hint, and the
-    /// standalone browser when launched with no path argument.
+    /// The last directory browsed in the *standalone browser*. Seeds the
+    /// browser when launched with no path argument, and is the cross-app
+    /// fallback for a dialog with no `current_folder` hint and no
+    /// per-app memory. Picker windows do not touch this (they carry an
+    /// ephemeral store), so a cancelled dialog leaves it untouched.
+    #[serde(default)]
+    last_dir: Option<PathBuf>,
+    /// Per-requesting-app memory, keyed by the portal `app_id`. Seeds a
+    /// dialog ahead of the global `last_dir` so each app reopens where
+    /// it last accepted.
+    #[serde(default)]
+    per_app: HashMap<String, AppState>,
+}
+
+/// What we remember for one requesting application.
+#[derive(Clone, Default, Serialize, Deserialize)]
+struct AppState {
+    /// The directory this app last *accepted* a file/folder from.
     #[serde(default)]
     last_dir: Option<PathBuf>,
 }
@@ -95,13 +112,47 @@ impl Store {
             return;
         }
         state.last_dir = Some(dir.to_path_buf());
+        self.persist(&state);
+    }
+
+    /// The directory `app_id` last accepted from, if remembered. Seeds a
+    /// dialog ahead of the global [`last_dir`](Store::last_dir).
+    pub fn app_last_dir(&self, app_id: &str) -> Option<PathBuf> {
+        self.state
+            .lock()
+            .unwrap()
+            .per_app
+            .get(app_id)?
+            .last_dir
+            .clone()
+    }
+
+    /// Remember that `app_id` accepted a file/folder from `dir`. A no-op
+    /// for an empty `app_id` (unsandboxed callers) or a non-absolute
+    /// `dir`, and when the value is unchanged.
+    pub fn record_app_dir(&self, app_id: &str, dir: &Path) {
+        if app_id.is_empty() || !dir.is_absolute() {
+            return;
+        }
+        let mut state = self.state.lock().unwrap();
+        {
+            let entry = state.per_app.entry(app_id.to_string()).or_default();
+            if entry.last_dir.as_deref() == Some(dir) {
+                return;
+            }
+            entry.last_dir = Some(dir.to_path_buf());
+        }
+        self.persist(&state);
+    }
+
+    /// Hand the writer a snapshot, called while still holding the state
+    /// lock so the writer observes updates in the same order memory did
+    /// (concurrent callers: the UI thread and the portal-dispatch
+    /// thread). The unbounded send never blocks; the writer coalesces
+    /// bursts and always persists the latest. A disconnected writer
+    /// (thread gone) is harmless — memory stays authoritative.
+    fn persist(&self, state: &Persisted) {
         if let Some(writer) = &self.writer {
-            // Send while still holding the lock so the writer observes
-            // updates in the same order memory did (concurrent callers:
-            // the UI thread and the portal-dispatch thread). The
-            // unbounded send never blocks; the writer coalesces bursts
-            // and always persists the latest. A disconnected writer
-            // (thread gone) is harmless — memory stays authoritative.
             let _ = writer.send(state.clone());
         }
     }
@@ -184,14 +235,48 @@ mod tests {
     }
 
     #[test]
+    fn per_app_dir_records_isolated_and_layered() {
+        let store = Store::ephemeral();
+        assert_eq!(store.app_last_dir("org.x"), None);
+        store.record_app_dir("org.x", Path::new("/ceph/x"));
+        store.record_app_dir("org.y", Path::new("/ceph/y"));
+        // Each app keeps its own; an unseen app has none.
+        assert_eq!(store.app_last_dir("org.x"), Some(PathBuf::from("/ceph/x")));
+        assert_eq!(store.app_last_dir("org.y"), Some(PathBuf::from("/ceph/y")));
+        assert_eq!(store.app_last_dir("org.z"), None);
+        // Per-app records are independent of the global last_dir.
+        assert_eq!(store.last_dir(), None);
+    }
+
+    #[test]
+    fn record_app_dir_ignores_empty_id_and_relative() {
+        let store = Store::ephemeral();
+        store.record_app_dir("", Path::new("/ceph/x"));
+        store.record_app_dir("org.x", Path::new("relative"));
+        assert_eq!(store.app_last_dir(""), None);
+        assert_eq!(store.app_last_dir("org.x"), None);
+    }
+
+    #[test]
     fn persisted_json_tolerates_unknown_and_missing_keys() {
-        // A future build's extra key loads (ignored); a missing
-        // last_dir defaults to None rather than failing the parse.
+        // A future build's extra key loads (ignored); missing keys
+        // default rather than failing the parse.
         let with_extra: Persisted =
             serde_json::from_str(r#"{"last_dir":"/a/b","future_field":42}"#).unwrap();
         assert_eq!(with_extra.last_dir, Some(PathBuf::from("/a/b")));
         let empty: Persisted = serde_json::from_str("{}").unwrap();
         assert_eq!(empty.last_dir, None);
+        assert!(empty.per_app.is_empty());
+        // per_app round-trips.
+        let with_app: Persisted =
+            serde_json::from_str(r#"{"per_app":{"org.x":{"last_dir":"/ceph/x"}}}"#).unwrap();
+        assert_eq!(
+            with_app
+                .per_app
+                .get("org.x")
+                .and_then(|a| a.last_dir.clone()),
+            Some(PathBuf::from("/ceph/x"))
+        );
     }
 
     #[test]
@@ -200,6 +285,7 @@ mod tests {
         let path = dir.join("nested").join("state.json");
         let state = Persisted {
             last_dir: Some(PathBuf::from("/ceph/work")),
+            ..Default::default()
         };
         write_atomic(&path, &state).unwrap();
         let back: Persisted = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
