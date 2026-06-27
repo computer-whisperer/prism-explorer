@@ -3393,8 +3393,8 @@ impl App for ExplorerApp {
                 text_input::apply_event(
                     &mut prompt.value,
                     &mut prompt.selection,
-                    "prompt-field",
                     &event,
+                    "prompt-field",
                 );
             }
             return;
@@ -3495,7 +3495,7 @@ impl App for ExplorerApp {
         }
         if event.target_key() == Some("browser-search") {
             let mut search = self.search.clone();
-            if text_input::apply_event(&mut search, &mut self.selection, "browser-search", &event) {
+            if text_input::apply_event(&mut search, &mut self.selection, &event, "browser-search") {
                 self.set_search(search);
             }
             return;

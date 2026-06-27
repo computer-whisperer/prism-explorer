@@ -331,8 +331,8 @@ impl App for PickerApp {
             text_input::apply_event(
                 &mut self.filename,
                 &mut self.selection,
-                "picker-name",
                 &event,
+                "picker-name",
             );
             return;
         }

@@ -18,9 +18,9 @@ authors = ["Christian Balcom"]
 [workspace.dependencies]
 anyhow = "1"
 tracing = "0.1"
-damascene-core = "0.4.3"
-damascene-wgpu = "0.4.3"
-damascene-winit-wgpu = "0.4.3"
+damascene-core = "0.4.4"
+damascene-wgpu = "0.4.4"
+damascene-winit-wgpu = "0.4.4"
 
 # Color-managed decode stack, shared with damascene-gallery and prism-bg.
 # Path dep from a sibling checkout until it's published.
