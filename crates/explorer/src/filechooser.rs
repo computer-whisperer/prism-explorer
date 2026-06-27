@@ -14,10 +14,10 @@
 //! exactly once (dropping the app unanswered counts as cancel).
 //!
 //! Deliberately unimplemented for now: `choices` (ignored),
-//! `multiple` (one URI comes back), modal-to-parent (`parent_window`
-//! is ignored — the dialog is a plain toplevel), and the
-//! `current_filter` result key (the filter active at accept time is
-//! not reported back).
+//! modal-to-parent (`parent_window` is ignored — the dialog is a plain
+//! toplevel), and the `current_filter` result key (the filter active at
+//! accept time is not reported back). `multiple` is honored — accept
+//! returns every marked file.
 
 use std::collections::HashMap;
 use std::ffi::OsString;
