@@ -83,19 +83,26 @@ impl Store {
     /// the writer thread does the disk write. A no-op when `dir` is
     /// already the recorded location.
     pub fn record_dir(&self, dir: &Path) {
-        let snapshot = {
-            let mut state = self.state.lock().unwrap();
-            if state.last_dir.as_deref() == Some(dir) {
-                return;
-            }
-            state.last_dir = Some(dir.to_path_buf());
-            state.clone()
-        };
+        // Only an absolute path is meaningful as a "last location". A
+        // relative one (e.g. an unsupported `~user` typed into the
+        // location bar) would mis-seed the next dialog or the browser's
+        // start directory, so drop it here at the single write point.
+        if !dir.is_absolute() {
+            return;
+        }
+        let mut state = self.state.lock().unwrap();
+        if state.last_dir.as_deref() == Some(dir) {
+            return;
+        }
+        state.last_dir = Some(dir.to_path_buf());
         if let Some(writer) = &self.writer {
-            // Unbounded send never blocks; the writer coalesces bursts
+            // Send while still holding the lock so the writer observes
+            // updates in the same order memory did (concurrent callers:
+            // the UI thread and the portal-dispatch thread). The
+            // unbounded send never blocks; the writer coalesces bursts
             // and always persists the latest. A disconnected writer
-            // (thread gone) is harmless — memory is still authoritative.
-            let _ = writer.send(snapshot);
+            // (thread gone) is harmless — memory stays authoritative.
+            let _ = writer.send(state.clone());
         }
     }
 }
@@ -163,6 +170,17 @@ mod tests {
         // Re-recording the same dir is a no-op but leaves it set.
         store.record_dir(Path::new("/ceph/photos"));
         assert_eq!(store.last_dir(), Some(PathBuf::from("/ceph/photos")));
+    }
+
+    #[test]
+    fn record_dir_ignores_relative_paths() {
+        let store = Store::ephemeral();
+        store.record_dir(Path::new("relative/dir"));
+        store.record_dir(Path::new("~user"));
+        assert_eq!(store.last_dir(), None);
+        // An absolute path after the relative ones still records.
+        store.record_dir(Path::new("/ceph/work"));
+        assert_eq!(store.last_dir(), Some(PathBuf::from("/ceph/work")));
     }
 
     #[test]

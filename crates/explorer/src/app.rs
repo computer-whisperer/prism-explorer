@@ -649,8 +649,11 @@ impl ExplorerApp {
         self.typeahead.clear();
         self.typeahead_at = None;
         // Navigating by any means (a place, a crumb, the parent button)
-        // closes an open location bar.
-        self.location_edit = None;
+        // closes an open location bar — and drops its now-orphaned text
+        // selection so it can't mis-seed the next focused field.
+        if self.location_edit.take().is_some() {
+            self.selection = Selection::default();
+        }
         self.preview = PreviewState::Empty;
         self.preview_inflight = None;
         self.preview_wanted = None;
@@ -3691,6 +3694,23 @@ impl App for ExplorerApp {
                     self.context_menu = None;
                 }
                 _ => {}
+            }
+        }
+        // The location bar suppresses all hotkeys while open, so it must
+        // not get stranded if focus drifts off the field. Escape always
+        // closes it, and a click anywhere outside the field dismisses it
+        // (GTK-style) before that click does its normal thing.
+        if self.location_edit.is_some() {
+            if event.kind == UiEventKind::Escape {
+                self.close_location();
+                return;
+            }
+            if matches!(event.kind, UiEventKind::Click | UiEventKind::SecondaryClick)
+                && event.target_key() != Some("browser-location")
+            {
+                self.close_location();
+                // Fall through: the click still selects the row, opens
+                // the menu, etc.
             }
         }
         // The location bar: type a path, Enter to go, Escape to dismiss.
