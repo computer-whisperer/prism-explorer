@@ -16,6 +16,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use damascene_core::image::Image;
 use damascene_core::prelude::*;
@@ -51,6 +52,9 @@ use crate::sysclip;
 const ROW_H: f32 = 34.0;
 /// Paint alpha for entries cut to the clipboard (faded until pasted).
 const CUT_DIM: f32 = 0.45;
+/// Idle gap after which a type-ahead query resets to empty, so a fresh
+/// keystroke starts a new search rather than extending a stale one.
+const TYPEAHEAD_RESET: Duration = Duration::from_millis(1000);
 const SIDEBAR_MIN: f32 = 160.0;
 const SIDEBAR_MAX: f32 = 420.0;
 const PREVIEW_MIN: f32 = 260.0;
@@ -325,6 +329,14 @@ pub struct ExplorerApp {
     /// Select this name once it appears in the stream — set when
     /// navigating to a parent so the directory we came from is focused.
     pending_select: Option<OsString>,
+    /// Type-ahead find: the accumulated query and the time of the last
+    /// keystroke. Bare printable keys (no Ctrl/Alt) jump the cursor to
+    /// the first entry whose name starts with the query; the buffer
+    /// resets after `TYPEAHEAD_RESET` of inactivity. Distinct from
+    /// `search`, which filters the listing — type-ahead leaves the list
+    /// intact and only moves the selection.
+    typeahead: String,
+    typeahead_at: Option<Instant>,
 
     preview: PreviewState,
     preview_mode: PreviewMode,
@@ -502,6 +514,8 @@ impl ExplorerApp {
             marked: HashSet::new(),
             anchor: None,
             pending_select: None,
+            typeahead: String::new(),
+            typeahead_at: None,
             preview: PreviewState::Empty,
             preview_mode: PreviewMode::Normal,
             preview_inflight: None,
@@ -617,6 +631,8 @@ impl ExplorerApp {
         self.prompt = None;
         self.confirm_delete = None;
         self.pending_select = select;
+        self.typeahead.clear();
+        self.typeahead_at = None;
         self.preview = PreviewState::Empty;
         self.preview_inflight = None;
         self.preview_wanted = None;
@@ -739,6 +755,57 @@ impl ExplorerApp {
             self.select_only(id);
             self.keep_selection_visible();
         }
+    }
+
+    /// Feed one typed character to type-ahead find and jump the cursor
+    /// to the match. Characters typed within `TYPEAHEAD_RESET` of each
+    /// other extend the prefix; a longer gap starts fresh. Repeating the
+    /// single letter you've been typing (e.g. "r", "r", "r") doesn't
+    /// extend the prefix — it cycles to the *next* entry under that
+    /// letter — so one key walks through same-initial names.
+    fn typeahead_feed(&mut self, c: char) {
+        let c = c.to_ascii_lowercase();
+        let now = Instant::now();
+        let stale = self
+            .typeahead_at
+            .is_none_or(|t| now.duration_since(t) >= TYPEAHEAD_RESET);
+        if stale {
+            self.typeahead.clear();
+        }
+        self.typeahead_at = Some(now);
+
+        let cycle = !self.typeahead.is_empty() && self.typeahead.chars().all(|x| x == c);
+        if !cycle {
+            self.typeahead.push(c);
+        }
+        // Cycling resumes just past the cursor; a fresh prefix scans
+        // from the top so it always lands on the first match.
+        let from = cycle.then(|| self.selected.map(|(_, pos)| pos)).flatten();
+        if let Some(pos) = self.typeahead_match(&self.typeahead, from) {
+            self.select_pos(pos);
+        }
+    }
+
+    /// First position in `order` whose entry name starts with the
+    /// (already-lowercased) `query`. With `after = Some(pos)` the scan
+    /// wraps from just past `pos`, so repeating a letter cycles through
+    /// the matches; with `None` it scans from the top.
+    fn typeahead_match(&self, query: &str, after: Option<usize>) -> Option<usize> {
+        let order = &self.listing.order;
+        if order.is_empty() {
+            return None;
+        }
+        let entries = self.listing.entries.lock().unwrap();
+        let starts_with = |pos: usize| {
+            order
+                .get(pos)
+                .and_then(|&id| entries.get(id as usize))
+                .is_some_and(|e| e.display.to_lowercase().starts_with(query))
+        };
+        let start = after.map_or(0, |pos| pos + 1);
+        (0..order.len())
+            .map(|i| (start + i) % order.len())
+            .find(|&pos| starts_with(pos))
     }
 
     /// Plain selection: cursor to `id`, clear marks, reset the anchor.
@@ -3332,19 +3399,17 @@ impl App for ExplorerApp {
             (KeyChord::named(UiKey::End), "last".into()),
             (KeyChord::named(UiKey::Enter), "open".into()),
             (KeyChord::named(UiKey::Backspace), "parent".into()),
-            (KeyChord::vim('k'), "prev".into()),
-            (KeyChord::vim('j'), "next".into()),
-            (KeyChord::vim('h'), "left".into()),
-            (KeyChord::vim('l'), "right".into()),
-            (KeyChord::vim('g'), "view".into()),
-            (KeyChord::vim('r'), "refresh".into()),
+            // Bare letters are reserved for type-ahead find (see
+            // `typeahead_feed`); navigation is the arrow keys, and the
+            // former vim-letter commands move to modifier/function-key
+            // chords so they don't swallow typed characters.
             (KeyChord::ctrl('f'), "search".into()),
             (KeyChord::ctrl('c'), "copy-files".into()),
             (KeyChord::ctrl('x'), "cut-files".into()),
             (KeyChord::ctrl('v'), "paste-files".into()),
+            (KeyChord::ctrl('h'), "hidden".into()),
             (KeyChord::named(UiKey::Other("F5".into())), "refresh".into()),
             (KeyChord::named(UiKey::Other("F2".into())), "rename".into()),
-            (KeyChord::vim('.'), "hidden".into()),
             (KeyChord::named(UiKey::Space), "mark".into()),
             (KeyChord::ctrl_shift('n'), "new-folder".into()),
             // Shift+Delete (permanent) must be registered before bare
@@ -3633,6 +3698,28 @@ impl App for ExplorerApp {
             }
         }
 
+        // Type-ahead find: a bare printable key (no Ctrl/Alt/Logo)
+        // reaching us unfocused — registered hotkeys and focused text
+        // fields have already consumed and returned above — jumps the
+        // cursor to the first matching entry. Auto-repeats are ignored
+        // so a held key doesn't run the query away.
+        if event.kind == UiEventKind::KeyDown {
+            if let Some(kp) = &event.key_press {
+                if let UiKey::Character(s) = &kp.key {
+                    let m = kp.modifiers;
+                    let mut chars = s.chars();
+                    if let (false, false, false, false, Some(c), None) =
+                        (m.ctrl, m.alt, m.logo, kp.repeat, chars.next(), chars.next())
+                    {
+                        if !c.is_control() && !c.is_whitespace() {
+                            self.typeahead_feed(c);
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+
         // Vertical motion is one entry in the list, one grid row in the
         // grid; horizontal motion only exists in the grid (in the list,
         // left/right walk the hierarchy, file-manager style).
@@ -3663,8 +3750,6 @@ impl App for ExplorerApp {
                 }
                 ViewMode::Grid => self.move_selection(1),
             }
-        } else if event.is_hotkey("view") {
-            self.toggle_view();
         } else if event.is_hotkey("refresh") {
             self.refresh();
         } else if event.is_hotkey("search") {
@@ -4525,6 +4610,82 @@ mod tests {
         app.toggle_mark(id_of(&app, "notes.txt"));
         app.navigate(PathBuf::from("/elsewhere"), None);
         assert!(app.marked.is_empty() && app.anchor.is_none());
+    }
+
+    /// `browse()` plus three `re*` entries, for type-ahead. Final order
+    /// (dirs first, then files, each case-insensitive by name):
+    /// docs(0), recipes(1), notes.txt(2), photo.jxr(3), readme.md(4),
+    /// report.txt(5).
+    fn typeahead_app() -> ExplorerApp {
+        let mut app = browse();
+        app.listing.absorb(
+            ListingUpdate {
+                batch: vec![
+                    RawEntry {
+                        name: "recipes".into(),
+                        kind: EntryKind::Dir,
+                    },
+                    RawEntry {
+                        name: "readme.md".into(),
+                        kind: EntryKind::File,
+                    },
+                    RawEntry {
+                        name: "report.txt".into(),
+                        kind: EntryKind::File,
+                    },
+                ],
+                done: true,
+                error: None,
+            },
+            false,
+            None,
+            None,
+            app.sort,
+        );
+        app
+    }
+
+    #[test]
+    fn typeahead_match_finds_prefix_from_top() {
+        let app = typeahead_app();
+        assert_eq!(app.typeahead_match("do", None), Some(0)); // docs
+        assert_eq!(app.typeahead_match("no", None), Some(2)); // notes.txt
+        assert_eq!(app.typeahead_match("re", None), Some(1)); // recipes (first "re")
+        assert_eq!(app.typeahead_match("rea", None), Some(4)); // readme.md
+        assert_eq!(app.typeahead_match("zzz", None), None); // no match
+    }
+
+    #[test]
+    fn typeahead_match_cycles_past_the_cursor() {
+        let app = typeahead_app();
+        // "r" matches recipes(1), readme.md(4), report.txt(5); cycling
+        // resumes just past the given position and wraps.
+        assert_eq!(app.typeahead_match("r", Some(1)), Some(4));
+        assert_eq!(app.typeahead_match("r", Some(4)), Some(5));
+        assert_eq!(app.typeahead_match("r", Some(5)), Some(1));
+    }
+
+    #[test]
+    fn typeahead_feed_extends_prefix_and_cycles() {
+        let mut app = typeahead_app();
+
+        // Fresh letter lands on the first match.
+        app.typeahead_feed('r');
+        assert_eq!(app.selected_id(), Some(id_of(&app, "recipes")));
+
+        // Same letter again cycles to the next same-initial entry
+        // (without extending the buffer to "rr").
+        app.typeahead_feed('r');
+        assert_eq!(app.selected_id(), Some(id_of(&app, "readme.md")));
+
+        // A different letter extends the prefix: "r" + "e" = "re",
+        // matched from the top — back to recipes.
+        app.typeahead_feed('e');
+        assert_eq!(app.selected_id(), Some(id_of(&app, "recipes")));
+
+        // "rea" narrows to readme.md.
+        app.typeahead_feed('a');
+        assert_eq!(app.selected_id(), Some(id_of(&app, "readme.md")));
     }
 
     /// Selection follows ids across a mid-stream resort: select an
