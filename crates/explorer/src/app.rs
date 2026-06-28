@@ -4241,6 +4241,14 @@ impl crate::host::HostApp for ExplorerApp {
             self.refresh_system_clipboard();
         }
     }
+
+    fn navigate_to(&mut self, dir: PathBuf, select: Option<OsString>) -> bool {
+        // A browser window always accepts "show in folder" / external
+        // navigation; this runs on the loop thread, so it drives the
+        // same navigate path the keyboard and D-Bus messages use.
+        self.navigate(dir, select);
+        true
+    }
 }
 
 fn binary_surface_size(preview_w: f32, viewport_h: f32) -> (f32, f32) {

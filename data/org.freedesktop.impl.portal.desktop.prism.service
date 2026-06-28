@@ -1,0 +1,12 @@
+# D-Bus activation for prism's portal FileChooser backend. Lets
+# xdg-desktop-portal start prism on demand to serve an open/save dialog
+# when no prism is already running. The name is prism-specific, so this
+# installs system-wide (/usr/share/dbus-1/services/) with no risk of
+# colliding with another desktop's portal backend.
+#
+# `--service` starts prism headless (no browser window) and resident; it
+# claims this name, FileManager1, and the single-instance name, then
+# serves requests and opens windows on demand.
+[D-BUS Service]
+Name=org.freedesktop.impl.portal.desktop.prism
+Exec=/usr/bin/prism-explorer --service

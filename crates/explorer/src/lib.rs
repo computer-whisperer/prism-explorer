@@ -5,8 +5,10 @@
 pub mod app;
 pub mod apps;
 mod binary_surface;
+pub mod browser;
 pub mod filechooser;
 pub mod filemanager1;
+pub mod instance;
 pub mod fixtures;
 mod fmt;
 pub mod host;

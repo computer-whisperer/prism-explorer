@@ -4,31 +4,29 @@
 //!
 //! Served from the running explorer on a detached thread (zbus's
 //! blocking API; the bus connection lives as long as the thread).
-//! Method calls translate to [`Msg::OpenLocation`] posted to the UI
-//! thread — the same navigate-and-select path the keyboard uses, so a
-//! `ShowItems` on a file ends with that file selected and previewed.
+//! Method calls post [`HostCommand::ShowLocation`] to the loop, which
+//! navigates the focused browser window (or opens a fresh one) and
+//! selects the item — the same navigate-and-select path the keyboard
+//! uses, so a `ShowItems` on a file ends with that file selected.
 //!
 //! Only one process can own the name; if another file manager holds
 //! it, we log and carry on as a plain browser.
 
 use std::ffi::OsString;
 use std::path::PathBuf;
-use std::sync::mpsc::Sender;
 
-use explorer_io::Notifier;
+use winit::event_loop::EventLoopProxy;
 
-use crate::model::Msg;
+use crate::host::HostCommand;
 
 struct FileManager1 {
-    tx: Sender<Msg>,
-    notify: Notifier,
+    proxy: EventLoopProxy<HostCommand>,
 }
 
 impl FileManager1 {
     fn open(&self, dir: PathBuf, select: Option<OsString>) {
         tracing::info!(dir = %dir.display(), select = ?select, "FileManager1 request");
-        let _ = self.tx.send(Msg::OpenLocation { dir, select });
-        (self.notify)();
+        let _ = self.proxy.send_event(HostCommand::ShowLocation { dir, select });
     }
 
     /// First parseable URI wins — the UI has one window, and one
@@ -77,10 +75,10 @@ impl FileManager1 {
 
 /// Own the name and serve until process exit. Failure (no session bus,
 /// name taken by another file manager) downgrades to a log line.
-pub fn spawn(tx: Sender<Msg>, notify: Notifier) {
+pub fn spawn(proxy: EventLoopProxy<HostCommand>) {
     let spawned = std::thread::Builder::new()
         .name("filemanager1".into())
-        .spawn(move || match serve(tx, notify) {
+        .spawn(move || match serve(proxy) {
             Ok(_conn) => {
                 tracing::info!("serving org.freedesktop.FileManager1");
                 // The connection's executor handles calls; this thread
@@ -98,10 +96,10 @@ pub fn spawn(tx: Sender<Msg>, notify: Notifier) {
     }
 }
 
-fn serve(tx: Sender<Msg>, notify: Notifier) -> zbus::Result<zbus::blocking::Connection> {
+fn serve(proxy: EventLoopProxy<HostCommand>) -> zbus::Result<zbus::blocking::Connection> {
     zbus::blocking::connection::Builder::session()?
         .name("org.freedesktop.FileManager1")?
-        .serve_at("/org/freedesktop/FileManager1", FileManager1 { tx, notify })?
+        .serve_at("/org/freedesktop/FileManager1", FileManager1 { proxy })?
         .build()
 }
 

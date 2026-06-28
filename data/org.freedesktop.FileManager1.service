@@ -1,8 +1,16 @@
 # D-Bus activation: lets "show in file manager" calls launch
 # prism-explorer when it isn't already running.
 #
-# Install to ~/.local/share/dbus-1/services/ (or the system dir) and
-# adjust Exec to the installed binary path.
+# org.freedesktop.FileManager1 is a SHARED name — only one file manager
+# per session owns it — so the package does NOT install this system-wide
+# (that would collide with nautilus/nemo/… on the same path). Opt in
+# per-user instead, which also takes precedence over any system default:
+#
+#   cp /usr/share/doc/prism-explorer/org.freedesktop.FileManager1.service \
+#      ~/.local/share/dbus-1/services/
+#
+# The packaged binary lives at /usr/bin/prism-explorer; adjust Exec if
+# you installed it elsewhere.
 [D-BUS Service]
 Name=org.freedesktop.FileManager1
-Exec=/usr/local/bin/prism-explorer
+Exec=/usr/bin/prism-explorer

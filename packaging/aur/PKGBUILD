@@ -59,15 +59,24 @@ package() {
     install -Dm0644 "data/prism.portal" \
         "$pkgdir/usr/share/xdg-desktop-portal/portals/prism.portal"
 
+    # D-Bus activation for the portal backend. The name is prism-specific
+    # (no collision), so this installs system-wide: xdg-desktop-portal can
+    # then start prism on demand (`--service`, headless) to serve a dialog
+    # even when no prism window is open.
+    install -Dm0644 "data/org.freedesktop.impl.portal.desktop.prism.service" \
+        "$pkgdir/usr/share/dbus-1/services/org.freedesktop.impl.portal.desktop.prism.service"
+
     install -Dm0644 "LICENSE-MIT" \
         "$pkgdir/usr/share/licenses/$pkgname/LICENSE-MIT"
     install -Dm0644 "LICENSE-APACHE" \
         "$pkgdir/usr/share/licenses/$pkgname/LICENSE-APACHE"
 
-    # NOTE: data/org.freedesktop.FileManager1.service is deliberately NOT
-    # installed system-wide — that path collides with any other file manager
-    # (nautilus, nemo, …) shipping the same activation file, which pacman
-    # rejects. Users who want prism to own org.freedesktop.FileManager1 install
-    # it per-user to ~/.local/share/dbus-1/services/ (see the README / file
-    # header). A running prism still claims the name dynamically regardless.
+    # org.freedesktop.FileManager1 is a SHARED name (one file manager per
+    # session), so its activation file is NOT installed system-wide — that
+    # path collides with nautilus/nemo/… and pacman would reject it. Ship
+    # it as a documented example; users opt in by copying it to
+    # ~/.local/share/dbus-1/services/ (per-user wins over any system
+    # default). A running prism still claims the name dynamically regardless.
+    install -Dm0644 "data/org.freedesktop.FileManager1.service" \
+        "$pkgdir/usr/share/doc/$pkgname/org.freedesktop.FileManager1.service"
 }

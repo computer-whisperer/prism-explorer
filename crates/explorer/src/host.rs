@@ -30,6 +30,8 @@
 //! path (damascene #105's `WindowGfx::with_surface_and_renderer`).
 
 use std::collections::HashMap;
+use std::ffi::OsString;
+use std::path::PathBuf;
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -55,7 +57,10 @@ use winit::window::{Window, WindowId};
 /// `EventLoopProxy`. The IO pool's notifier and the D-Bus services
 /// send [`Wake`](HostCommand::Wake); the portal FileChooser service
 /// opens its picker dialogs with [`OpenWindow`](HostCommand::OpenWindow)
-/// and tears them down with [`CloseWindow`](HostCommand::CloseWindow).
+/// and tears them down with [`CloseWindow`](HostCommand::CloseWindow);
+/// the single-instance and FileManager1 services open browser windows
+/// with [`OpenBrowser`](HostCommand::OpenBrowser) /
+/// [`ShowLocation`](HostCommand::ShowLocation).
 pub enum HostCommand {
     /// Data outside the UI trees changed (listing batch, decoded
     /// preview, D-Bus navigation message): rebuild every window.
@@ -68,7 +73,30 @@ pub enum HostCommand {
     /// or unknown token is a no-op — the user may have closed the
     /// window first.
     CloseWindow { token: u64 },
+    /// Open a *new* browser window at `dir` (optionally selecting
+    /// `select`). Used when a second `prism-explorer` launch hands off
+    /// to this resident process. The host mints the window from its
+    /// browser factory, so the sender needs no app-construction deps.
+    OpenBrowser {
+        dir: PathBuf,
+        select: Option<OsString>,
+    },
+    /// "Show this in the file manager": navigate the focused browser
+    /// window to `dir` (selecting `select`), or — if no browser window
+    /// is open — mint a new one. Posted by the FileManager1 service.
+    ShowLocation {
+        dir: PathBuf,
+        select: Option<OsString>,
+    },
 }
+
+/// Mints a fresh browser window at a directory. The host holds one of
+/// these so D-Bus service threads can ask for browser windows without
+/// owning the explorer's construction dependencies (pool, registry,
+/// caches, stores). Each call spawns that window's own IO pool, the
+/// same way the portal's pickers do.
+pub type BrowserFactory =
+    Arc<dyn Fn(PathBuf, Option<OsString>) -> WindowSpec + Send + Sync>;
 
 /// A window to open: title, logical size, and the [`App`] that owns it.
 ///
@@ -108,13 +136,29 @@ pub trait HostApp: App {
     /// focus-gained edge to re-read the system clipboard, so a file
     /// selection copied in another app becomes pasteable here.
     fn window_focused(&mut self, _focused: bool) {}
+
+    /// Navigate this window to `dir`, selecting `select` once it streams
+    /// in. Returns whether the app accepted it: browser windows do
+    /// (so [`HostCommand::ShowLocation`] reuses the focused one); picker
+    /// windows leave the default and decline, so a "show in folder" call
+    /// never hijacks an open dialog.
+    fn navigate_to(&mut self, _dir: PathBuf, _select: Option<OsString>) -> bool {
+        false
+    }
 }
 
-/// Run the host loop with one initial window. Returns when the last
-/// window closes (`resident: false`) or only on a fatal error
-/// (`resident: true` — a process serving D-Bus requests stays warm
-/// with zero windows, ready to spin one up for the next request).
-/// `Err` means GPU bring-up for the first window failed.
+/// Run the host loop. Returns when the last window closes
+/// (`resident: false`) or only on a fatal error (`resident: true` — a
+/// process serving D-Bus requests stays warm with zero windows, ready
+/// to spin one up for the next request). `Err` means GPU bring-up for
+/// the first window failed.
+///
+/// `initial` is the window opened at startup, or `None` for a service
+/// launch (`--service`) that starts headless and waits for a portal or
+/// FileManager1 request; such a launch must be `resident`. `browser`
+/// mints browser windows on demand for [`HostCommand::OpenBrowser`] /
+/// [`ShowLocation`](HostCommand::ShowLocation) (and is `None` only for
+/// hosts that never serve those — currently always supplied).
 ///
 /// `config` supplies the color-preference ladder, MSAA sample count,
 /// present-mode choice, and Wayland `app_id`; its run-loop knobs
@@ -124,8 +168,9 @@ pub trait HostApp: App {
 pub fn run(
     event_loop: EventLoop<HostCommand>,
     config: HostConfig,
-    initial: WindowSpec,
+    initial: Option<WindowSpec>,
     resident: bool,
+    browser: Option<BrowserFactory>,
 ) -> Result<(), String> {
     event_loop.set_control_flow(ControlFlow::Wait);
     let mut host = Host {
@@ -134,8 +179,10 @@ pub fn run(
         runner_pool: None,
         windows: HashMap::new(),
         tokens: HashMap::new(),
-        initial: Some(initial),
+        initial,
         resident,
+        browser,
+        focused: None,
         clipboard: arboard::Clipboard::new().ok(),
         last_primary: String::new(),
         setup_error: None,
@@ -251,11 +298,19 @@ struct Host {
     /// [`HostCommand::CloseWindow`] can find them. Entries for windows
     /// the user already closed are pruned on that close.
     tokens: HashMap<u64, WindowId>,
-    /// The first window's spec, consumed by `resumed()`.
+    /// The first window's spec, consumed by `resumed()`. `None` for a
+    /// `--service` launch that starts headless.
     initial: Option<WindowSpec>,
     /// Stay alive with zero windows (the process is a D-Bus service);
     /// otherwise the last window closing exits the loop.
     resident: bool,
+    /// Mints browser windows for [`HostCommand::OpenBrowser`] /
+    /// [`ShowLocation`](HostCommand::ShowLocation).
+    browser: Option<BrowserFactory>,
+    /// The window that last gained keyboard focus, so `ShowLocation`
+    /// can route "show in folder" to the front browser. Pruned to
+    /// `None` when that window closes.
+    focused: Option<WindowId>,
     /// Best-effort native clipboard, shared across windows.
     /// Initialization can fail headless; copy shortcuts no-op then.
     clipboard: Option<arboard::Clipboard>,
@@ -428,8 +483,29 @@ impl Host {
     fn close_window(&mut self, event_loop: &ActiveEventLoop, id: WindowId) {
         self.windows.remove(&id);
         self.tokens.retain(|_, mapped| *mapped != id);
+        if self.focused == Some(id) {
+            self.focused = None;
+        }
         if self.windows.is_empty() && !self.resident {
             event_loop.exit();
+        }
+    }
+
+    /// Mint a new browser window at `dir` via the factory, if one is
+    /// configured. Without a factory (a host that never serves browser
+    /// requests) the command is a logged no-op rather than a panic.
+    fn open_browser(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        dir: PathBuf,
+        select: Option<OsString>,
+    ) {
+        match &self.browser {
+            Some(factory) => {
+                let spec = factory(dir, select);
+                self.create_window(event_loop, spec);
+            }
+            None => tracing::warn!("OpenBrowser/ShowLocation with no browser factory; ignoring"),
         }
     }
 }
@@ -510,6 +586,26 @@ impl ApplicationHandler<HostCommand> for Host {
             HostCommand::CloseWindow { token } => {
                 if let Some(id) = self.tokens.remove(&token) {
                     self.close_window(event_loop, id);
+                }
+            }
+            HostCommand::OpenBrowser { dir, select } => {
+                self.open_browser(event_loop, dir, select);
+            }
+            HostCommand::ShowLocation { dir, select } => {
+                // Reuse the focused browser window if it accepts the
+                // navigation; otherwise open a fresh one.
+                let routed = self
+                    .focused
+                    .and_then(|id| self.windows.get_mut(&id))
+                    .is_some_and(|win| {
+                        let accepted = win.app.navigate_to(dir.clone(), select.clone());
+                        if accepted {
+                            win.gfx.window.request_redraw();
+                        }
+                        accepted
+                    });
+                if !routed {
+                    self.open_browser(event_loop, dir, select);
                 }
             }
         }
@@ -717,6 +813,13 @@ impl ApplicationHandler<HostCommand> for Host {
                 // the worker's notifier pokes the redraw once it lands, so
                 // no frame is forced here.
                 win.app.window_focused(focused);
+                // Track the front window so ShowLocation ("show in
+                // folder") can route to it. Only the focus-gain edge
+                // updates it; a focus-loss leaves the last-focused window
+                // as the routing target.
+                if focused {
+                    self.focused = Some(id);
+                }
             }
 
             WindowEvent::KeyboardInput {
