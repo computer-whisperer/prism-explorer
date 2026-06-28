@@ -23,19 +23,14 @@ damascene-wgpu = "0.4.4"
 damascene-winit-wgpu = "0.4.4"
 
 # Color-managed decode stack, shared with damascene-gallery and prism-bg.
-# Path dep from a sibling checkout until it's published.
-achromat = { path = "../achromat", features = ["damascene"] }
+# Git dep, pinned, until achromat is published to crates.io. Its vendored
+# jpegxr is a path dep *inside* the achromat repo, so it resolves within the
+# git checkout — no [patch.crates-io] needed here.
+achromat = { git = "https://github.com/computer-whisperer/achromat.git", rev = "f781fab9104cdc9c2a9c60267300abdcf522484c", features = ["damascene"] }
 
 explorer-io = { path = "crates/explorer-io" }
 explorer-previews = { path = "crates/explorer-previews" }
 explorer-thumbs = { path = "crates/explorer-thumbs" }
-
-# achromat's vendored jpegxr 0.3.1 (bindgen bumped to 0.72; upstream's
-# pin on 0.69 generates opaque structs with current libclang). Patches
-# apply only at the consuming workspace root, so it's repeated here,
-# pointed at achromat's vendor copy. Drop when upstream updates.
-[patch.crates-io]
-jpegxr = { path = "../achromat/vendor/jpegxr" }
 
 # MSDF/text crates are ~500x slower unoptimized (per damascene's own
 # profile guidance); image decode is also hot in dev runs.

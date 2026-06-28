@@ -21,6 +21,7 @@ checksum = "366ffbaa4442f4684d91e2cd7c5ea7c4ed8add41959a31447066e279e432b618"
 [[package]]
 name = "achromat"
 version = "0.1.0"
+source = "git+https://github.com/computer-whisperer/achromat.git?rev=f781fab9104cdc9c2a9c60267300abdcf522484c#f781fab9104cdc9c2a9c60267300abdcf522484c"
 dependencies = [
  "anyhow",
  "damascene-core",
@@ -1800,6 +1801,7 @@ dependencies = [
 [[package]]
 name = "jpegxr"
 version = "0.3.1"
+source = "git+https://github.com/computer-whisperer/achromat.git?rev=f781fab9104cdc9c2a9c60267300abdcf522484c#f781fab9104cdc9c2a9c60267300abdcf522484c"
 dependencies = [
  "bindgen",
  "cc",
