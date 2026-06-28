@@ -153,6 +153,27 @@ A `multiple` open dialog returns the whole multi-selection (Ctrl /
 Shift / Space; see Controls). Not yet honored: `choices` (ignored) and
 modality to the caller's window.
 
+## xdg-open & the directory default
+
+`org.freedesktop.FileManager1` covers callers that *ask* for a file
+manager over D-Bus, but many "open folder" / "reveal" affordances just
+shell out to `xdg-open <dir>`, which resolves the **`inode/directory`**
+default application — mime/desktop-entry machinery, not D-Bus. Install
+`data/prism-explorer.desktop` to `~/.local/share/applications/` and make
+prism that default:
+
+```
+update-desktop-database ~/.local/share/applications
+xdg-mime default prism-explorer.desktop inode/directory
+```
+
+Then `xdg-open <dir>` (and anything built on it) opens a prism window at
+that directory. The entry claims **only** `inode/directory` — prism is a
+browser, not a general-purpose file opener, so it deliberately does not
+register for arbitrary file types. Each `xdg-open` launches a fresh
+window; it does not yet route the path into an already-resident portal
+process.
+
 ## Roadmap
 
 - Portal polish: a D-Bus-activatable zero-window service mode

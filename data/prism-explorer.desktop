@@ -1,0 +1,33 @@
+# Desktop entry: makes prism-explorer resolvable by `xdg-open`, by
+# "open folder" / Reveal buttons that shell out to it, and by the
+# freedesktop `inode/directory` default-application machinery. Without
+# it, opening a directory falls through to whatever else claims
+# inode/directory (often a stray X11 file manager).
+#
+# This is the mime/desktop path, distinct from org.freedesktop.FileManager1
+# (data/org.freedesktop.FileManager1.service): `xdg-open <dir>` resolves
+# the inode/directory default app, never D-Bus.
+#
+# Install to ~/.local/share/applications/ (or /usr/share/applications/),
+# refresh the cache, and make prism the directory default:
+#
+#   update-desktop-database ~/.local/share/applications
+#   xdg-mime default prism-explorer.desktop inode/directory
+#
+# Verify:  xdg-mime query default inode/directory  -> prism-explorer.desktop
+#
+# Exec uses %f (a single local path): xdg-open/gio convert a file:// dir
+# URI to a path before launch, and the binary reads argv[1] as its start
+# directory. Adjust Exec to an absolute path if prism-explorer is not on
+# the launcher's PATH.
+[Desktop Entry]
+Type=Application
+Name=Prism Explorer
+GenericName=File Manager
+Comment=Color-managed file explorer with HDR-aware previews
+Exec=prism-explorer %f
+Icon=prism-explorer
+Terminal=false
+Categories=System;FileTools;FileManager;
+MimeType=inode/directory;
+StartupWMClass=prism-explorer
