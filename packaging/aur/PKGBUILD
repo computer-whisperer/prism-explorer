@@ -1,0 +1,89 @@
+# !!! WORK IN PROGRESS — DOES NOT BUILD AS-IS. !!!
+# Written when achromat was a `../achromat` path dep. achromat is now a pinned
+# git dependency (see the workspace Cargo.toml), so the two-source sibling
+# layout below no longer matches how cargo resolves it, and a clean-chroot
+# build can't fetch a git dep offline. Pending a decision on how to package
+# achromat (vendor / source-array + offline / publish to crates.io). Do not
+# submit to the AUR until reworked.
+
+# Maintainer: Christian Balcom <robot.inventor@gmail.com>
+pkgname=prism-explorer
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="Color-managed file explorer — damascene UI, HDR-aware previews, built for big slow filesystems"
+arch=('x86_64')
+url="https://github.com/computer-whisperer/prism-explorer"
+license=('MIT' 'Apache-2.0')
+# Runtime libraries the binary links (verify against `ldd` / `namcap`):
+#   libvulkan  -> vulkan-icd-loader (wgpu renderer),
+#   libxkbcommon, libwayland-client -> libxkbcommon + wayland (winit + arboard).
+# Pure-Rust otherwise: syntect, achromat, jpegxr (vendored C, built static).
+depends=('vulkan-icd-loader' 'libxkbcommon' 'wayland')
+# A Vulkan ICD (vulkan-radeon / nvidia-utils / vulkan-intel) is required at
+# runtime but depends on the GPU, so it is intentionally not pinned here.
+# `clang` provides libclang for jpegxr's bindgen step; base-devel supplies cc.
+makedepends=('rust' 'cargo' 'git' 'clang')
+options=('!lto')
+
+# prism-explorer's workspace depends on the (still unpublished) sibling crate
+# `achromat` via a relative path — `achromat = { path = "../achromat" }` plus a
+# `[patch.crates-io]` for its vendored jpegxr. So we fetch BOTH repos and lay
+# them out as siblings in $srcdir; `../achromat` then resolves exactly as it
+# does in a local checkout. Replace `git+...#commit=` with `#tag=v$pkgver` once
+# both repos carry release tags. Both commits must be pushed and the repos
+# reachable (public, or via your configured git credentials) for makepkg.
+_commit=429c2beab5e6f6b722b84338dcf24f0cda950595
+_achromat_commit=f781fab9104cdc9c2a9c60267300abdcf522484c
+source=(
+    "prism-explorer::git+$url.git#commit=$_commit"
+    "achromat::git+https://github.com/computer-whisperer/achromat.git#commit=$_achromat_commit"
+)
+sha256sums=('SKIP'
+            'SKIP')
+
+prepare() {
+    cd "$srcdir/prism-explorer"
+    # Fetch registry deps up front so build() can run --frozen (offline).
+    # The path deps (achromat, vendored jpegxr) resolve from the sibling
+    # checkout, not the network.
+    export RUSTUP_TOOLCHAIN=stable
+    cargo fetch --locked --target "$(rustc -vV | sed -n 's/host: //p')"
+}
+
+build() {
+    cd "$srcdir/prism-explorer"
+    export RUSTUP_TOOLCHAIN=stable
+    export CARGO_TARGET_DIR=target
+    # Only the GUI binary — the crate also ships a `dump_bundles` lint tool.
+    cargo build --release --frozen -p prism-explorer --bin prism-explorer
+}
+
+package() {
+    cd "$srcdir/prism-explorer"
+
+    install -Dm0755 "target/release/prism-explorer" \
+        "$pkgdir/usr/bin/prism-explorer"
+
+    # Desktop entry: makes `xdg-open <dir>` and the inode/directory default
+    # resolve to prism. Arch's desktop-file-utils / mime hooks refresh the
+    # caches on install; the user still picks the default with `xdg-mime`.
+    install -Dm0644 "data/prism-explorer.desktop" \
+        "$pkgdir/usr/share/applications/prism-explorer.desktop"
+
+    # xdg-desktop-portal FileChooser backend declaration. Only takes effect
+    # once preferred in ~/.config/xdg-desktop-portal/portals.conf (per-user).
+    install -Dm0644 "data/prism.portal" \
+        "$pkgdir/usr/share/xdg-desktop-portal/portals/prism.portal"
+
+    install -Dm0644 "LICENSE-MIT" \
+        "$pkgdir/usr/share/licenses/$pkgname/LICENSE-MIT"
+    install -Dm0644 "LICENSE-APACHE" \
+        "$pkgdir/usr/share/licenses/$pkgname/LICENSE-APACHE"
+
+    # NOTE: data/org.freedesktop.FileManager1.service is deliberately NOT
+    # installed system-wide — that path collides with any other file manager
+    # (nautilus, nemo, …) shipping the same activation file, which pacman
+    # rejects. Users who want prism to own org.freedesktop.FileManager1 install
+    # it per-user to ~/.local/share/dbus-1/services/ (see the README / file
+    # header). A running prism still claims the name dynamically regardless.
+}
