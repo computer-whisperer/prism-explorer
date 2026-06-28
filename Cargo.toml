@@ -18,15 +18,15 @@ authors = ["Christian Balcom"]
 [workspace.dependencies]
 anyhow = "1"
 tracing = "0.1"
-damascene-core = "0.4.4"
-damascene-wgpu = "0.4.4"
-damascene-winit-wgpu = "0.4.4"
+damascene-core = "0.4.5"
+damascene-wgpu = "0.4.5"
+damascene-winit-wgpu = "0.4.5"
 
 # Color-managed decode stack, shared with damascene-gallery and prism-bg.
 # Git dep, pinned, until achromat is published to crates.io. Its vendored
 # jpegxr is a path dep *inside* the achromat repo, so it resolves within the
 # git checkout — no [patch.crates-io] needed here.
-achromat = { git = "https://github.com/computer-whisperer/achromat.git", rev = "f781fab9104cdc9c2a9c60267300abdcf522484c", features = ["damascene"] }
+achromat = { git = "https://github.com/computer-whisperer/achromat.git", tag = "v0.1.0", features = ["damascene"] }
 
 explorer-io = { path = "crates/explorer-io" }
 explorer-previews = { path = "crates/explorer-previews" }

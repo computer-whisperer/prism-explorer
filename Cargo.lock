@@ -21,7 +21,7 @@ checksum = "366ffbaa4442f4684d91e2cd7c5ea7c4ed8add41959a31447066e279e432b618"
 [[package]]
 name = "achromat"
 version = "0.1.0"
-source = "git+https://github.com/computer-whisperer/achromat.git?rev=f781fab9104cdc9c2a9c60267300abdcf522484c#f781fab9104cdc9c2a9c60267300abdcf522484c"
+source = "git+https://github.com/computer-whisperer/achromat.git?tag=v0.1.0#7576d08fc5a1dd47c5d9b73f3f516426905b6c25"
 dependencies = [
  "anyhow",
  "damascene-core",
@@ -781,9 +781,9 @@ checksum = "f27ae1dd37df86211c42e150270f82743308803d90a6f6e6651cd730d5e1732f"
 
 [[package]]
 name = "damascene-core"
-version = "0.4.4"
+version = "0.4.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4e96f89eaafff89b1a0dd5156dfbd26e642ad89a81492d2164cd3b0206cbc3f5"
+checksum = "9b224c7d9bb8316a09393dc472231f2e481677c4c033f6a58fc8636ae4f2a1f9"
 dependencies = [
  "bytemuck",
  "cosmic-text",
@@ -809,9 +809,9 @@ dependencies = [
 
 [[package]]
 name = "damascene-fonts"
-version = "0.4.4"
+version = "0.4.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "40cb371526da32d2cee0911742ca8b9c945dfb2942b69925bc708e475e45943c"
+checksum = "75fef582e0137131d26b9f5fbe4d90242b5f1a05788ba36f03c1fa425826ebc3"
 dependencies = [
  "damascene-fonts-emoji",
  "damascene-fonts-inter",
@@ -845,9 +845,9 @@ checksum = "e0d8aa98fba560c659beac4f4a798cb002bfe908c8c26c3a8eb3195ab9ee0776"
 
 [[package]]
 name = "damascene-wgpu"
-version = "0.4.4"
+version = "0.4.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2da079867e82ef658e1b3a1b4e2d2ce550707cdcfd996dad889d078866433aa4"
+checksum = "f8b72f7662c1aa49eb4865bc7181185f6d61a516966c7079768c15b995aa3aba"
 dependencies = [
  "bytemuck",
  "cosmic-text",
@@ -860,9 +860,9 @@ dependencies = [
 
 [[package]]
 name = "damascene-winit-wgpu"
-version = "0.4.4"
+version = "0.4.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3bd26b08a3916e16471979ccbd43d37e3b4ae112add33b314bbe63f852295a06"
+checksum = "6c7d3fc10b17d9bccb80edbc253ceb3555cecfc1e5654bd8f83cfde10984d178"
 dependencies = [
  "arboard",
  "damascene-core",
@@ -1001,7 +1001,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -1801,7 +1801,7 @@ dependencies = [
 [[package]]
 name = "jpegxr"
 version = "0.3.1"
-source = "git+https://github.com/computer-whisperer/achromat.git?rev=f781fab9104cdc9c2a9c60267300abdcf522484c#f781fab9104cdc9c2a9c60267300abdcf522484c"
+source = "git+https://github.com/computer-whisperer/achromat.git?tag=v0.1.0#7576d08fc5a1dd47c5d9b73f3f516426905b6c25"
 dependencies = [
  "bindgen",
  "cc",
@@ -2378,7 +2378,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -2811,7 +2811,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7d8fae84b431384b68627d0f9b3b1245fcf9f46f6c0e3dc902e9dce64edd1967"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -3304,7 +3304,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.12.1",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -3705,7 +3705,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix 1.1.4",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -3995,7 +3995,7 @@ checksum = "f2f6fb2847f6742cd76af783a2a2c49e9375d0a111c7bef6f71cd9e738c72d6e"
 dependencies = [
  "memoffset",
  "tempfile",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -4490,7 +4490,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]

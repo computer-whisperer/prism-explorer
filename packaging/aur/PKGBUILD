@@ -1,11 +1,3 @@
-# !!! WORK IN PROGRESS — DOES NOT BUILD AS-IS. !!!
-# Written when achromat was a `../achromat` path dep. achromat is now a pinned
-# git dependency (see the workspace Cargo.toml), so the two-source sibling
-# layout below no longer matches how cargo resolves it, and a clean-chroot
-# build can't fetch a git dep offline. Pending a decision on how to package
-# achromat (vendor / source-array + offline / publish to crates.io). Do not
-# submit to the AUR until reworked.
-
 # Maintainer: Christian Balcom <robot.inventor@gmail.com>
 pkgname=prism-explorer
 pkgver=0.1.0
@@ -25,33 +17,25 @@ depends=('vulkan-icd-loader' 'libxkbcommon' 'wayland')
 makedepends=('rust' 'cargo' 'git' 'clang')
 options=('!lto')
 
-# prism-explorer's workspace depends on the (still unpublished) sibling crate
-# `achromat` via a relative path — `achromat = { path = "../achromat" }` plus a
-# `[patch.crates-io]` for its vendored jpegxr. So we fetch BOTH repos and lay
-# them out as siblings in $srcdir; `../achromat` then resolves exactly as it
-# does in a local checkout. Replace `git+...#commit=` with `#tag=v$pkgver` once
-# both repos carry release tags. Both commits must be pushed and the repos
-# reachable (public, or via your configured git credentials) for makepkg.
-_commit=429c2beab5e6f6b722b84338dcf24f0cda950595
-_achromat_commit=f781fab9104cdc9c2a9c60267300abdcf522484c
-source=(
-    "prism-explorer::git+$url.git#commit=$_commit"
-    "achromat::git+https://github.com/computer-whisperer/achromat.git#commit=$_achromat_commit"
-)
-sha256sums=('SKIP'
-            'SKIP')
+# prism-explorer's only non-crates.io dependency is `achromat` (with its
+# vendored `jpegxr`), pinned as a git dependency in the workspace Cargo.toml.
+# cargo resolves and fetches that git tree itself from Cargo.lock — both crates
+# come from the single achromat git source — so we do NOT lay it out as a
+# sibling in $srcdir. prepare() fetches everything (registry + git deps) up
+# front, then build() runs --frozen offline.
+source=("$pkgname::git+$url.git#tag=v$pkgver")
+sha256sums=('SKIP')
 
 prepare() {
-    cd "$srcdir/prism-explorer"
-    # Fetch registry deps up front so build() can run --frozen (offline).
-    # The path deps (achromat, vendored jpegxr) resolve from the sibling
-    # checkout, not the network.
+    cd "$srcdir/$pkgname"
+    # Populate the cargo cache (registry crates + the achromat git dep) while we
+    # still have network, so build() can run --frozen with no further fetching.
     export RUSTUP_TOOLCHAIN=stable
     cargo fetch --locked --target "$(rustc -vV | sed -n 's/host: //p')"
 }
 
 build() {
-    cd "$srcdir/prism-explorer"
+    cd "$srcdir/$pkgname"
     export RUSTUP_TOOLCHAIN=stable
     export CARGO_TARGET_DIR=target
     # Only the GUI binary — the crate also ships a `dump_bundles` lint tool.
@@ -59,7 +43,7 @@ build() {
 }
 
 package() {
-    cd "$srcdir/prism-explorer"
+    cd "$srcdir/$pkgname"
 
     install -Dm0755 "target/release/prism-explorer" \
         "$pkgdir/usr/bin/prism-explorer"
