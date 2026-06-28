@@ -28,8 +28,10 @@ use damascene_core::widgets::popover::{context_menu, menu_item};
 use damascene_core::widgets::progress::{progress, progress_indeterminate};
 use damascene_core::widgets::resize_handle::HANDLE_THICKNESS;
 use damascene_core::widgets::select::{self, select_menu, select_trigger};
+use damascene_core::widgets::switch::switch;
 use damascene_core::widgets::tabs::{self, tabs_list};
 use damascene_core::widgets::text_input::{self, TextInputOpts};
+use damascene_core::widgets::toggle::{self, toggle_group};
 use damascene_core::{BuildCx, EventCx, KeyChord, KeyModifiers, Rect, UiEvent, UiEventKind, UiKey};
 use lru::LruCache;
 
@@ -87,6 +89,31 @@ const SORT_STAT_BATCH: usize = 512;
 enum ViewMode {
     List,
     Grid,
+}
+
+impl ViewMode {
+    /// Stable string form for the persisted settings file.
+    fn as_str(self) -> &'static str {
+        match self {
+            ViewMode::List => "list",
+            ViewMode::Grid => "grid",
+        }
+    }
+
+    /// Parse the persisted form; anything unrecognized falls back to
+    /// the default list view.
+    fn from_str(s: &str) -> ViewMode {
+        match s {
+            "grid" => ViewMode::Grid,
+            _ => ViewMode::List,
+        }
+    }
+}
+
+impl std::fmt::Display for ViewMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -296,6 +323,10 @@ pub struct ExplorerApp {
     /// True for the standalone browser, false for picker windows (their
     /// browsing must not move the global history — they still *read* it).
     record_visits: bool,
+    /// Persisted user preferences (see [`crate::settings`]). Seeds
+    /// `show_hidden`/`sort`/`view` at construction; those mutators write
+    /// back through [`persist_settings`](Self::persist_settings).
+    settings: Arc<crate::settings::Store>,
 
     cwd: PathBuf,
     listing: Listing,
@@ -318,6 +349,12 @@ pub struct ExplorerApp {
     location_edit: Option<String>,
     sort: SortMode,
     sort_open: bool,
+    /// The Settings dialog is open.
+    settings_open: bool,
+    /// Open-state for the sort `select` inside the Settings dialog —
+    /// distinct from the toolbar's `sort_open`, though both drive
+    /// `sort`.
+    settings_sort_open: bool,
     focus_requests: Vec<String>,
     view: ViewMode,
     file_activation: FileActivation,
@@ -495,6 +532,7 @@ enum ContextTarget {
 }
 
 impl ExplorerApp {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         start: PathBuf,
         pool: Pool,
@@ -502,9 +540,11 @@ impl ExplorerApp {
         registry: Arc<Registry>,
         thumbs: Arc<ThumbCache>,
         store: Arc<Store>,
+        settings: Arc<crate::settings::Store>,
         record_visits: bool,
     ) -> Self {
         let (tx, rx) = channel();
+        let prefs = settings.get();
         let mut app = ExplorerApp {
             listing: Listing::new(start.clone(), pool.generation()),
             cwd: start.clone(),
@@ -514,19 +554,22 @@ impl ExplorerApp {
             notifier,
             registry,
             store,
+            settings,
             record_visits,
             recents: Vec::new(),
             places: Vec::new(),
-            show_hidden: false,
+            show_hidden: prefs.show_hidden,
             file_filter: None,
             search: String::new(),
             selection: Selection::default(),
             show_search: true,
             location_edit: None,
-            sort: SortMode::default(),
+            sort: crate::model::parse_sort_mode(&prefs.sort).unwrap_or_default(),
             sort_open: false,
+            settings_open: false,
+            settings_sort_open: false,
             focus_requests: Vec::new(),
-            view: ViewMode::List,
+            view: ViewMode::from_str(&prefs.view),
             file_activation: FileActivation::SystemOpen,
             activated: Vec::new(),
             thumbs,
@@ -1507,9 +1550,22 @@ impl ExplorerApp {
         });
     }
 
+    /// Snapshot the user-facing preferences into the settings store,
+    /// which persists them off-thread. Called by every mutator of the
+    /// three persisted fields so the on-disk file always tracks the
+    /// live state.
+    fn persist_settings(&self) {
+        self.settings.save(crate::settings::Settings {
+            show_hidden: self.show_hidden,
+            sort: self.sort.to_string(),
+            view: self.view.as_str().to_string(),
+        });
+    }
+
     fn toggle_hidden(&mut self) {
         self.show_hidden = !self.show_hidden;
         self.rebuild_visible_order();
+        self.persist_settings();
     }
 
     fn set_sort_mode(&mut self, sort: SortMode) {
@@ -1520,6 +1576,7 @@ impl ExplorerApp {
         self.rebuild_visible_order();
         self.keep_selection_visible();
         self.request_missing_stats_for_sort();
+        self.persist_settings();
     }
 
     fn keep_selection_visible(&self) {
@@ -1692,6 +1749,7 @@ impl ExplorerApp {
                 ScrollAlignment::Visible,
             ));
         }
+        self.persist_settings();
     }
 
     /// Re-derive the selection's position after `order` changed; drop
@@ -1862,6 +1920,7 @@ impl ExplorerApp {
                 .width(Size::Fixed(128.0))
                 .tooltip("sort order"),
             icon_button(view_icon).key("view-toggle").tooltip(view_tip),
+            icon_button("settings").key("settings").tooltip("settings"),
             color_mode_badge(cx),
         ]);
         toolbar(tools)
@@ -1894,7 +1953,7 @@ impl ExplorerApp {
 
     fn search_el(&self, narrow: bool) -> El {
         let (input_w, row_w) = if narrow {
-            (160.0, 224.0)
+            (144.0, 208.0)
         } else {
             (220.0, 284.0)
         };
@@ -2510,6 +2569,13 @@ impl ExplorerApp {
         if let Some(message) = &self.op_error {
             layers.push(self.op_error_dialog(message));
         }
+        if self.settings_open {
+            layers.push(self.settings_dialog());
+            // The sort select's drop-down rides above its own dialog.
+            if self.settings_sort_open {
+                layers.push(select_menu("settings-sort", sort_options()));
+            }
+        }
         if layers.len() == 1 {
             layers.pop().unwrap()
         } else {
@@ -2781,6 +2847,47 @@ impl ExplorerApp {
         ))
     }
 
+    /// The Settings dialog: the persisted browser preferences. The sort
+    /// row reuses the same `select` widget as the toolbar (under a
+    /// distinct key, `settings-sort`), and view is a two-way toggle
+    /// group; both drive the same `sort`/`view` fields the toolbar does,
+    /// so a change here and a change there are indistinguishable.
+    fn settings_dialog(&self) -> El {
+        let setting_row = |label: &str, control: El| {
+            row([text(label.to_string()), spacer(), control])
+                .align(Align::Center)
+                .width(Size::Fill(1.0))
+        };
+        dialog(
+            "settings",
+            [
+                dialog_header([dialog_title("Settings")]),
+                column([
+                    setting_row(
+                        "Show hidden files",
+                        switch("settings:show-hidden", self.show_hidden),
+                    ),
+                    setting_row(
+                        "Sort order",
+                        select_trigger("settings-sort", self.sort.label())
+                            .width(Size::Fixed(160.0)),
+                    ),
+                    setting_row(
+                        "View",
+                        toggle_group(
+                            "settings-view",
+                            &self.view,
+                            [(ViewMode::List, "List"), (ViewMode::Grid, "Grid")],
+                        ),
+                    ),
+                ])
+                .gap(tokens::SPACE_3)
+                .width(Size::Fill(1.0)),
+                dialog_footer([button("Done").primary().key("settings:close")]),
+            ],
+        )
+    }
+
     /// Modal notice for a failed file operation.
     fn op_error_dialog(&self, message: &str) -> El {
         dialog(
@@ -2883,7 +2990,7 @@ impl ExplorerApp {
             left.push_str(" · listing…");
         }
         if !self.show_hidden {
-            left.push_str(" · hidden files off (.)");
+            left.push_str(" · hidden files off (Ctrl+H)");
         }
         // A running transfer has its own progress strip above the status
         // bar, so this slot just names the selected entry.
@@ -3691,6 +3798,42 @@ impl App for ExplorerApp {
             }
             return;
         }
+        // The Settings dialog is modal: its switch / sort-select / view
+        // toggle drive the persisted prefs (through the same mutators the
+        // toolbar uses); Done / scrim / Escape close it.
+        if self.settings_open {
+            if event.is_click_or_activate("settings:close")
+                || event.is_click_or_activate("settings:dismiss")
+                || event.kind == UiEventKind::Escape
+            {
+                self.settings_open = false;
+                return;
+            }
+            if event.is_click_or_activate("settings:show-hidden") {
+                self.toggle_hidden();
+                return;
+            }
+            let mut sort = self.sort;
+            let mut sort_open = self.settings_sort_open;
+            if select::apply_event(&mut sort, &mut sort_open, &event, "settings-sort", |s| {
+                parse_sort_mode(&s)
+            }) {
+                self.settings_sort_open = sort_open;
+                self.set_sort_mode(sort);
+                return;
+            }
+            let mut view = self.view;
+            if toggle::apply_event_single(&mut view, &event, "settings-view", |s| {
+                Some(ViewMode::from_str(s))
+            }) {
+                if view != self.view {
+                    self.toggle_view();
+                }
+                return;
+            }
+            // Swallow everything else while the dialog is up.
+            return;
+        }
         // The "Open with…" chooser is likewise modal: an app row
         // launches and closes; cancel/scrim/Escape just close.
         if let Some(target) = self.open_with {
@@ -3910,6 +4053,10 @@ impl App for ExplorerApp {
             }
             if key == "view-toggle" && event.is_click_or_activate(key) {
                 self.toggle_view();
+                return;
+            }
+            if key == "settings" && event.is_click_or_activate(key) {
+                self.settings_open = true;
                 return;
             }
             if key == "new-folder" && event.is_click_or_activate(key) {
@@ -4192,6 +4339,7 @@ pub(crate) mod fixtures {
             Arc::new(Registry::standard()),
             Arc::new(thumbs),
             crate::state::Store::ephemeral(),
+            crate::settings::Store::ephemeral(),
             false,
         );
         app.places = vec![

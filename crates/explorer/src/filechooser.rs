@@ -54,6 +54,9 @@ pub struct PickerDeps {
     /// window. Seeds `start_dir` (per-app memory, then the global
     /// fallback) and, on accept, records where each app last chose.
     pub store: Arc<crate::state::Store>,
+    /// Persisted browser preferences (show hidden, sort, view), shared
+    /// with the standalone browser so a change in either sticks for both.
+    pub settings: Arc<crate::settings::Store>,
     pub proxy: EventLoopProxy<HostCommand>,
 }
 
@@ -98,6 +101,7 @@ impl FileChooser {
             // false` keeps its browsing out of the log. The dialog's only
             // contribution is the request event recorded on completion.
             self.deps.store.clone(),
+            self.deps.settings.clone(),
             false,
         );
         let app = PickerApp::new(

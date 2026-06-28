@@ -18,7 +18,7 @@ use explorer_previews::Registry;
 use explorer_thumbs::ThumbCache;
 use prism_explorer::app::ExplorerApp;
 use prism_explorer::host::{self, HostCommand, WindowSpec};
-use prism_explorer::{filechooser, filemanager1, state};
+use prism_explorer::{filechooser, filemanager1, settings, state};
 
 /// Long edge of cached thumbnails: 2× the grid tile width, so tiles
 /// stay sharp on 2× displays.
@@ -39,6 +39,10 @@ fn main() -> Result<()> {
     // Persisted last-used location, shared by the browser window and
     // every portal picker. Loaded once here (a single small read).
     let store = state::Store::load();
+
+    // Persisted browser preferences (show hidden, sort, view), likewise
+    // shared by the browser and every picker. A single small read.
+    let settings = settings::Store::load();
 
     let start = match std::env::args_os().nth(1) {
         Some(arg) => {
@@ -108,6 +112,7 @@ fn main() -> Result<()> {
         registry.clone(),
         thumbs.clone(),
         store.clone(),
+        settings.clone(),
         // The standalone browser owns the global history; its
         // navigations are logged as visits.
         true,
@@ -127,6 +132,7 @@ fn main() -> Result<()> {
         registry,
         thumbs,
         store,
+        settings,
         proxy: event_loop.create_proxy(),
     });
 
