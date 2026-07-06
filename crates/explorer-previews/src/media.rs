@@ -63,8 +63,8 @@ impl PreviewHandler for AudioHandler {
 fn extract_video_frame(path: &Path) -> anyhow::Result<Preview> {
     let dir = PreviewTempDir::new("video")?;
     let png = dir.path().join("frame.png");
-    let status = Command::new("ffmpeg")
-        .arg("-hide_banner")
+    let mut cmd = Command::new("ffmpeg");
+    cmd.arg("-hide_banner")
         .arg("-loglevel")
         .arg("error")
         .arg("-y")
@@ -78,8 +78,8 @@ fn extract_video_frame(path: &Path) -> anyhow::Result<Preview> {
         .arg("-sn")
         .arg(&png)
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
+        .stderr(Stdio::null());
+    let status = crate::run_with_timeout(&mut cmd, crate::CHILD_TIMEOUT)
         .with_context(|| "failed to run ffmpeg")?;
     if !status.success() {
         bail!("ffmpeg exited with {status}");

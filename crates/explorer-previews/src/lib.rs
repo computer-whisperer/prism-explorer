@@ -132,6 +132,36 @@ fn extension(path: &Path) -> Option<String> {
     path.extension().map(|e| e.to_string_lossy().to_lowercase())
 }
 
+/// Hard deadline for helper processes (ffmpeg, pdftoppm). Generous for a
+/// cold CephFS read, but bounded: these run on shared pool workers, jobs
+/// can't be cancelled once started, and one pathological file must not
+/// eat a worker for the rest of the session.
+pub(crate) const CHILD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Run `cmd` to completion, killing it at `timeout`. `Command::status()`
+/// blocks forever on a spinning child — corrupt transport streams and
+/// adversarial PDFs do exactly that to ffmpeg/pdftoppm.
+pub(crate) fn run_with_timeout(
+    cmd: &mut std::process::Command,
+    timeout: std::time::Duration,
+) -> anyhow::Result<std::process::ExitStatus> {
+    let start = std::time::Instant::now();
+    let mut child = cmd.spawn()?;
+    let mut delay = std::time::Duration::from_millis(10);
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok(status);
+        }
+        if start.elapsed() >= timeout {
+            let _ = child.kill();
+            let _ = child.wait(); // reap; kill guarantees imminent exit
+            anyhow::bail!("child process timed out after {}s", timeout.as_secs());
+        }
+        std::thread::sleep(delay);
+        delay = (delay * 2).min(std::time::Duration::from_millis(200));
+    }
+}
+
 pub(crate) struct PreviewTempDir {
     path: PathBuf,
 }
@@ -227,6 +257,25 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    /// A hung helper process is killed at the deadline instead of
+    /// blocking the pool worker forever; a prompt one reports its status.
+    #[test]
+    fn run_with_timeout_kills_hung_child_and_passes_fast_one() {
+        let start = std::time::Instant::now();
+        let mut hung = std::process::Command::new("sleep");
+        hung.arg("30");
+        let result = run_with_timeout(&mut hung, std::time::Duration::from_millis(100));
+        assert!(result.is_err(), "hung child should time out");
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(10),
+            "timeout must not wait for the child's natural exit"
+        );
+
+        let mut quick = std::process::Command::new("true");
+        let status = run_with_timeout(&mut quick, std::time::Duration::from_secs(5)).unwrap();
+        assert!(status.success());
     }
 
     /// End-to-end through the registry: a real PNG decodes to an image

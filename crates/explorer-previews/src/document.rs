@@ -46,8 +46,8 @@ impl PreviewHandler for PdfHandler {
 fn render_first_page(path: &Path) -> anyhow::Result<Preview> {
     let dir = PreviewTempDir::new("pdf")?;
     let prefix = dir.path().join("page");
-    let status = Command::new("pdftoppm")
-        .arg("-f")
+    let mut cmd = Command::new("pdftoppm");
+    cmd.arg("-f")
         .arg("1")
         .arg("-l")
         .arg("1")
@@ -58,8 +58,8 @@ fn render_first_page(path: &Path) -> anyhow::Result<Preview> {
         .arg(path)
         .arg(&prefix)
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
+        .stderr(Stdio::null());
+    let status = crate::run_with_timeout(&mut cmd, crate::CHILD_TIMEOUT)
         .with_context(|| "failed to run pdftoppm")?;
     if !status.success() {
         bail!("pdftoppm exited with {status}");
