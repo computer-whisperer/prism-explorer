@@ -11,7 +11,7 @@
 # cleanly (0.1.0.r12.gabcdef > 0.1.0.r8.g123456). Conflicts with and
 # provides prism-explorer, replacing an AUR install.
 pkgname=prism-explorer-local
-pkgver=0.1.0
+pkgver=0.1.0.r12.fd26c69
 pkgrel=1
 pkgdesc="Color-managed file explorer — local dev build from the working checkout"
 arch=('x86_64')

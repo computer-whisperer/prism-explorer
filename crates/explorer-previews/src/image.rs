@@ -89,10 +89,8 @@ mod tests {
     /// hundreds of MB and fail decode anyway).
     #[test]
     fn oversized_source_returns_details_not_decode() {
-        let dir = std::env::temp_dir().join(format!(
-            "explorer-previews-imggate-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("explorer-previews-imggate-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("huge.exr");
@@ -101,7 +99,10 @@ mod tests {
 
         match load_raster_image(&path).unwrap() {
             Preview::Details { rows, .. } => {
-                assert!(rows.iter().any(|r| r.value.contains("too large")), "{rows:?}");
+                assert!(
+                    rows.iter().any(|r| r.value.contains("too large")),
+                    "{rows:?}"
+                );
             }
             _ => panic!("oversized image must not be decoded"),
         }

@@ -1597,16 +1597,15 @@ impl ExplorerApp {
             // and the pool swallows job panics — so a panicking decoder
             // (jpegxr FFI, hostile files) must still produce a reply or
             // the pane wedges on "Loading" for the rest of the session.
-            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                PreviewPayload {
+            let result =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| PreviewPayload {
                     preview: registry.load(&path).map_err(|e| format!("{e:#}")),
                     raw: explorer_previews::raw_preview(&path).map_err(|e| format!("{e:#}")),
-                }
-            }))
-            .unwrap_or_else(|_| PreviewPayload {
-                preview: Err("the preview decoder crashed on this file".into()),
-                raw: Err("the preview decoder crashed on this file".into()),
-            });
+                }))
+                .unwrap_or_else(|_| PreviewPayload {
+                    preview: Err("the preview decoder crashed on this file".into()),
+                    raw: Err("the preview decoder crashed on this file".into()),
+                });
             let _ = tx.send(Msg::Preview {
                 generation,
                 id,
@@ -2330,24 +2329,30 @@ impl ExplorerApp {
                                 // cleared when this message lands, so a
                                 // panicking decoder must still reply or
                                 // the tile stays a skeleton forever.
-                                let decode = std::panic::catch_unwind(
-                                    std::panic::AssertUnwindSafe(|| match thumb_policy {
-                                        GridThumbPolicy::Decode => match thumbs.thumbnail(&path) {
-                                            Ok(image) => ThumbResult::Image(image),
-                                            Err(error) => ThumbResult::Error(format!("{error:#}")),
-                                        },
-                                        GridThumbPolicy::CacheOnly => {
-                                            match thumbs.cached_thumbnail(&path) {
-                                                Ok(Some(image)) => ThumbResult::Image(image),
-                                                Ok(None) => ThumbResult::Miss,
-                                                Err(error) => ThumbResult::Error(format!("{error:#}")),
+                                let decode =
+                                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                        match thumb_policy {
+                                            GridThumbPolicy::Decode => {
+                                                match thumbs.thumbnail(&path) {
+                                                    Ok(image) => ThumbResult::Image(image),
+                                                    Err(error) => {
+                                                        ThumbResult::Error(format!("{error:#}"))
+                                                    }
+                                                }
                                             }
+                                            GridThumbPolicy::CacheOnly => {
+                                                match thumbs.cached_thumbnail(&path) {
+                                                    Ok(Some(image)) => ThumbResult::Image(image),
+                                                    Ok(None) => ThumbResult::Miss,
+                                                    Err(error) => {
+                                                        ThumbResult::Error(format!("{error:#}"))
+                                                    }
+                                                }
+                                            }
+                                            GridThumbPolicy::Never
+                                            | GridThumbPolicy::WaitForMeta => ThumbResult::Miss,
                                         }
-                                        GridThumbPolicy::Never | GridThumbPolicy::WaitForMeta => {
-                                            ThumbResult::Miss
-                                        }
-                                    }),
-                                );
+                                    }));
                                 let result = decode.unwrap_or_else(|_| {
                                     ThumbResult::Error("the thumbnail decoder crashed".into())
                                 });

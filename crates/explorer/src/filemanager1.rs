@@ -26,7 +26,9 @@ struct FileManager1 {
 impl FileManager1 {
     fn open(&self, dir: PathBuf, select: Option<OsString>) {
         tracing::info!(dir = %dir.display(), select = ?select, "FileManager1 request");
-        let _ = self.proxy.send_event(HostCommand::ShowLocation { dir, select });
+        let _ = self
+            .proxy
+            .send_event(HostCommand::ShowLocation { dir, select });
     }
 
     /// First parseable URI wins — the UI has one window, and one

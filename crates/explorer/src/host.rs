@@ -95,8 +95,7 @@ pub enum HostCommand {
 /// owning the explorer's construction dependencies (pool, registry,
 /// caches, stores). Each call spawns that window's own IO pool, the
 /// same way the portal's pickers do.
-pub type BrowserFactory =
-    Arc<dyn Fn(PathBuf, Option<OsString>) -> WindowSpec + Send + Sync>;
+pub type BrowserFactory = Arc<dyn Fn(PathBuf, Option<OsString>) -> WindowSpec + Send + Sync>;
 
 /// A window to open: title, logical size, and the [`App`] that owns it.
 ///

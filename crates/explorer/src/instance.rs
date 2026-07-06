@@ -105,9 +105,7 @@ pub fn try_become_primary(proxy: EventLoopProxy<HostCommand>) -> Arbitration {
 /// builder would silently queue and report success without ownership,
 /// so we request the name explicitly with `DoNotQueue` and inspect the
 /// reply.
-fn serve(
-    proxy: EventLoopProxy<HostCommand>,
-) -> zbus::Result<Option<zbus::blocking::Connection>> {
+fn serve(proxy: EventLoopProxy<HostCommand>) -> zbus::Result<Option<zbus::blocking::Connection>> {
     use zbus::fdo::{RequestNameFlags, RequestNameReply};
 
     // Register the object *before* claiming the name, so a handoff call

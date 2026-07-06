@@ -689,7 +689,10 @@ mod tests {
         // No store memory for these cases: empty app_id never matches.
         let store = crate::state::Store::ephemeral();
         // No options at all → no filters, index 0.
-        assert_eq!(filter_options(&HashMap::new(), "", RequestKind::OpenFile, &store), (Vec::new(), 0));
+        assert_eq!(
+            filter_options(&HashMap::new(), "", RequestKind::OpenFile, &store),
+            (Vec::new(), 0)
+        );
 
         let raw: Vec<RawFilter> = vec![
             (
@@ -718,7 +721,10 @@ mod tests {
             "current_filter".to_string(),
             OwnedValue::try_from(Value::from(all)).unwrap(),
         );
-        assert_eq!(filter_options(&options, "", RequestKind::OpenFile, &store).1, 1);
+        assert_eq!(
+            filter_options(&options, "", RequestKind::OpenFile, &store).1,
+            1
+        );
 
         // …and a detached one is appended and selected.
         let detached: RawFilter = ("Detached".into(), vec![(0, "*.x".into())]);
@@ -793,7 +799,10 @@ mod tests {
         );
 
         // No memory yet → first filter.
-        assert_eq!(filter_options(&options, "org.app", RequestKind::OpenFile, &store).1, 0);
+        assert_eq!(
+            filter_options(&options, "org.app", RequestKind::OpenFile, &store).1,
+            0
+        );
 
         // Memory is kind-scoped: a filter accepted in this app's *Save*
         // dialog must not pre-filter its Open dialogs.
@@ -804,16 +813,28 @@ mod tests {
             None,
             Some("All files"),
         );
-        assert_eq!(filter_options(&options, "org.app", RequestKind::OpenFile, &store).1, 0);
+        assert_eq!(
+            filter_options(&options, "org.app", RequestKind::OpenFile, &store).1,
+            0
+        );
 
         // Remembered filter pre-selects by name when no current_filter.
         accept(&store, "org.app", None, Some("All files"));
-        assert_eq!(filter_options(&options, "org.app", RequestKind::OpenFile, &store).1, 1);
+        assert_eq!(
+            filter_options(&options, "org.app", RequestKind::OpenFile, &store).1,
+            1
+        );
         // A different app is unaffected.
-        assert_eq!(filter_options(&options, "org.other", RequestKind::OpenFile, &store).1, 0);
+        assert_eq!(
+            filter_options(&options, "org.other", RequestKind::OpenFile, &store).1,
+            0
+        );
         // A remembered filter no longer offered falls back to the first.
         accept(&store, "org.app", None, Some("Vanished"));
-        assert_eq!(filter_options(&options, "org.app", RequestKind::OpenFile, &store).1, 0);
+        assert_eq!(
+            filter_options(&options, "org.app", RequestKind::OpenFile, &store).1,
+            0
+        );
 
         // An explicit current_filter always wins over memory.
         accept(&store, "org.app", None, Some("All files"));
@@ -822,7 +843,10 @@ mod tests {
             "current_filter".to_string(),
             OwnedValue::try_from(Value::from(images)).unwrap(),
         );
-        assert_eq!(filter_options(&options, "org.app", RequestKind::OpenFile, &store).1, 0);
+        assert_eq!(
+            filter_options(&options, "org.app", RequestKind::OpenFile, &store).1,
+            0
+        );
     }
 
     #[test]
