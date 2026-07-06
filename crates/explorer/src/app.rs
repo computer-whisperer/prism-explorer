@@ -687,6 +687,13 @@ impl ExplorerApp {
             self.store.record_visit(&dir);
         }
         self.recents = self.store.recent_dirs(RECENTS_SHOWN);
+        // A search filters *this* directory; carrying it into another
+        // one pre-filters a listing the user never searched (and makes
+        // entered directories look mysteriously empty). Same-directory
+        // refreshes keep it. The box stays open — only the term clears.
+        if dir != self.cwd && !self.search.is_empty() {
+            self.search.clear();
+        }
         self.cwd = dir.clone();
         self.listing = Listing::new(dir.clone(), generation);
         self.selected = None;
@@ -775,6 +782,28 @@ impl ExplorerApp {
         (!term.is_empty()).then(|| term.to_string())
     }
 
+    /// Focus the entry a finished op asked us to select, once the
+    /// streaming listing has produced it. The entry the user just
+    /// created/renamed may not match an active search ("docs" while
+    /// filtering "photo") — clear the filter to reveal it rather than
+    /// silently succeeding into an invisible entry.
+    fn resolve_pending_select(&mut self) {
+        let Some(name) = self.pending_select.clone() else {
+            return;
+        };
+        if let Some(id) = self.listing.id_by_name(&name) {
+            self.pending_select = None;
+            if self.listing.pos_of(id).is_none() && self.search_term().is_some() {
+                self.search.clear();
+                self.rebuild_visible_order();
+            }
+            self.select_id(id);
+            self.keep_selection_visible();
+        } else if self.listing.complete {
+            self.pending_select = None;
+        }
+    }
+
     fn rebuild_visible_order(&mut self) {
         let search = self.search_term();
         self.listing.rebuild_order(
@@ -827,11 +856,24 @@ impl ExplorerApp {
     }
 
     /// Keyboard navigation (arrows, Home/End) is single-select: move
-    /// the cursor and drop any marks. Multi-select is mouse/Space only.
+    /// the cursor and drop any marks. Building a set from the keyboard
+    /// is Ctrl+arrows (cursor moves, marks stay) + Space (toggle).
     fn select_pos(&mut self, pos: usize) {
         if let Some(&id) = self.listing.order.get(pos) {
             self.select_only(id);
             self.keep_selection_visible();
+        }
+    }
+
+    /// Ctrl+arrows: move the cursor `delta` rows without touching the
+    /// marked set or the range anchor, so Space can toggle entries into
+    /// a multi-selection as the cursor walks.
+    fn move_cursor_keep_marks(&mut self, delta: isize) {
+        if let Some(pos) = self.step_pos(delta) {
+            if let Some(&id) = self.listing.order.get(pos) {
+                self.select_id(id);
+                self.keep_selection_visible();
+            }
         }
     }
 
@@ -919,12 +961,15 @@ impl ExplorerApp {
         }
     }
 
-    fn move_selection(&mut self, delta: isize) {
+    /// The cursor's landing position for a `delta`-row step, clamped to
+    /// the listing; `None` on an empty listing. No cursor yet starts at
+    /// the top (or bottom, stepping up).
+    fn step_pos(&self, delta: isize) -> Option<usize> {
         let len = self.listing.order.len();
         if len == 0 {
-            return;
+            return None;
         }
-        let pos = match self.selected {
+        Some(match self.selected {
             Some((_, pos)) => (pos as isize + delta).clamp(0, len as isize - 1) as usize,
             None => {
                 if delta >= 0 {
@@ -933,8 +978,13 @@ impl ExplorerApp {
                     len - 1
                 }
             }
-        };
-        self.select_pos(pos);
+        })
+    }
+
+    fn move_selection(&mut self, delta: isize) {
+        if let Some(pos) = self.step_pos(delta) {
+            self.select_pos(pos);
+        }
     }
 
     /// Enter / double-click: descend into directories, hand files to
@@ -1769,7 +1819,13 @@ impl ExplorerApp {
     }
 
     /// Re-derive the selection's position after `order` changed; drop
-    /// the cursor and any marks whose entries were filtered out.
+    /// the cursor when its entry was filtered out. Marks are left alone:
+    /// a transient search (or hidden toggle) must not destroy a
+    /// hand-built multi-selection — filtered-out marks go dormant and
+    /// return when the filter lifts. Dormant marks can't be acted on
+    /// invisibly: `bulk_targets` and `marked_file_paths` both walk the
+    /// *visible* order, and entries never leave `entries` within a
+    /// listing (deletion refreshes → `navigate` clears the set).
     fn remap_selection(&mut self) {
         if let Some((id, _)) = self.selected {
             self.selected = self.listing.pos_of(id).map(|pos| (id, pos));
@@ -1777,9 +1833,6 @@ impl ExplorerApp {
                 self.preview = PreviewState::Empty;
                 self.preview_wanted = None;
             }
-        }
-        if !self.marked.is_empty() {
-            self.marked.retain(|&id| self.listing.pos_of(id).is_some());
         }
     }
 
@@ -3014,6 +3067,22 @@ impl ExplorerApp {
         if !self.listing.complete && self.listing.error.is_none() {
             left.push_str(" · listing…");
         }
+        // Count the multi-selection the way bulk actions see it (visible
+        // marks only), and say when a filter is hiding part of the set —
+        // dormant marks return when the filter lifts.
+        let visible_marked = self
+            .listing
+            .order
+            .iter()
+            .filter(|id| self.marked.contains(id))
+            .count();
+        if visible_marked > 0 {
+            left.push_str(&format!(" · {visible_marked} selected"));
+            let dormant = self.marked.len() - visible_marked;
+            if dormant > 0 {
+                left.push_str(&format!(" ({dormant} more behind filter)"));
+            }
+        }
         if !self.show_hidden {
             left.push_str(" · hidden files off (Ctrl+H)");
         }
@@ -3566,15 +3635,7 @@ impl App for ExplorerApp {
                     ) {
                         self.remap_selection();
                     }
-                    if let Some(name) = self.pending_select.clone() {
-                        if let Some(id) = self.listing.id_by_name(&name) {
-                            self.pending_select = None;
-                            self.select_id(id);
-                            self.keep_selection_visible();
-                        } else if self.listing.complete {
-                            self.pending_select = None;
-                        }
-                    }
+                    self.resolve_pending_select();
                 }
                 Msg::Stat {
                     generation,
@@ -3696,9 +3757,24 @@ impl App for ExplorerApp {
             shift: true,
             ..KeyModifiers::default()
         });
+        let ctrl = KeyModifiers {
+            ctrl: true,
+            ..KeyModifiers::default()
+        };
         vec![
             (KeyChord::named(UiKey::ArrowUp), "prev".into()),
             (KeyChord::named(UiKey::ArrowDown), "next".into()),
+            // Ctrl+arrows move the cursor without clearing marks —
+            // Space then toggles, so a multi-selection can be built
+            // from the keyboard.
+            (
+                KeyChord::named(UiKey::ArrowUp).with_modifiers(ctrl),
+                "mark-prev".into(),
+            ),
+            (
+                KeyChord::named(UiKey::ArrowDown).with_modifiers(ctrl),
+                "mark-next".into(),
+            ),
             (KeyChord::named(UiKey::ArrowLeft), "left".into()),
             (KeyChord::named(UiKey::ArrowRight), "right".into()),
             (KeyChord::named(UiKey::Home), "first".into()),
@@ -4129,6 +4205,10 @@ impl App for ExplorerApp {
             self.move_selection(vstep);
         } else if event.is_hotkey("prev") {
             self.move_selection(-vstep);
+        } else if event.is_hotkey("mark-next") {
+            self.move_cursor_keep_marks(vstep);
+        } else if event.is_hotkey("mark-prev") {
+            self.move_cursor_keep_marks(-vstep);
         } else if event.is_hotkey("left") {
             match self.view {
                 ViewMode::List => self.navigate_parent(),
@@ -5005,6 +5085,93 @@ mod tests {
             !app.scroll_requests.borrow().is_empty(),
             "keyboard select_pos should queue a scroll request",
         );
+    }
+
+    /// A transient search puts marks to sleep instead of destroying
+    /// them: ops see only the visible marks while filtered, and the
+    /// full set returns when the filter lifts.
+    #[test]
+    fn marks_survive_transient_search_filter() {
+        let mut app = browse(); // docs(dir), notes.txt, photo.jxr
+        let notes = id_of(&app, "notes.txt");
+        let photo = id_of(&app, "photo.jxr");
+        app.toggle_mark(notes);
+        app.toggle_mark(photo);
+
+        app.set_search("photo".into());
+        assert_eq!(
+            app.marked,
+            HashSet::from([notes, photo]),
+            "filtering must not destroy the marked set"
+        );
+        assert_eq!(
+            app.marked_file_paths(),
+            vec![PathBuf::from("/test/somewhere/photo.jxr")],
+            "bulk actions see only visible marks while filtered"
+        );
+
+        app.set_search(String::new());
+        assert_eq!(
+            app.marked_file_paths(),
+            vec![
+                PathBuf::from("/test/somewhere/notes.txt"),
+                PathBuf::from("/test/somewhere/photo.jxr"),
+            ],
+            "lifting the filter revives the whole set"
+        );
+    }
+
+    /// Ctrl+arrows walk the cursor without clearing marks, so Space can
+    /// toggle entries into a multi-selection from the keyboard.
+    #[test]
+    fn ctrl_arrows_keep_marks_for_keyboard_multi_select() {
+        let mut app = browse(); // docs(dir), notes.txt, photo.jxr
+        app.select_pos(0);
+        let docs = id_of(&app, "docs");
+        let notes = id_of(&app, "notes.txt");
+        app.toggle_mark(docs);
+
+        app.move_cursor_keep_marks(1);
+        assert_eq!(app.selected_id(), Some(notes), "cursor moved");
+        assert_eq!(app.marked, HashSet::from([docs]), "marks kept");
+
+        app.toggle_mark(notes);
+        assert_eq!(app.marked, HashSet::from([docs, notes]));
+
+        // The plain arrow still collapses to single-select.
+        app.move_selection(1);
+        assert!(app.marked.is_empty());
+    }
+
+    /// A search filters the directory it was typed in: entering another
+    /// directory clears it, while a same-directory refresh keeps it.
+    #[test]
+    fn search_clears_on_directory_change_not_refresh() {
+        let mut app = browse();
+        app.set_search("photo".into());
+
+        app.navigate(app.cwd.clone(), None);
+        assert_eq!(app.search, "photo", "same-dir refresh keeps the filter");
+
+        app.navigate(PathBuf::from("/elsewhere"), None);
+        assert!(
+            app.search.is_empty(),
+            "entering another directory drops the filter"
+        );
+    }
+
+    /// A created/renamed entry that doesn't match the active search is
+    /// revealed (filter cleared, entry selected), not silently hidden.
+    #[test]
+    fn pending_select_reveals_entry_hidden_by_search() {
+        let mut app = browse(); // docs(dir), notes.txt, photo.jxr
+        app.set_search("photo".into());
+        app.pending_select = Some("docs".into());
+
+        app.resolve_pending_select();
+        assert!(app.search.is_empty(), "filter cleared to reveal the entry");
+        assert_eq!(app.selected_id(), Some(id_of(&app, "docs")));
+        assert!(app.pending_select.is_none());
     }
 
     /// Keyboard nav and navigation both drop the multi-selection.
