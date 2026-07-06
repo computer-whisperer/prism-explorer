@@ -1,0 +1,77 @@
+# Maintainer: Christian Balcom <robot.inventor@gmail.com>
+#
+# Dev-install variant of packaging/aur/PKGBUILD: builds from the LOCAL
+# git checkout's HEAD (committed state only — the working tree is not
+# copied) instead of the GitHub release tag. Use it to dogfood fixes
+# between releases:
+#
+#   cd packaging/local && makepkg -si
+#
+# pkgver derives from `git describe`, so successive builds upgrade
+# cleanly (0.1.0.r12.gabcdef > 0.1.0.r8.g123456). Conflicts with and
+# provides prism-explorer, replacing an AUR install.
+pkgname=prism-explorer-local
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="Color-managed file explorer — local dev build from the working checkout"
+arch=('x86_64')
+url="https://github.com/computer-whisperer/prism-explorer"
+license=('MIT' 'Apache-2.0')
+provides=('prism-explorer')
+conflicts=('prism-explorer')
+depends=('vulkan-icd-loader' 'libxkbcommon' 'wayland')
+makedepends=('rust' 'cargo' 'git' 'clang')
+options=('!lto')
+
+# file:// clone of the checkout two levels up. makepkg clones HEAD, so
+# only committed work ships — uncommitted edits are deliberately left
+# behind (a build you can't reproduce from history shouldn't be on the
+# system).
+source=("$pkgname::git+file://${PKGBUILD_LOCAL_REPO:-$(cd ../.. && pwd)}")
+sha256sums=('SKIP')
+
+pkgver() {
+    cd "$srcdir/$pkgname"
+    # v0.1.0-12-gabcdef → 0.1.0.r12.gabcdef (monotonic across commits).
+    git describe --long --tags | sed 's/^v//; s/\([^-]*-\)g/r\1/; s/-/./g'
+}
+
+prepare() {
+    cd "$srcdir/$pkgname"
+    # Registry crates + the achromat git dep, resolved from Cargo.lock,
+    # land in the cargo cache now so build() can run --frozen offline.
+    export RUSTUP_TOOLCHAIN=stable
+    cargo fetch --locked --target "$(rustc -vV | sed -n 's/host: //p')"
+}
+
+build() {
+    cd "$srcdir/$pkgname"
+    export RUSTUP_TOOLCHAIN=stable
+    export CARGO_TARGET_DIR=target
+    cargo build --release --frozen -p prism-explorer --bin prism-explorer
+}
+
+package() {
+    cd "$srcdir/$pkgname"
+
+    install -Dm0755 "target/release/prism-explorer" \
+        "$pkgdir/usr/bin/prism-explorer"
+
+    install -Dm0644 "data/prism-explorer.desktop" \
+        "$pkgdir/usr/share/applications/prism-explorer.desktop"
+
+    install -Dm0644 "data/prism.portal" \
+        "$pkgdir/usr/share/xdg-desktop-portal/portals/prism.portal"
+
+    install -Dm0644 "data/org.freedesktop.impl.portal.desktop.prism.service" \
+        "$pkgdir/usr/share/dbus-1/services/org.freedesktop.impl.portal.desktop.prism.service"
+
+    install -Dm0644 "LICENSE-MIT" \
+        "$pkgdir/usr/share/licenses/$pkgname/LICENSE-MIT"
+    install -Dm0644 "LICENSE-APACHE" \
+        "$pkgdir/usr/share/licenses/$pkgname/LICENSE-APACHE"
+
+    # Shared-name activation file stays doc-only (see the AUR PKGBUILD).
+    install -Dm0644 "data/org.freedesktop.FileManager1.service" \
+        "$pkgdir/usr/share/doc/$pkgname/org.freedesktop.FileManager1.service"
+}

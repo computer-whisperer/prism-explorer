@@ -13,4 +13,7 @@
 # you installed it elsewhere.
 [D-BUS Service]
 Name=org.freedesktop.FileManager1
-Exec=/usr/bin/prism-explorer
+# --service: headless + resident. Without it a cold ShowItems activation
+# opens a stray browser window at the remembered directory *before* the
+# requested location arrives, minting two windows for one reveal.
+Exec=/usr/bin/prism-explorer --service
