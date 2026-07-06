@@ -518,15 +518,40 @@ fn class_match(p: &[char], pi: usize, c: char) -> Option<(bool, usize)> {
     None
 }
 
+/// HDR formats the achromat stack decodes that mime_guess's database
+/// lacks (checked against mime_guess 2.0.5). Without these, a
+/// mime-only portal filter — `image/*` is what many GTK/Qt apps and
+/// browsers send — hides exactly the files this explorer exists to
+/// browse, while GTK's own picker (shared-mime-info) shows them.
+/// Types as shared-mime-info names them, plus common aliases.
+const MIME_OVERLAY: &[(&str, &[&str])] = &[
+    ("jxr", &["image/jxr", "image/vnd.ms-photo"]),
+    ("exr", &["image/x-exr", "image/aces"]),
+];
+
 /// Does the extension-guessed mimetype of `name` satisfy `pattern`
 /// (`image/png`, `image/*`, `*/*`)?
 fn mime_matches(pattern: &str, name: &str) -> bool {
     let Some((pt, ps)) = pattern.split_once('/') else {
         return false;
     };
-    mime_guess::from_path(name)
-        .iter()
-        .any(|m| (pt == "*" || m.type_() == pt) && (ps == "*" || m.subtype() == ps))
+    let satisfies = |mime_type: &str, subtype: &str| {
+        (pt == "*" || mime_type == pt) && (ps == "*" || subtype == ps)
+    };
+    let overlay_hit = std::path::Path::new(name)
+        .extension()
+        .map(|e| e.to_string_lossy().to_lowercase())
+        .and_then(|ext| MIME_OVERLAY.iter().find(|(e, _)| *e == ext))
+        .is_some_and(|(_, mimes)| {
+            mimes
+                .iter()
+                .filter_map(|m| m.split_once('/'))
+                .any(|(t, s)| satisfies(t, s))
+        });
+    overlay_hit
+        || mime_guess::from_path(name)
+            .iter()
+            .any(|m| satisfies(m.type_().as_str(), m.subtype().as_str()))
 }
 
 #[cfg(test)]
@@ -676,6 +701,39 @@ mod tests {
         };
         assert!(exact.matches("a.png"));
         assert!(!exact.matches("a.jpg"));
+    }
+
+    /// The HDR formats mime_guess doesn't know must still pass mime
+    /// filters — `image/*` from a mime-only caller (browsers, Qt apps)
+    /// otherwise hides every .jxr/.exr in the picker.
+    #[test]
+    fn mime_overlay_covers_hdr_formats() {
+        let images = FileFilter {
+            name: "Images".into(),
+            globs: vec![],
+            mimes: vec!["image/*".into()],
+        };
+        assert!(images.matches("scene.exr"));
+        assert!(images.matches("shot.jxr"));
+        assert!(images.matches("SHOT.JXR"), "extension case-folded");
+        assert!(images.matches("frame.jxl"), "mime_guess side still works");
+        assert!(!images.matches("notes.txt"));
+
+        // Exact types, canonical and alias.
+        for (mime, file, hit) in [
+            ("image/vnd.ms-photo", "a.jxr", true),
+            ("image/jxr", "a.jxr", true),
+            ("image/x-exr", "a.exr", true),
+            ("image/aces", "a.exr", true),
+            ("image/png", "a.exr", false),
+        ] {
+            let f = FileFilter {
+                name: mime.into(),
+                globs: vec![],
+                mimes: vec![mime.into()],
+            };
+            assert_eq!(f.matches(file), hit, "{mime} vs {file}");
+        }
     }
 
     #[test]
