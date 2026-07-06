@@ -69,6 +69,14 @@ pub fn scenes() -> Vec<Scene> {
             BROWSER_HALF,
             app::fixtures::binary_preview(),
         ),
+        // A short window (tiling WMs stack windows into quarter-height
+        // slots) with a crowded sidebar — guards the sidebar's scroll
+        // containment.
+        scene(
+            "crowded_sidebar_short",
+            (750.0, 420.0),
+            app::fixtures::crowded_sidebar(),
+        ),
         scene("multiselect", BROWSER, multiselect()),
         scene("multiselect_half", BROWSER_HALF, multiselect()),
         scene("context_menu", BROWSER, app::fixtures::context_menu()),

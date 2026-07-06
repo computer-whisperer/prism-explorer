@@ -1938,9 +1938,18 @@ impl ExplorerApp {
             ]));
         }
 
-        sidebar(groups)
-            .width(Size::Fixed(sidebar_w))
-            .height(Size::Fill(1.0))
+        // `sidebar()` is a plain column with the panel recipe — it does
+        // not scroll. On short windows the Bookmarks/Recent groups march
+        // straight off the window bottom without this containment (the
+        // crowded_sidebar_short fixture lints Overflow without it). The
+        // horizontal padding keeps the place buttons' focus rings inside
+        // the scroll's scissor (the accordion idiom).
+        sidebar([scroll(groups)
+            .key("sidebar-scroll")
+            .padding(Sides::x(tokens::RING_WIDTH))
+            .scrollbar_gutter()])
+        .width(Size::Fixed(sidebar_w))
+        .height(Size::Fill(1.0))
     }
 
     fn toolbar_el(&self, cx: &BuildCx) -> El {
@@ -4496,6 +4505,26 @@ pub(crate) mod fixtures {
         );
         stat_file(&mut app, "notes.txt", 12);
         stat_file(&mut app, "photo.jxr", 1024);
+        app
+    }
+
+    /// Sidebar crowded past a short window's height: a stack of
+    /// bookmarks plus a full Recent group. Regression scene for the
+    /// sidebar's scroll containment — without it the place buttons
+    /// march straight off the bottom of the window.
+    pub(crate) fn crowded_sidebar() -> ExplorerApp {
+        let mut app = browse();
+        for i in 0..10 {
+            app.places.push(Place {
+                label: format!("project-{i}"),
+                path: format!("/data/projects/project-{i}").into(),
+                icon: "folder",
+                bookmark: true,
+            });
+        }
+        app.recents = (0..8)
+            .map(|i| PathBuf::from(format!("/data/recent/dir-{i}")))
+            .collect();
         app
     }
 
