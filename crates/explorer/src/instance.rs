@@ -3,9 +3,9 @@
 //! Only one prism-explorer process per session is the *primary*: it
 //! owns the well-known name [`BUS_NAME`], serves the portal FileChooser
 //! and FileManager1 services, and owns the shared history/settings
-//! stores. A second launch ([`try_become_primary`] returns `false`)
-//! hands its directory to the primary via [`hand_off`] and exits, so
-//! the two processes never race those single-owner stores (each loads a
+//! stores. A second launch ([`Arbitration::Secondary`]) hands its
+//! directory to the primary via [`hand_off`] and exits, so the two
+//! processes never race those single-owner stores (each loads a
 //! snapshot at startup and writes the whole thing back — concurrent
 //! owners would clobber each other).
 //!
@@ -44,20 +44,34 @@ impl Instance {
     }
 }
 
-/// Try to become the primary instance. On success the name is held by a
-/// detached thread for the process's lifetime and the `OpenWindow`
-/// method is served; returns `true`. If another prism already owns the
-/// name, returns `false` — the caller is a secondary and should
-/// [`hand_off`] then exit. A bus failure also yields `false` (we run as
-/// a lone browser rather than aborting).
-pub fn try_become_primary(proxy: EventLoopProxy<HostCommand>) -> bool {
+/// How this launch relates to the session's single-instance contract.
+/// The distinction between `Secondary` and `BusUnavailable` matters:
+/// a secondary has a primary to hand off to, while a broken bus means
+/// there is nobody to coordinate with — falling back to a lone window
+/// is the only way to open at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Arbitration {
+    /// We own [`BUS_NAME`] and serve `OpenWindow` — this process is the
+    /// primary for the session.
+    Primary,
+    /// Another prism owns the name; [`hand_off`] and exit.
+    Secondary,
+    /// No usable session bus. The caller should run as a lone,
+    /// uncoordinated browser (and must not claim shared D-Bus names).
+    BusUnavailable,
+}
+
+/// Try to become the primary instance. On [`Arbitration::Primary`] the
+/// name is held by a detached thread for the process's lifetime and the
+/// `OpenWindow` method is served.
+pub fn try_become_primary(proxy: EventLoopProxy<HostCommand>) -> Arbitration {
     let (ready_tx, ready_rx) = std::sync::mpsc::channel();
     let spawned = std::thread::Builder::new()
         .name("instance".into())
         .spawn(move || match serve(proxy) {
             Ok(Some(_conn)) => {
                 tracing::info!("primary instance: serving {BUS_NAME}");
-                let _ = ready_tx.send(true);
+                let _ = ready_tx.send(Arbitration::Primary);
                 // The connection's executor handles calls; park to keep
                 // it (and the owned name) alive for the process lifetime.
                 loop {
@@ -67,20 +81,20 @@ pub fn try_become_primary(proxy: EventLoopProxy<HostCommand>) -> bool {
             Ok(None) => {
                 // Another prism already owns the name — we are secondary.
                 tracing::info!("another prism owns {BUS_NAME}; this launch is secondary");
-                let _ = ready_tx.send(false);
+                let _ = ready_tx.send(Arbitration::Secondary);
             }
             Err(e) => {
                 // No session bus, etc. Run as a lone instance rather than
                 // aborting, but we are not a coordinating primary.
                 tracing::info!(error = %e, "instance bus unavailable");
-                let _ = ready_tx.send(false);
+                let _ = ready_tx.send(Arbitration::BusUnavailable);
             }
         });
     match spawned {
-        Ok(_) => ready_rx.recv().unwrap_or(false),
+        Ok(_) => ready_rx.recv().unwrap_or(Arbitration::BusUnavailable),
         Err(e) => {
             tracing::warn!(error = %e, "instance thread failed to spawn");
-            false
+            Arbitration::BusUnavailable
         }
     }
 }

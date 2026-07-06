@@ -92,17 +92,37 @@ fn main() -> Result<()> {
     // and the history/settings stores; a second launch hands its
     // directory to the primary (which opens a window for it) and exits,
     // so the two never clobber each other's persisted state.
-    if !instance::try_become_primary(event_loop.create_proxy()) {
-        if !service_mode {
+    let arbitration = instance::try_become_primary(event_loop.create_proxy());
+    match arbitration {
+        instance::Arbitration::Primary => {}
+        instance::Arbitration::Secondary => {
+            // A `--service` activation while a primary already runs has
+            // nothing to do — the primary serves the request.
+            if service_mode {
+                return Ok(());
+            }
             // Ask the running primary to open the requested directory.
-            instance::hand_off(&start)?;
+            // If it can't be reached (typically a primary mid-shutdown
+            // whose name the bus hasn't reaped), open a lone window
+            // rather than failing the launch with nothing on screen.
+            match instance::hand_off(&start) {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    tracing::warn!(error = %e, "hand_off failed; opening a lone window");
+                }
+            }
         }
-        // A `--service` activation while a primary already runs has
-        // nothing to do — the primary serves the request.
-        return Ok(());
+        instance::Arbitration::BusUnavailable => {
+            // No session bus: a windowed launch still opens (lone,
+            // uncoordinated); a service activation is meaningless.
+            if service_mode {
+                anyhow::bail!("--service needs a session D-Bus connection");
+            }
+        }
     }
+    let is_primary = arbitration == instance::Arbitration::Primary;
 
-    // ---- we are the primary instance ------------------------------------
+    // ---- primary, or an uncoordinated lone browser ----------------------
 
     // Thumbnails cache to local disk, never the (possibly network)
     // filesystem being browsed. tmp fallback still caches within a
@@ -150,22 +170,27 @@ fn main() -> Result<()> {
         workers,
     };
 
-    // "Show this in the file manager" service — browsers' Open
+    // The shared D-Bus services belong to the primary only. A lone
+    // fallback browser must not request them: zbus queues on a taken
+    // name, so a fallback would silently seize FileManager1/the portal
+    // from the real primary whenever it releases them.
+    //
+    // filemanager1: "show this in the file manager" — browsers' Open
     // containing folder, etc. Posts ShowLocation to the loop.
-    filemanager1::spawn(event_loop.create_proxy());
-
-    // Portal FileChooser backend: open/save dialogs for every
-    // portal-using app, served as picker windows from this process.
-    // Best-effort; the primary stays resident regardless (it owns the
-    // instance + FileManager1 names too), serving requests with zero
-    // windows open.
-    let _portal = filechooser::spawn(PickerDeps {
-        notifier,
-        registry,
-        thumbs,
-        store,
-        settings,
-        proxy: event_loop.create_proxy(),
+    // filechooser: portal open/save dialogs for every portal-using app,
+    // served as picker windows from this process. Best-effort; the
+    // primary stays resident regardless (it owns the instance name
+    // too), serving requests with zero windows open.
+    let _portal = is_primary.then(|| {
+        filemanager1::spawn(event_loop.create_proxy());
+        filechooser::spawn(PickerDeps {
+            notifier,
+            registry,
+            thumbs,
+            store,
+            settings,
+            proxy: event_loop.create_proxy(),
+        })
     });
 
     // Headless in service mode; otherwise open the start directory.
