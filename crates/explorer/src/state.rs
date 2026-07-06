@@ -236,8 +236,12 @@ impl Store {
             .and_then(|e| e.dir.clone())
     }
 
-    /// The filter (by display name) `app_id` last accepted with, if any.
-    pub fn app_last_filter(&self, app_id: &str) -> Option<String> {
+    /// The filter (by display name) `app_id` last accepted with in a
+    /// request of the same `kind`, if any. Kind-scoped: a filter chosen
+    /// in an app's Save dialog must never pre-filter its Open dialogs —
+    /// the two carry different filter lists, and a leaked name that
+    /// happens to match would silently hide the files the user came for.
+    pub fn app_last_filter(&self, app_id: &str, kind: RequestKind) -> Option<String> {
         if app_id.is_empty() {
             return None;
         }
@@ -246,7 +250,9 @@ impl Store {
             .events
             .iter()
             .rev()
-            .find(|e| e.app_id == app_id && e.accepted && e.filter.is_some())
+            .find(|e| {
+                e.app_id == app_id && e.kind == kind.as_str() && e.accepted && e.filter.is_some()
+            })
             .and_then(|e| e.filter.clone())
     }
 
@@ -380,7 +386,13 @@ mod tests {
             }),
         );
         assert_eq!(store.app_last_dir("org.x"), Some(PathBuf::from("/ceph/x")));
-        assert_eq!(store.app_last_filter("org.x"), Some("Images".to_string()));
+        assert_eq!(
+            store.app_last_filter("org.x", RequestKind::SaveFile),
+            Some("Images".to_string())
+        );
+        // Kind-scoped: the Save-dialog filter never leaks into the same
+        // app's Open dialogs.
+        assert_eq!(store.app_last_filter("org.x", RequestKind::OpenFile), None);
         // Isolation: another app and empty id see nothing.
         assert_eq!(store.app_last_dir("org.y"), None);
         assert_eq!(store.app_last_dir(""), None);
