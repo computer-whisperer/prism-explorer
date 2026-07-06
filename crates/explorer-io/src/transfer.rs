@@ -282,6 +282,19 @@ fn place_item(
     progress: &mut Progress,
     on_progress: &mut dyn FnMut(&Progress),
 ) -> std::io::Result<Outcome> {
+    // Refuse to paste a directory into itself or any of its descendants
+    // (cp's "cannot copy a directory into itself"): the copy walk would
+    // descend into its own output, re-copying files level after level.
+    // Symlinks are exempt — they are recreated, never followed.
+    if std::fs::symlink_metadata(&item.src_root).is_ok_and(|m| m.is_dir())
+        && dest_within(&item.src_root, dest)
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "cannot copy a directory into itself",
+        ));
+    }
+
     let plain = dest.join(&item.name);
     // Pasting an item into its own directory can only mean "duplicate"
     // (merging or replacing it onto itself is nonsensical and would be
@@ -393,9 +406,18 @@ fn place(
                         "refusing to replace a directory with a file or vice versa",
                     ));
                 }
-                remove_any(dst)?;
-                if let Err(e) = copy_tree(src, dst, cancel, progress, on_progress) {
-                    let _ = remove_any(dst);
+                // Build the replacement under a staging name next to the
+                // target, then rename over it: the old file survives until
+                // the new one fully exists, so a cancel, ENOSPC, or source
+                // IO error mid-copy never costs both copies. (Both sides
+                // are non-directories here, so rename-over is atomic.)
+                let staged = staging_path(dst);
+                if let Err(e) = copy_tree(src, &staged, cancel, progress, on_progress) {
+                    let _ = remove_any(&staged);
+                    return Err(e);
+                }
+                if let Err(e) = std::fs::rename(&staged, dst) {
+                    let _ = remove_any(&staged);
                     return Err(e);
                 }
                 if mode == TransferMode::Move {
@@ -512,6 +534,30 @@ fn copy_symlink(src: &Path, dst: &Path) -> std::io::Result<()> {
 
 fn preserve_permissions(src_meta: &std::fs::Metadata, dst: &Path) {
     let _ = std::fs::set_permissions(dst, src_meta.permissions());
+}
+
+/// True when `dest` is `src` itself or sits anywhere under it.
+/// Canonicalized (both exist at check time) so a symlinked alias of the
+/// destination can't dodge the check; falls back to a lexical prefix
+/// test if canonicalization fails (e.g. a permission-denied component).
+fn dest_within(src: &Path, dest: &Path) -> bool {
+    match (std::fs::canonicalize(src), std::fs::canonicalize(dest)) {
+        (Ok(s), Ok(d)) => d.starts_with(&s),
+        _ => dest.starts_with(src),
+    }
+}
+
+/// A dot-prefixed sibling name for staging a [`ConflictPolicy::Replace`]
+/// copy next to its target. Pid + a process-wide counter keep concurrent
+/// replacements (ours or another instance's) from colliding.
+fn staging_path(dst: &Path) -> PathBuf {
+    use std::sync::atomic::AtomicU64;
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    let mut name = std::ffi::OsString::from(".");
+    name.push(dst.file_name().unwrap_or_default());
+    name.push(format!(".prism-replace.{}-{seq}", std::process::id()));
+    dst.with_file_name(name)
 }
 
 /// Remove a path whatever it is: a directory tree, a file, or a symlink
@@ -901,6 +947,83 @@ mod tests {
             "mismatch is reported, not destructive"
         );
         assert!(dst.join("x/inner").is_dir(), "existing tree untouched");
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// A Replace that dies mid-copy (cancel, ENOSPC, source IO error)
+    /// must leave the old destination intact — the replacement is staged
+    /// beside it and only renamed over on success.
+    #[test]
+    fn replace_cancelled_mid_copy_keeps_old_destination() {
+        let root = scratch("replace-cancel");
+        let src = root.join("big.bin");
+        // Several chunks so cancel can land partway through the copy.
+        std::fs::write(&src, vec![9u8; (1 << 20) * 3]).unwrap();
+        let dst = root.join("dest");
+        std::fs::create_dir(&dst).unwrap();
+        std::fs::write(dst.join("big.bin"), b"old").unwrap();
+
+        let cancel = CancelToken::new();
+        let plan = scan(
+            std::slice::from_ref(&src),
+            &dst,
+            TransferMode::Copy,
+            &cancel,
+        );
+        assert!(plan.has_collisions());
+        let c2 = cancel.clone();
+        let report = run(&plan, ConflictPolicy::Replace, &cancel, &mut |p| {
+            if p.bytes_done > 0 {
+                c2.cancel();
+            }
+        });
+        assert!(report.cancelled);
+        assert_eq!(
+            std::fs::read(dst.join("big.bin")).unwrap(),
+            b"old",
+            "old destination survives a failed replace"
+        );
+        assert!(src.exists(), "source untouched");
+        let entries: Vec<_> = std::fs::read_dir(&dst)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(entries, vec!["big.bin"], "no staging file left behind");
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// Pasting a directory into itself (or any descendant) is refused per
+    /// item — like cp — instead of the walk descending into its own output.
+    #[test]
+    fn refuses_copy_of_directory_into_itself_or_descendant() {
+        let root = scratch("self-recurse");
+        let src = root.join("pics");
+        std::fs::create_dir_all(src.join("sub")).unwrap();
+        std::fs::write(src.join("a.txt"), b"x").unwrap();
+
+        // dest == the directory being copied.
+        let report = transfer(
+            std::slice::from_ref(&src),
+            &src,
+            TransferMode::Copy,
+            ConflictPolicy::Replace,
+        );
+        assert_eq!(report.copied, 0);
+        assert_eq!(report.failed.len(), 1, "refused, reported, not fatal");
+        assert!(!src.join("pics").exists(), "no nested copy created");
+
+        // dest deeper inside the directory being copied.
+        let report = transfer(
+            std::slice::from_ref(&src),
+            &src.join("sub"),
+            TransferMode::Copy,
+            ConflictPolicy::Replace,
+        );
+        assert_eq!(report.failed.len(), 1);
+        assert!(!src.join("sub/pics").exists());
+        assert_eq!(std::fs::read(src.join("a.txt")).unwrap(), b"x");
 
         std::fs::remove_dir_all(&root).unwrap();
     }
