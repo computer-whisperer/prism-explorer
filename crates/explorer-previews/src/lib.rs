@@ -149,8 +149,15 @@ pub(crate) fn run_with_timeout(
     let mut child = cmd.spawn()?;
     let mut delay = std::time::Duration::from_millis(10);
     loop {
-        if let Some(status) = child.try_wait()? {
-            return Ok(status);
+        match child.try_wait() {
+            Ok(Some(status)) => return Ok(status),
+            Ok(None) => {}
+            // Don't leak a live child just because waitpid errored.
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(e.into());
+            }
         }
         if start.elapsed() >= timeout {
             let _ = child.kill();

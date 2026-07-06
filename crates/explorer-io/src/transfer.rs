@@ -406,6 +406,17 @@ fn place(
                         "refusing to replace a directory with a file or vice versa",
                     ));
                 }
+                // The "conflict" may be the same underlying file reached
+                // via an aliased path (a symlinked directory): replacing
+                // it with itself would install a copy over the original
+                // and then, on a move, delete the one real file. Nothing
+                // to do — treat it as Skip, like cp's same-file refusal.
+                if same_file(&src_meta, &dm) {
+                    progress.bytes_done += src_meta.len();
+                    progress.files_done += 1;
+                    on_progress(progress);
+                    return Ok(Outcome::Skipped);
+                }
                 // Build the replacement under a staging name next to the
                 // target, then rename over it: the old file survives until
                 // the new one fully exists, so a cancel, ENOSPC, or source
@@ -534,6 +545,20 @@ fn copy_symlink(src: &Path, dst: &Path) -> std::io::Result<()> {
 
 fn preserve_permissions(src_meta: &std::fs::Metadata, dst: &Path) {
     let _ = std::fs::set_permissions(dst, src_meta.permissions());
+}
+
+/// True when the two metadata describe the same underlying file —
+/// dev+ino identity, the check path comparison can't do (the same file
+/// is reachable through any symlinked directory alias).
+#[cfg(unix)]
+fn same_file(a: &std::fs::Metadata, b: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    a.dev() == b.dev() && a.ino() == b.ino()
+}
+
+#[cfg(not(unix))]
+fn same_file(_a: &std::fs::Metadata, _b: &std::fs::Metadata) -> bool {
+    false
 }
 
 /// True when `dest` is `src` itself or sits anywhere under it.
@@ -990,6 +1015,36 @@ mod tests {
             .map(|e| e.unwrap().file_name())
             .collect();
         assert_eq!(entries, vec!["big.bin"], "no staging file left behind");
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// Replace onto the same underlying file through a symlinked-dir
+    /// alias must be a no-op skip, not a self-replace: the lexical
+    /// self-paste check can't see the alias, and a move would otherwise
+    /// install the copy over the original and then delete it.
+    #[cfg(unix)]
+    #[test]
+    fn replace_onto_same_file_via_symlink_alias_skips() {
+        let root = scratch("alias-replace");
+        std::fs::create_dir(root.join("data")).unwrap();
+        std::fs::write(root.join("data/a.txt"), b"precious").unwrap();
+        std::os::unix::fs::symlink(root.join("data"), root.join("x")).unwrap();
+
+        // Cut data/a.txt, paste into the alias x/, resolve with Replace.
+        let report = transfer(
+            std::slice::from_ref(&root.join("data/a.txt")),
+            &root.join("x"),
+            TransferMode::Move,
+            ConflictPolicy::Replace,
+        );
+        assert!(report.failed.is_empty(), "{:?}", report.failed);
+        assert_eq!(report.skipped, 1, "same-file replace is a skip");
+        assert_eq!(
+            std::fs::read(root.join("data/a.txt")).unwrap(),
+            b"precious",
+            "the one real file survives"
+        );
 
         std::fs::remove_dir_all(&root).unwrap();
     }
