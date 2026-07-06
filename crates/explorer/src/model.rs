@@ -434,8 +434,12 @@ impl FileFilter {
     }
 }
 
-/// Iterative `*`/`?` glob (the portal's pattern language; no character
-/// classes). The caller lowercases both sides for case-insensitivity.
+/// Iterative fnmatch-style glob: `*`, `?`, and `[...]` character
+/// classes (sets, ranges, `!` negation). Classes matter in practice:
+/// Firefox's GTK picker rewrites every extension filter through
+/// `MakeCaseInsensitiveShellGlob` — `*.xsn` arrives on the portal wire
+/// as `*.[xX][sS][nN]` — so a matcher without them hides every file.
+/// The caller lowercases both sides for case-insensitivity.
 fn glob_match(pattern: &str, name: &str) -> bool {
     let p: Vec<char> = pattern.chars().collect();
     let n: Vec<char> = name.chars().collect();
@@ -444,8 +448,8 @@ fn glob_match(pattern: &str, name: &str) -> bool {
     // started at — on mismatch, grow that expansion by one.
     let mut star: Option<(usize, usize)> = None;
     while ni < n.len() {
-        if pi < p.len() && (p[pi] == '?' || p[pi] == n[ni]) {
-            pi += 1;
+        if let Some(next) = token_match(&p, pi, n[ni]) {
+            pi = next;
             ni += 1;
         } else if pi < p.len() && p[pi] == '*' {
             star = Some((pi, ni));
@@ -459,6 +463,59 @@ fn glob_match(pattern: &str, name: &str) -> bool {
         }
     }
     p[pi..].iter().all(|&c| c == '*')
+}
+
+/// If the single pattern token at `pi` consumes `c`, the index just
+/// past that token; `None` on mismatch (or on `*`, which the caller's
+/// backtracking owns).
+fn token_match(p: &[char], pi: usize, c: char) -> Option<usize> {
+    match p.get(pi)? {
+        '?' => Some(pi + 1),
+        '*' => None,
+        '[' => match class_match(p, pi, c) {
+            Some((true, next)) => Some(next),
+            Some((false, _)) => None,
+            // Unterminated class: fnmatch treats the `[` as a literal.
+            None => (c == '[').then_some(pi + 1),
+        },
+        &pc => (pc == c).then_some(pi + 1),
+    }
+}
+
+/// Match `c` against the `[...]` class starting at `p[pi]`. Returns
+/// `(matched, index past the closing bracket)`, or `None` when the
+/// class never closes. fnmatch semantics: leading `!` negates, `]` as
+/// the first member is a literal, `a-z` is an inclusive range (a `-`
+/// adjacent to the closing bracket is a literal member).
+fn class_match(p: &[char], pi: usize, c: char) -> Option<(bool, usize)> {
+    let mut i = pi + 1;
+    let negated = p.get(i) == Some(&'!');
+    if negated {
+        i += 1;
+    }
+    let mut matched = false;
+    let mut first = true;
+    while let Some(&pc) = p.get(i) {
+        if pc == ']' && !first {
+            return Some((matched != negated, i + 1));
+        }
+        if let (Some('-'), Some(&hi)) = (p.get(i + 1).copied(), p.get(i + 2)) {
+            if hi != ']' {
+                if pc <= c && c <= hi {
+                    matched = true;
+                }
+                i += 3;
+                first = false;
+                continue;
+            }
+        }
+        if pc == c {
+            matched = true;
+        }
+        i += 1;
+        first = false;
+    }
+    None
 }
 
 /// Does the extension-guessed mimetype of `name` satisfy `pattern`
@@ -553,6 +610,49 @@ mod tests {
         assert!(glob_match("*.tar.*", "x.tar.gz"));
         assert!(!glob_match("?", ""));
         assert!(glob_match("*", ""));
+    }
+
+    #[test]
+    fn glob_character_classes() {
+        // The Firefox shape: MakeCaseInsensitiveShellGlob rewrites every
+        // extension filter into bracket pairs before it reaches the
+        // portal (the parser lowercases it on the way in).
+        assert!(glob_match("*.[xx][ss][nn]", "form.xsn"));
+        assert!(!glob_match("*.[xx][ss][nn]", "form.xsl"));
+
+        // Sets, ranges, negation.
+        assert!(glob_match("img[0-9].png", "img4.png"));
+        assert!(!glob_match("img[0-9].png", "imgx.png"));
+        assert!(glob_match("[abc]it", "bit"));
+        assert!(!glob_match("[abc]it", "fit"));
+        assert!(glob_match("[!a]bc", "xbc"));
+        assert!(!glob_match("[!a]bc", "abc"));
+
+        // `]` as the first member is literal; a class after `*`
+        // exercises the backtracking path.
+        assert!(glob_match("[]]x", "]x"));
+        assert!(glob_match("*[0-9].log", "run-42.log"));
+        assert!(!glob_match("*[0-9].log", "run-x.log"));
+
+        // Unterminated class degrades to a literal `[` (fnmatch).
+        assert!(glob_match("a[bc", "a[bc"));
+        assert!(!glob_match("a[bc", "abc"));
+    }
+
+    /// End-to-end through FileFilter: the exact wire filter Firefox
+    /// sends for an `accept=".xsn"` picker — display name "*.xsn",
+    /// pattern `*.[xX][sS][nN]` — must match .xsn files of any case.
+    #[test]
+    fn firefox_case_insensitive_bracket_filter_matches() {
+        let filter = FileFilter {
+            name: "*.xsn".into(),
+            // parse_filter lowercases globs on the way in.
+            globs: vec!["*.[xX][sS][nN]".to_lowercase()],
+            mimes: vec![],
+        };
+        assert!(filter.matches("form.xsn"));
+        assert!(filter.matches("FORM.XSN"));
+        assert!(!filter.matches("form.xml"));
     }
 
     #[test]
